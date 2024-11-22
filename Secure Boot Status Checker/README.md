@@ -1,3 +1,24 @@
+# Secure Boot Status Checker
+
+This PowerShell script checks the Secure Boot status of a list of servers and exports the results to a CSV file.
+
+## Prerequisites
+
+- PowerShell 5.1 or later
+- A list of server names in a text file located at `C:\temp\ServerList.txt`
+- Necessary permissions to run remote commands on the servers
+
+## Usage
+
+1. **Prepare the Server List:**
+   - Create a text file named `ServerList.txt` in the `C:\temp\` directory.
+   - Add the names of the servers you want to check, one per line.
+
+2. **Run the Script:**
+   - Open PowerShell with administrative privileges.
+   - Execute the script.
+
+```powershell
 $date = Get-Date -Format "MM-dd-yyyy_HH-mm-ss"
 #write-host $date  
 
@@ -14,20 +35,13 @@ foreach ($server in $servers) {
     $port5985 = Test-NetConnection -ComputerName $server -Port 5985 -InformationLevel Quiet
 
     if ($ping -or $port445 -or $port5985) {
-       
-          
-            #Get Secure boot status
-            $OS = (Get-WmiObject -Class Win32_OperatingSystem | Select-Object -Property Caption).caption
-            $secureboot = Invoke-command -ComputerName $server -ScriptBlock {Confirm-SecureBootUEFI}
-            
-    } 
-   
-    else 
-    
-    {
+        # Get Secure boot status
+        $OS = (Get-WmiObject -Class Win32_OperatingSystem | Select-Object -Property Caption).caption
+        $secureboot = Invoke-command -ComputerName $server -ScriptBlock {Confirm-SecureBootUEFI}
+    } else {
         # If the server is not responding, set status to "Not Responding"
         $secureboot = "As the Server is not responding/communicating Secure Boot Status cannot be fetched" 
-         $OS = "Server Not Responding/Communicating"
+        $OS = "Server Not Responding/Communicating"
     }
 
     # Add the result to the array
@@ -35,7 +49,6 @@ foreach ($server in $servers) {
         ServerName = $server
         OperatingSystem = $OS
         Secureboot =  $secureboot
-        
     }
 }
 
@@ -43,3 +56,4 @@ foreach ($server in $servers) {
 $results | Export-Csv -Path "C:\temp\Secureboot_status_$date.csv" -NoTypeInformation
 
 Write-Output "Data for Secureboot status for all the servers has been exported to C:\temp\ location"
+
