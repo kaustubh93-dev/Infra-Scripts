@@ -1,0 +1,31 @@
+resources
+| where type == 'microsoft.hybridcompute/machines'
+| extend ArcServer   = name,
+         OsName      = tostring(properties.osName),
+         OsSku       = tostring(properties.osSku),
+         Manufacturer = coalesce(tostring(properties.hardwareProfile.manufacturer),
+                                 tostring(properties.detectedProperties.manufacturer),
+                                 tostring(properties.detectedProperties.biosManufacturer)),
+         CpuModel    = coalesce(tostring(properties.hardwareProfile.processors[0].name),
+                                tostring(properties.detectedProperties.processorNames)),
+         CpuCores    = toint(coalesce(properties.hardwareProfile.processors[0].numberOfCores,
+                                     properties.detectedProperties.coreCount,
+                                     properties.detectedProperties.logicalCoreCount)),
+                 DomainName  = tostring(properties.domainName),
+         ServerFqdn  = coalesce(tostring(properties.machineFqdn),
+                                tostring(properties.dnsFqdn),
+                                tostring(properties.adFqdn))
+| mv-expand nic = properties.networkProfile.networkInterfaces to typeof(dynamic)
+| mv-expand ip  = nic.ipAddresses                                to typeof(dynamic)
+| extend IpAddress = tostring(ip.address)
+| summarize IpAddresses = make_set(IpAddress),
+            TotalCores  = sum(CpuCores),
+            CpuModel    = any(CpuModel),
+            Tags        = any(tags)
+          by ArcServer, OsName, OsSku, Manufacturer, DomainName, ServerFqdn
+| extend IpList   = tostring(IpAddresses),
+         TagsJson = tostring(coalesce(Tags, dynamic({})))
+| project ArcServer, OsName, OsSku, Manufacturer,
+          CpuModel, TotalCores, IpList,
+          DomainName, ServerFqdn, TagsJson
+| order by ArcServer asc

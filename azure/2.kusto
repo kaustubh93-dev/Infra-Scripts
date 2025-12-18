@@ -1,0 +1,109 @@
+resources
+ 
+| where type == 'microsoft.hybridcompute/machines'
+| extend
+ 
+    ArcServer = name,
+    OsName = tostring(properties.osName),
+    OperatingSystemVersion = tostring(properties.osSku),
+ 
+    Manufacturer = coalesce(
+ 
+        tostring(properties.hardwareProfile.manufacturer),
+        tostring(properties.detectedProperties.manufacturer),
+        tostring(properties.detectedProperties.biosManufacturer)
+ 
+    ),
+ 
+    CpuModel = coalesce(
+ 
+        tostring(properties.hardwareProfile.processors[0].name),
+        tostring(properties.detectedProperties.processorNames)
+ 
+    ),
+ 
+    CpuCores = toint(coalesce(
+ 
+        properties.hardwareProfile.processors[0].numberOfCores,
+        properties.detectedProperties.coreCount,
+        properties.detectedProperties.logicalCoreCount
+ 
+    )),
+ 
+    vCPUs = toint(coalesce(
+ 
+        properties.detectedProperties.logicalCoreCount,
+        properties.hardwareProfile.processors[0].numberOfLogicalProcessors
+ 
+    )),
+ 
+    TotalMemoryGB = round(coalesce(
+ 
+        todouble(properties.detectedProperties.totalPhysicalMemoryInGigabytes),
+        todouble(properties.hardwareProfile.totalPhysicalMemoryInBytes) / (1024.0 * 1024.0 * 1024.0),
+        todouble(properties.detectedProperties.totalPhysicalMemoryInBytes) / (1024.0 * 1024.0 * 1024.0)
+ 
+    ), 2),
+ 
+    DomainName = tostring(properties.domainName),
+ 
+    ServerFqdn = coalesce(
+ 
+        tostring(properties.machineFqdn),
+        tostring(properties.dnsFqdn),
+        tostring(properties.adFqdn)
+ 
+    ),
+ 
+    StorageDisks = properties.storageProfile.disks
+ 
+| mv-expand disk = StorageDisks to typeof(dynamic)
+| extend DiskSizeGB = todouble(disk.maxSizeInBytes) / (1024.0 * 1024.0 * 1024.0)
+| summarize
+ 
+    TotalDiskSpaceGB = round(sum(DiskSizeGB), 2),
+    NumberOfDisks = count(disk),
+    CorePerProcessor = any(CpuCores),
+    vCPUs = any(vCPUs),
+    TotalMemoryGB = any(TotalMemoryGB),
+    CpuModel = any(CpuModel),
+    Tags = any(tags)
+ 
+  by ArcServer, OsName, OperatingSystemVersion, Manufacturer, DomainName, ServerFqdn
+ 
+| join kind=leftouter (
+ 
+    resources
+ 
+    | where type == 'microsoft.hybridcompute/machines'
+    | extend ArcServer = name
+    | mv-expand nic = properties.networkProfile.networkInterfaces to typeof(dynamic)
+    | mv-expand ip = nic.ipAddresses to typeof(dynamic)
+    | extend IpAddress = tostring(ip.address)
+    | summarize IpAddresses = make_set(IpAddress) by ArcServer
+ 
+) on ArcServer
+ 
+| extend
+ 
+    IpList = tostring(coalesce(IpAddresses, dynamic([]))),
+    TagsJson = tostring(coalesce(Tags, dynamic({})))
+ 
+| project
+ 
+    ArcServer,
+    IpList,
+    ServerFqdn,
+    OsName,
+    OperatingSystemVersion,
+    Manufacturer,
+    CpuModel,
+    CorePerProcessor,
+    vCPUs,
+    TotalMemoryGB,
+    TotalDiskSpaceGB,
+    NumberOfDisks,
+    DomainName,
+    TagsJson
+ 
+| order by ArcServer asc
