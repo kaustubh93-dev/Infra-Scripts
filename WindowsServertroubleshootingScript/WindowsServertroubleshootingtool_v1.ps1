@@ -7,8 +7,8 @@
 .PARAMETER EnableLogging
     Enables transcript logging of the entire session
 .EXAMPLE
-    .\WindowsServertroubleshootingtool_v1_updated.ps1
-    .\WindowsServertroubleshootingtool_v1_updated.ps1 -EnableLogging
+    .\WindowsServertroubleshootingtool_v1.ps1
+    .\WindowsServertroubleshootingtool_v1.ps1 -EnableLogging
 .NOTES
     Version: 2.0
     Requires: Administrator privileges
@@ -18,6 +18,10 @@
 param(
     [switch]$EnableLogging
 )
+
+# Requirements: PowerShell 5.1+ and the NetTCPIP module (Get-Net* cmdlets).
+# This file was updated to avoid overriding core cmdlets like `Write-Error` and `Write-Warning`.
+# If running on older PowerShell versions, some cmdlets may be unavailable.
 
 #region Constants and Configuration
 # Threshold Constants
@@ -38,7 +42,7 @@ $script:DefaultLogPath = Join-Path $script:TempBasePath "Logs"
 
 # TSS Path Configuration - HARDCODED
 # Change this path to match your TSS installation location
-$script:TSSPath = "C:\Script\TSS"  # Default hardcoded path
+$script:TSSPath = "C:\TSS"  # Default hardcoded path
 #endregion
 
 #region Output and Display Functions
@@ -60,9 +64,9 @@ function Write-Header {
         The header text to display
     #>
     param([string]$Text)
-    Write-Host "`n========================================" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
     Write-Host $Text -ForegroundColor Cyan
-    Write-Host "========================================`n" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
 }
 
 function Write-Success {
@@ -84,7 +88,8 @@ function Write-Warning {
         The warning message to display
     #>
     param([string]$Text)
-    Write-Host "[WARNING] $($Text)" -ForegroundColor Yellow
+    # Forward to the built-in warning cmdlet to preserve expected behavior
+    Microsoft.PowerShell.Utility\Write-Warning -Message $Text
 }
 
 function Write-Error {
@@ -95,7 +100,8 @@ function Write-Error {
         The error message to display
     #>
     param([string]$Text)
-    Write-Host "[ERROR] $($Text)" -ForegroundColor Red
+    # Forward to the built-in error cmdlet to preserve error records and streams
+    Microsoft.PowerShell.Utility\Write-Error -Message $Text
 }
 
 function Write-Info {
@@ -564,7 +570,7 @@ function Start-NetworkLogCollection {
     Write-Host "2. Network Slowness (general diagnostics)" -ForegroundColor Yellow
     Write-Host "3. Manual netsh trace" -ForegroundColor Yellow
     
-    $choice = Get-ValidatedChoice -Prompt "`nEnter choice (1-3)" -ValidChoices @("1", "2", "3")
+    $choice = Get-ValidatedChoice -Prompt "Enter choice (1-3)" -ValidChoices @("1", "2", "3")
     
     switch ($choice) {
         "1" {
@@ -1243,6 +1249,335 @@ function Show-ValidatorInfo {
     Write-Info "Zip the ServerScanner folder and share for analysis"
 }
 
+function Test-TLSConfiguration {
+    <#
+    .SYNOPSIS
+        Validates TLS configuration on the server
+    .DESCRIPTION
+        Checks enabled TLS protocols, cipher suites, and security configurations
+    .EXAMPLE
+        Test-TLSConfiguration
+    #>
+    Write-Header "TLS Configuration Validation"
+    
+    # TLS Registry Paths
+    $tlsProtocols = @{
+        "TLS 1.0" = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0"
+        "TLS 1.1" = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1"
+        "TLS 1.2" = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2"
+        "TLS 1.3" = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.3"
+    }
+    
+    Write-Info "Checking TLS Protocol Status..."
+    Write-Info ""
+    
+    foreach ($protocol in $tlsProtocols.GetEnumerator()) {
+        $protocolName = $protocol.Key
+        $regPath = $protocol.Value
+        
+        Write-Info "--- $protocolName ---"
+        
+        # Check if protocol key exists
+        if (Test-Path $regPath) {
+            # Check Client settings
+            $clientPath = Join-Path $regPath "Client"
+            if (Test-Path $clientPath) {
+                try {
+                    $clientEnabled = Get-ItemProperty -Path $clientPath -Name "Enabled" -ErrorAction SilentlyContinue
+                    $clientDisabledByDefault = Get-ItemProperty -Path $clientPath -Name "DisabledByDefault" -ErrorAction SilentlyContinue
+                    
+                    if ($clientEnabled.Enabled -eq 1 -and $clientDisabledByDefault.DisabledByDefault -eq 0) {
+                        Write-Success "  Client: ENABLED"
+                    } elseif ($clientEnabled.Enabled -eq 0 -or $clientDisabledByDefault.DisabledByDefault -eq 1) {
+                        Write-Warning "  Client: DISABLED"
+                    } else {
+                        Write-Info "  Client: Not explicitly configured (using system default)"
+                    }
+                } catch {
+                    Write-Info "  Client: Not explicitly configured (using system default)"
+                }
+            } else {
+                Write-Info "  Client: Not explicitly configured (using system default)"
+            }
+            
+            # Check Server settings
+            $serverPath = Join-Path $regPath "Server"
+            if (Test-Path $serverPath) {
+                try {
+                    $serverEnabled = Get-ItemProperty -Path $serverPath -Name "Enabled" -ErrorAction SilentlyContinue
+                    $serverDisabledByDefault = Get-ItemProperty -Path $serverPath -Name "DisabledByDefault" -ErrorAction SilentlyContinue
+                    
+                    if ($serverEnabled.Enabled -eq 1 -and $serverDisabledByDefault.DisabledByDefault -eq 0) {
+                        Write-Success "  Server: ENABLED"
+                    } elseif ($serverEnabled.Enabled -eq 0 -or $serverDisabledByDefault.DisabledByDefault -eq 1) {
+                        Write-Warning "  Server: DISABLED"
+                    } else {
+                        Write-Info "  Server: Not explicitly configured (using system default)"
+                    }
+                } catch {
+                    Write-Info "  Server: Not explicitly configured (using system default)"
+                }
+            } else {
+                Write-Info "  Server: Not explicitly configured (using system default)"
+            }
+        } else {
+            Write-Info "  Protocol registry key does not exist (using system default)"
+        }
+        
+        Write-Info ""
+    }
+    
+    # Security Recommendations
+    Write-Info "--- Security Recommendations ---"
+    Write-Warning "TLS 1.0 and TLS 1.1 are deprecated and should be disabled"
+    Write-Success "TLS 1.2 should be enabled (minimum requirement)"
+    Write-Success "TLS 1.3 should be enabled for best security (Windows Server 2022+)"
+    Write-Info ""
+    
+    # Check .NET Framework TLS support
+    Write-Info "--- .NET Framework TLS Support ---"
+    try {
+        $netFx4Path = "HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319"
+        if (Test-Path $netFx4Path) {
+            $schUseStrongCrypto = Get-ItemProperty -Path $netFx4Path -Name "SchUseStrongCrypto" -ErrorAction SilentlyContinue
+            $systemDefaultTls = Get-ItemProperty -Path $netFx4Path -Name "SystemDefaultTlsVersions" -ErrorAction SilentlyContinue
+            
+            if ($schUseStrongCrypto.SchUseStrongCrypto -eq 1) {
+                Write-Success ".NET 4.x (32-bit): Strong Crypto ENABLED"
+            } else {
+                Write-Warning ".NET 4.x (32-bit): Strong Crypto NOT enabled"
+            }
+            
+            if ($systemDefaultTls.SystemDefaultTlsVersions -eq 1) {
+                Write-Success ".NET 4.x (32-bit): System Default TLS ENABLED"
+            } else {
+                Write-Warning ".NET 4.x (32-bit): System Default TLS NOT enabled"
+            }
+        }
+        
+        $netFx4Path64 = "HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v4.0.30319"
+        if (Test-Path $netFx4Path64) {
+            $schUseStrongCrypto64 = Get-ItemProperty -Path $netFx4Path64 -Name "SchUseStrongCrypto" -ErrorAction SilentlyContinue
+            $systemDefaultTls64 = Get-ItemProperty -Path $netFx4Path64 -Name "SystemDefaultTlsVersions" -ErrorAction SilentlyContinue
+            
+            if ($schUseStrongCrypto64.SchUseStrongCrypto -eq 1) {
+                Write-Success ".NET 4.x (64-bit): Strong Crypto ENABLED"
+            } else {
+                Write-Warning ".NET 4.x (64-bit): Strong Crypto NOT enabled"
+            }
+            
+            if ($systemDefaultTls64.SystemDefaultTlsVersions -eq 1) {
+                Write-Success ".NET 4.x (64-bit): System Default TLS ENABLED"
+            } else {
+                Write-Warning ".NET 4.x (64-bit): System Default TLS NOT enabled"
+            }
+        }
+    } catch {
+        Write-Error "Failed to check .NET Framework TLS configuration: $($_.Exception.Message)"
+    }
+    
+    Write-Info ""
+    
+    # Check PowerShell TLS support
+    Write-Info "--- PowerShell TLS Support ---"
+    try {
+        $securityProtocol = [Net.ServicePointManager]::SecurityProtocol
+        Write-Info "Current PowerShell Session Security Protocol: $securityProtocol"
+        
+        if ($securityProtocol -match "Tls12") {
+            Write-Success "TLS 1.2 is available in PowerShell"
+        } else {
+            Write-Warning "TLS 1.2 is NOT configured in PowerShell"
+            Write-Info "To enable: [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12"
+        }
+        
+        if ($securityProtocol -match "Tls13") {
+            Write-Success "TLS 1.3 is available in PowerShell"
+        }
+    } catch {
+        Write-Error "Failed to check PowerShell TLS configuration: $($_.Exception.Message)"
+    }
+    
+    Write-Info ""
+    
+    # Check cipher suites
+    Write-Info "--- TLS Cipher Suites ---"
+    try {
+        $cipherSuites = Get-TlsCipherSuite -ErrorAction SilentlyContinue
+        if ($cipherSuites) {
+            Write-Info "Total Cipher Suites Enabled: $($cipherSuites.Count)"
+            Write-Info ""
+            Write-Info "Top 10 Enabled Cipher Suites (by priority):"
+            $cipherSuites | Select-Object -First 10 | ForEach-Object {
+                $suite = $_.Name
+                if ($suite -match "TLS_AES|TLS_CHACHA20") {
+                    Write-Success "  $suite (TLS 1.3)"
+                } elseif ($suite -match "GCM|ECDHE") {
+                    Write-Success "  $suite (Strong)"
+                } elseif ($suite -match "CBC") {
+                    Write-Warning "  $suite (Consider disabling CBC mode ciphers)"
+                } else {
+                    Write-Info "  $suite"
+                }
+            }
+            
+            # Check for weak cipher suites
+            Write-Info ""
+            Write-Info "Checking for weak/deprecated cipher suites..."
+            $weakCiphers = $cipherSuites | Where-Object { 
+                $_.Name -match "RC4|DES|3DES|MD5|NULL|EXPORT|anon" 
+            }
+            
+            if ($weakCiphers) {
+                Write-Error "CRITICAL: Weak cipher suites detected!"
+                $weakCiphers | ForEach-Object {
+                    Write-Warning "  - $($_.Name)"
+                }
+            } else {
+                Write-Success "No weak cipher suites detected"
+            }
+        } else {
+            Write-Warning "Could not retrieve cipher suite information (may require Windows Server 2012 R2+)"
+        }
+    } catch {
+        Write-Warning "Could not check cipher suites: $($_.Exception.Message)"
+    }
+    
+    Write-Info ""
+    Write-Info "--- Quick Fix Commands ---"
+    Write-Host @"
+
+To disable TLS 1.0 and 1.1 (RECOMMENDED):
+# Disable TLS 1.0
+New-Item 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server' -Force
+New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server' -Name 'Enabled' -Value 0 -PropertyType 'DWord' -Force
+New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server' -Name 'DisabledByDefault' -Value 1 -PropertyType 'DWord' -Force
+
+# Disable TLS 1.1
+New-Item 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server' -Force
+New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server' -Name 'Enabled' -Value 0 -PropertyType 'DWord' -Force
+New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server' -Name 'DisabledByDefault' -Value 1 -PropertyType 'DWord' -Force
+
+To enable TLS 1.2:
+New-Item 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Server' -Force
+New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Server' -Name 'Enabled' -Value 1 -PropertyType 'DWord' -Force
+New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Server' -Name 'DisabledByDefault' -Value 0 -PropertyType 'DWord' -Force
+
+To enable .NET Framework to use TLS 1.2:
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319' -Name 'SchUseStrongCrypto' -Value 1 -Type DWord
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319' -Name 'SystemDefaultTlsVersions' -Value 1 -Type DWord
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v4.0.30319' -Name 'SchUseStrongCrypto' -Value 1 -Type DWord
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v4.0.30319' -Name 'SystemDefaultTlsVersions' -Value 1 -Type DWord
+
+NOTE: A system restart is required after making TLS changes!
+
+"@ -ForegroundColor Cyan
+}
+
+function Export-TLSReport {
+    <#
+    .SYNOPSIS
+        Exports TLS configuration to a report file
+    .DESCRIPTION
+        Creates a detailed report of TLS settings for documentation
+    #>
+    Write-Header "Exporting TLS Configuration Report"
+    
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $reportPath = Join-Path $script:DefaultLogPath "TLSReport_$($timestamp).txt"
+    
+    if (-not (Test-PathValid -Path $script:DefaultLogPath -CreateIfNotExist)) {
+        Write-Error "Cannot create report directory"
+        return
+    }
+    
+    try {
+        $report = @"
+========================================
+TLS CONFIGURATION REPORT
+Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+Computer: $($env:COMPUTERNAME)
+========================================
+
+"@
+        
+        # Get all protocol info
+        $tlsProtocols = @("TLS 1.0", "TLS 1.1", "TLS 1.2", "TLS 1.3")
+        
+        foreach ($protocol in $tlsProtocols) {
+            $report += "`n--- $protocol ---`n"
+            $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$protocol"
+            
+            if (Test-Path $regPath) {
+                # Client
+                $clientPath = Join-Path $regPath "Client"
+                if (Test-Path $clientPath) {
+                    $clientProps = Get-ItemProperty -Path $clientPath -ErrorAction SilentlyContinue
+                    $report += "Client Enabled: $($clientProps.Enabled)`n"
+                    $report += "Client DisabledByDefault: $($clientProps.DisabledByDefault)`n"
+                } else {
+                    $report += "Client: Not configured`n"
+                }
+                
+                # Server
+                $serverPath = Join-Path $regPath "Server"
+                if (Test-Path $serverPath) {
+                    $serverProps = Get-ItemProperty -Path $serverPath -ErrorAction SilentlyContinue
+                    $report += "Server Enabled: $($serverProps.Enabled)`n"
+                    $report += "Server DisabledByDefault: $($serverProps.DisabledByDefault)`n"
+                } else {
+                    $report += "Server: Not configured`n"
+                }
+            } else {
+                $report += "Not configured (using system defaults)`n"
+            }
+        }
+        
+        # .NET Framework
+        $report += "`n--- .NET Framework Configuration ---`n"
+        $netFx4Path = "HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319"
+        if (Test-Path $netFx4Path) {
+            $netProps = Get-ItemProperty -Path $netFx4Path -ErrorAction SilentlyContinue
+            $report += "SchUseStrongCrypto (32-bit): $($netProps.SchUseStrongCrypto)`n"
+            $report += "SystemDefaultTlsVersions (32-bit): $($netProps.SystemDefaultTlsVersions)`n"
+        }
+        
+        $netFx4Path64 = "HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v4.0.30319"
+        if (Test-Path $netFx4Path64) {
+            $netProps64 = Get-ItemProperty -Path $netFx4Path64 -ErrorAction SilentlyContinue
+            $report += "SchUseStrongCrypto (64-bit): $($netProps64.SchUseStrongCrypto)`n"
+            $report += "SystemDefaultTlsVersions (64-bit): $($netProps64.SystemDefaultTlsVersions)`n"
+        }
+        
+        # Cipher Suites
+        $report += "`n--- Enabled Cipher Suites ---`n"
+        try {
+            $cipherSuites = Get-TlsCipherSuite -ErrorAction SilentlyContinue
+            if ($cipherSuites) {
+                foreach ($suite in $cipherSuites) {
+                    $report += "$($suite.Name)`n"
+                }
+            }
+        } catch {
+            $report += "Could not retrieve cipher suites`n"
+        }
+        
+        $report | Out-File -FilePath $reportPath -Encoding UTF8 -ErrorAction Stop
+        Write-Success "TLS Report generated: $($reportPath)"
+        
+        $open = Get-ValidatedChoice -Prompt "Open report? (Y/N)" -ValidChoices @("Y", "N")
+        if ($open -eq "Y") {
+            try {
+                notepad $reportPath
+            } catch {
+                Write-Warning "Could not open report automatically. Please navigate to: $($reportPath)"
+            }
+        }
+    } catch {
+        Write-Error "Failed to generate TLS report: $($_.Exception.Message)"
+    }
+}
+
 function Export-SystemReport {
     <#
     .SYNOPSIS
@@ -1422,9 +1757,10 @@ function Show-MainMenu {
     
     Write-Host "`nUTILITIES:" -ForegroundColor Yellow
     Write-Host "  6. Generate System Report" -ForegroundColor White
-    Write-Host "  7. Validator Script Information" -ForegroundColor White
-    Write-Host "  8. Configure TSS Path" -ForegroundColor White
-    Write-Host "  9. Check TSS Status" -ForegroundColor White
+    Write-Host "  7. TLS Configuration Validation" -ForegroundColor White
+    Write-Host "  8. Validator Script Information" -ForegroundColor White
+    Write-Host "  9. Configure TSS Path" -ForegroundColor White
+    Write-Host " 10. Check TSS Status" -ForegroundColor White
     
     Write-Host "`n  0. Exit" -ForegroundColor Red
     
@@ -1480,58 +1816,67 @@ function Start-TroubleshootingTool {
     try {
         do {
             Show-MainMenu
-            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-9)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9")
+            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-10)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10")
             
-            switch ($choice) {
-                "1" {
-                    Clear-Host
-                    Test-NetworkConfiguration
-                    Write-Host "`n"
-                    Start-NetworkLogCollection
-                }
-                "2" {
-                    Clear-Host
-                    Test-MemoryUsage
-                    Write-Host "`n"
-                    Start-MemoryLogCollection
-                }
-                "3" {
-                    Clear-Host
-                    Test-CPUUsage
-                    Write-Host "`n"
-                    Start-CPULogCollection
-                }
-                "4" {
-                    Clear-Host
-                    Test-DiskPerformance
-                    Write-Host "`n"
-                    Start-DiskLogCollection
-                }
-                "5" {
-                    Clear-Host
-                    Show-AdditionalScenarios
-                }
-                "6" {
-                    Clear-Host
-                    Export-SystemReport
-                }
-                "7" {
-                    Clear-Host
-                    Show-ValidatorInfo
-                }
-                "8" {
-                    Clear-Host
-                    Set-TSSPath
-                }
-                "9" {
-                    Clear-Host
-                    $null = Test-TSSAvailable
-                }
-                "0" {
-                    Write-Host "`nExiting... Thank you for using the troubleshooting tool!" -ForegroundColor Cyan
-                    break
-                }
-            }
+switch ($choice) {
+    "1" {
+        Clear-Host
+        Test-NetworkConfiguration
+        Write-Host "`n"
+        Start-NetworkLogCollection
+    }
+    "2" {
+        Clear-Host
+        Test-MemoryUsage
+        Write-Host "`n"
+        Start-MemoryLogCollection
+    }
+    "3" {
+        Clear-Host
+        Test-CPUUsage
+        Write-Host "`n"
+        Start-CPULogCollection
+    }
+    "4" {
+        Clear-Host
+        Test-DiskPerformance
+        Write-Host "`n"
+        Start-DiskLogCollection
+    }
+    "5" {
+        Clear-Host
+        Show-AdditionalScenarios
+    }
+    "6" {
+        Clear-Host
+        Export-SystemReport
+    }
+    "7" {
+        Clear-Host
+        Test-TLSConfiguration
+        Write-Host "`n"
+        $export = Get-ValidatedChoice -Prompt "Export TLS report? (Y/N)" -ValidChoices @("Y", "N")
+        if ($export -eq "Y") {
+            Export-TLSReport
+        }
+    }
+    "8" {
+        Clear-Host
+        Show-ValidatorInfo
+    }
+    "9" {
+        Clear-Host
+        Set-TSSPath
+    }
+    "10" {
+        Clear-Host
+        $null = Test-TSSAvailable
+    }
+    "0" {
+        Write-Host "`nExiting... Thank you for using the troubleshooting tool!" -ForegroundColor Cyan
+        break
+    }
+}
             
             if ($choice -ne "0") {
                 Write-Host "`n"
