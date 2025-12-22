@@ -2,7 +2,7 @@
 
 ## Overview
 
-A comprehensive PowerShell-based interactive tool designed for Windows Server administrators to diagnose and collect logs for common server issues including Network, Memory, CPU, and Disk performance problems.
+A comprehensive PowerShell-based interactive tool designed for Windows Server administrators to diagnose and collect logs for common server issues including Network, Memory, CPU, Disk performance problems, and TLS/SSL configuration validation.
 
 **Version:** 2.0  
 **Requires:** Administrator privileges, PowerShell 5.1 or higher
@@ -28,8 +28,18 @@ A comprehensive PowerShell-based interactive tool designed for Windows Server ad
 - Server health assessments
 - Event log exports
 
+### 🔐 Security & Compliance
+- **TLS Configuration Validation**: Comprehensive TLS/SSL protocol analysis
+  - Check enabled TLS versions (1.0, 1.1, 1.2, 1.3)
+  - Validate .NET Framework TLS support
+  - Analyze cipher suites and identify weak ciphers
+  - Verify PowerShell TLS capabilities
+  - Export detailed TLS configuration reports
+  - Provides remediation commands for security hardening
+
 ### 📊 Utilities
 - Comprehensive system report generation
+- TLS configuration validation and reporting
 - TSS (TroubleShootingScript) integration
 - Validator script information
 - Transcript logging support
@@ -125,9 +135,10 @@ ADDITIONAL SCENARIOS:
 
 UTILITIES:
   6. Generate System Report
-  7. Validator Script Information
-  8. Update TSS Path
-  9. Check TSS Status
+  7. TLS Configuration Validation
+  8. Validator Script Information
+  9. Configure TSS Path
+  10. Check TSS Status
 
   0. Exit
 ```
@@ -315,6 +326,131 @@ Generates a comprehensive text report including:
 
 ---
 
+## TLS Configuration Validation (Option 7)
+
+### Overview
+Comprehensive TLS/SSL protocol analysis and security validation tool that helps ensure your server meets modern security standards and compliance requirements.
+
+### Checks Performed
+
+#### Protocol Analysis
+- **TLS 1.0 Status**: Client and Server configuration (deprecated, should be disabled)
+- **TLS 1.1 Status**: Client and Server configuration (deprecated, should be disabled)
+- **TLS 1.2 Status**: Client and Server configuration (minimum requirement)
+- **TLS 1.3 Status**: Client and Server configuration (recommended for Windows Server 2022+)
+
+#### .NET Framework Configuration
+- SchUseStrongCrypto settings (32-bit and 64-bit)
+- SystemDefaultTlsVersions settings (32-bit and 64-bit)
+- Validates proper .NET Framework TLS support for applications
+
+#### PowerShell TLS Support
+- Current session security protocol configuration
+- TLS 1.2 and 1.3 availability check
+- Provides commands to enable TLS in PowerShell sessions
+
+#### Cipher Suite Analysis
+- Lists all enabled cipher suites in priority order
+- Identifies TLS 1.3 cipher suites (most secure)
+- Flags strong cipher suites (GCM, ECDHE)
+- **Detects weak/deprecated ciphers**: RC4, DES, 3DES, MD5, NULL, EXPORT, anonymous
+- Provides security recommendations
+
+### Output Information
+
+The TLS validation provides:
+
+1. **Color-coded status indicators**:
+   - 🟢 **Green (SUCCESS)**: Protocol/feature is properly enabled
+   - 🟡 **Yellow (WARNING)**: Protocol/feature needs attention or is disabled
+   - 🔴 **Red (ERROR)**: Critical security issue detected (weak ciphers, deprecated protocols enabled)
+   - ⚪ **White (INFO)**: Informational status
+
+2. **Security recommendations** based on current best practices
+
+3. **Remediation commands** for common TLS configuration tasks
+
+### TLS Report Export
+
+The tool can generate a detailed TLS configuration report including:
+- Complete protocol status for all TLS versions
+- .NET Framework configuration details
+- Full list of enabled cipher suites
+- Registry configuration values
+- Timestamp and server identification
+
+**Report Location:** `%TEMP%\ServerDiagnostics\Logs\TLSReport_YYYYMMDD_HHMMSS.txt`
+
+### Security Best Practices
+
+#### Recommended Configuration
+
+✅ **ENABLE**:
+- TLS 1.2 (minimum requirement)
+- TLS 1.3 (if supported by your OS)
+- Strong cipher suites (AES-GCM, ChaCha20-Poly1305)
+- .NET Framework strong crypto
+- System default TLS versions
+
+❌ **DISABLE**:
+- TLS 1.0 (deprecated since 2020)
+- TLS 1.1 (deprecated since 2020)
+- Weak cipher suites (RC4, DES, 3DES, CBC-mode)
+- SSL 3.0 and earlier (if not already disabled)
+
+### Quick Fix Commands
+
+The tool provides ready-to-use PowerShell commands for:
+
+#### Disabling TLS 1.0 and 1.1
+```powershell
+# Disable TLS 1.0
+New-Item 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server' -Force
+New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server' -Name 'Enabled' -Value 0 -PropertyType 'DWord' -Force
+New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server' -Name 'DisabledByDefault' -Value 1 -PropertyType 'DWord' -Force
+
+# Disable TLS 1.1
+New-Item 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server' -Force
+New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server' -Name 'Enabled' -Value 0 -PropertyType 'DWord' -Force
+New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server' -Name 'DisabledByDefault' -Value 1 -PropertyType 'DWord' -Force
+```
+
+#### Enabling TLS 1.2
+```powershell
+New-Item 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Server' -Force
+New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Server' -Name 'Enabled' -Value 1 -PropertyType 'DWord' -Force
+New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Server' -Name 'DisabledByDefault' -Value 0 -PropertyType 'DWord' -Force
+```
+
+#### Enabling .NET Framework TLS 1.2
+```powershell
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319' -Name 'SchUseStrongCrypto' -Value 1 -Type DWord
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319' -Name 'SystemDefaultTlsVersions' -Value 1 -Type DWord
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v4.0.30319' -Name 'SchUseStrongCrypto' -Value 1 -Type DWord
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v4.0.30319' -Name 'SystemDefaultTlsVersions' -Value 1 -Type DWord
+```
+
+**⚠️ IMPORTANT**: A system restart is required after making TLS registry changes!
+
+### Use Cases
+
+**When to use TLS validation:**
+- **Security Audits**: Verify server meets security compliance requirements (PCI DSS, HIPAA, SOC 2)
+- **Troubleshooting**: Diagnose SSL/TLS connection failures
+- **Migration Planning**: Before/after validation when upgrading servers or applications
+- **Compliance**: Regular checks to ensure deprecated protocols remain disabled
+- **Application Issues**: When applications fail to connect due to TLS version mismatches
+- **Vulnerability Remediation**: After applying security patches or hardening configurations
+
+**Common scenarios:**
+1. Application connections failing after disabling TLS 1.0/1.1
+2. Browser warnings about insecure connections
+3. API integration issues related to cipher suites
+4. .NET applications unable to establish HTTPS connections
+5. Compliance audit preparation (PCI DSS requires TLS 1.2+)
+
+---
+
 ## TSS Configuration
 
 ### Default TSS Path
@@ -330,11 +466,11 @@ $script:TSSPath = "D:\YourPath\TSS"
 
 **Method 2: Runtime Update** (Temporary)
 1. Run the script
-2. Select option 8: "Update TSS Path"
+2. Select option 9: "Configure TSS Path"
 3. Enter your TSS installation path
 4. Press Enter to validate
 
-### TSS Status Check (Option 9)
+### TSS Status Check (Option 10)
 Verifies:
 - TSS directory exists
 - TSS.ps1 file is present
@@ -380,6 +516,7 @@ $script:DefaultLogPath = Join-Path $script:TempBasePath "Logs"
 | File Type | Default Location | Description |
 |-----------|------------------|-------------|
 | System Reports | `%TEMP%\ServerDiagnostics\Logs\` | Comprehensive system reports |
+| TLS Reports | `%TEMP%\ServerDiagnostics\Logs\` | TLS configuration reports |
 | Transcript Logs | `%TEMP%\ServerDiagnostics\Logs\` | Session transcript logs |
 | TSS Logs | `C:\MS_DATA\` | TSS-generated logs (configurable) |
 | Event Logs | `%TEMP%\ServerDiagnostics\Logs\EventLogs\` | Exported event logs |
@@ -408,6 +545,15 @@ When using TSS commands, logs are typically saved to:
 2. **Long-term Monitoring**: Use Performance Monitor (2-4 hours)
 3. **Baseline Collection**: Capture during normal operations for comparison
 4. **Off-peak Hours**: For comprehensive assessments, run during low activity
+
+### 🔐 Security Best Practices
+
+1. **Regular TLS Audits**: Run TLS validation monthly or after system changes
+2. **Disable Deprecated Protocols**: Immediately disable TLS 1.0 and 1.1
+3. **Enable Strong Cryptography**: Configure .NET Framework for TLS 1.2+
+4. **Monitor Cipher Suites**: Regularly check for and remove weak ciphers
+5. **Document Changes**: Keep records of all security configuration changes
+6. **Test Before Production**: Validate TLS changes in test environment first
 
 ### 🔧 Troubleshooting Tips
 
@@ -448,8 +594,8 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 #### Issue: "TSS not found"
 **Solution:** 
 1. Download TSS from provided links
-2. Extract to `C:\TSS` or update path (Option 8)
-3. Verify with Option 9
+2. Extract to `C:\TSS` or update path (Option 9)
+3. Verify with Option 10
 
 #### Issue: "Cannot create directory"
 **Solution:** Check permissions and disk space
@@ -463,6 +609,11 @@ Test-Path $env:TEMP -PathType Container
 - Script will skip unavailable properties
 - No action required
 
+#### Issue: "Get-TlsCipherSuite cmdlet not found"
+**Solution:** Requires Windows Server 2012 R2 or later
+- TLS validation will work partially
+- Cipher suite analysis will be skipped
+
 ---
 
 ## Performance Impact
@@ -472,13 +623,14 @@ Test-Path $env:TEMP -PathType Container
 | Activity | CPU Impact | Memory Impact | Disk I/O | Network I/O |
 |----------|------------|---------------|----------|-------------|
 | Diagnostics Only | Minimal (<5%) | Minimal (<100MB) | Low | Low |
+| TLS Validation | Minimal (<2%) | Minimal (<50MB) | Low | None |
 | TSS Traces | Low-Medium (5-15%) | Medium (200-500MB) | Medium-High | Low-Medium |
 | Performance Monitor | Minimal (<2%) | Low (50-200MB) | Medium | Minimal |
 | System Report | Minimal (<3%) | Minimal (<50MB) | Low | Minimal |
 
 ### Recommendations
 
-- **Production Servers**: Safe to run diagnostics anytime
+- **Production Servers**: Safe to run diagnostics and TLS validation anytime
 - **Trace Collection**: Monitor system resources during collection
 - **Peak Hours**: Avoid long-term traces during critical operations
 - **Resource-Constrained**: Use shorter capture windows or specific traces
@@ -524,6 +676,13 @@ Suggestions for improvements are welcome. Consider:
 - ✨ Enhanced documentation and help
 - ✨ Transcript logging support
 - ✨ Improved user experience with validated inputs
+- ✨ **NEW: TLS Configuration Validation**
+  - Protocol status checking (TLS 1.0, 1.1, 1.2, 1.3)
+  - .NET Framework TLS support validation
+  - Cipher suite analysis with weak cipher detection
+  - PowerShell TLS capability check
+  - Detailed TLS configuration reports
+  - Security remediation commands
 - 🐛 Fixed path handling issues
 - 🐛 Resolved TSS execution errors
 
@@ -542,6 +701,8 @@ This tool is provided "as is" without warranty of any kind. Always:
 - Review commands before execution
 - Ensure adequate backups exist
 - Monitor system resources during log collection
+- **Test TLS changes in development/staging before production**
+- **Verify application compatibility after TLS configuration changes**
 
 ### Usage Rights
 
@@ -550,6 +711,7 @@ This script is intended for:
 - IT support personnel
 - System troubleshooting and diagnostics
 - Performance analysis and optimization
+- Security compliance and auditing
 
 ---
 
@@ -561,6 +723,7 @@ This script is intended for:
 - [ ] Download and extract TSS to `C:\TSS`
 - [ ] Execute script
 - [ ] Run diagnostics (Options 1-4)
+- [ ] Run TLS validation (Option 7) for security audit
 - [ ] Collect logs if issues found
 - [ ] Review output and collected logs
 
@@ -584,6 +747,22 @@ This script is intended for:
 3. Run for 2-4 hours during normal operations
 4. Analyze .blg files with Performance Monitor
 
+**Security Audit:**
+1. Option 7 → Run TLS Configuration Validation
+2. Review protocol status and cipher suites
+3. Export TLS report for documentation
+4. Apply remediation commands if needed
+5. Restart server
+6. Re-run validation to confirm changes
+
+**Pre-Deployment Security Check:**
+1. Option 7 → Validate current TLS configuration
+2. Option 6 → Generate system report
+3. Document current state
+4. Apply security hardening
+5. Option 7 → Verify changes
+6. Export reports for compliance documentation
+
 ---
 
 ## Contact & Resources
@@ -593,6 +772,14 @@ This script is intended for:
 - [Windows Server Documentation](https://docs.microsoft.com/windows-server/)
 - [Performance Tuning Guidelines](https://docs.microsoft.com/windows-server/administration/performance-tuning/)
 - [ProcDump Documentation](https://learn.microsoft.com/sysinternals/downloads/procdump)
+- [TLS Best Practices](https://docs.microsoft.com/windows-server/security/tls/tls-registry-settings)
+- [.NET Framework TLS](https://docs.microsoft.com/dotnet/framework/network-programming/tls)
+
+### Security Resources
+- [NIST TLS Guidelines](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-52r2.pdf)
+- [PCI DSS Requirements](https://www.pcisecuritystandards.org/)
+- [OWASP TLS Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Transport_Layer_Protection_Cheat_Sheet.html)
+- [SSL Labs Server Test](https://www.ssllabs.com/ssltest/)
 
 ### Tools Mentioned
 - **TSS (TroubleShootingScript)**: Microsoft's comprehensive data collection tool
@@ -600,6 +787,7 @@ This script is intended for:
 - **Performance Monitor**: Real-time and historical performance data
 - **ProcDump**: Application crash dump utility
 - **Netsh**: Network tracing utility
+- **IISCrypto**: GUI tool for TLS configuration (third-party)
 
 ---
 
@@ -627,9 +815,21 @@ This script is intended for:
 | Intermittent Issue | 30 minutes | 2-4 hours |
 | Baseline Collection | 2 hours | 4 hours |
 | Disk Performance | 10 minutes | 15 minutes |
+| TLS Validation | Instant | N/A |
+
+### TLS Protocol Support by Windows Version
+
+| Windows Version | TLS 1.0 | TLS 1.1 | TLS 1.2 | TLS 1.3 |
+|-----------------|---------|---------|---------|---------|
+| Server 2008 R2 | ✅ Default | ✅ Default | ✅ (Update required) | ❌ |
+| Server 2012 | ✅ Default | ✅ Default | ✅ Default | ❌ |
+| Server 2012 R2 | ✅ Default | ✅ Default | ✅ Default | ❌ |
+| Server 2016 | ✅ Default | ✅ Default | ✅ Default | ❌ |
+| Server 2019 | ✅ (Disabled) | ✅ (Disabled) | ✅ Default | ❌ |
+| Server 2022 | ❌ Disabled | ❌ Disabled | ✅ Default | ✅ Available |
 
 ---
 
 **Last Updated:** December 2024  
 **Script Version:** 2.0  
-**Documentation Version:** 1.0
+**Documentation Version:** 2.0
