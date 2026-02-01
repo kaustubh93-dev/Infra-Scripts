@@ -10,7 +10,8 @@
     .\WindowsServertroubleshootingtool_v1.ps1
     .\WindowsServertroubleshootingtool_v1.ps1 -EnableLogging
 .NOTES
-    Version: 2.0
+    Version: 2.1
+    Last Updated: 2026-02-01
     Requires: Administrator privileges
     Enhanced with improved error handling, validation, and best practices
 #>
@@ -24,6 +25,10 @@ param(
 # If running on older PowerShell versions, some cmdlets may be unavailable.
 
 #region Constants and Configuration
+# Script Version
+$script:ScriptVersion = "2.1"
+$script:LastUpdated = "2026-02-01"
+
 # Threshold Constants
 $MEMORY_CRITICAL_THRESHOLD = 90
 $MEMORY_WARNING_THRESHOLD = 80
@@ -35,14 +40,30 @@ $DISK_LATENCY_CRITICAL_MS = 50
 $DISK_LATENCY_WARNING_MS = 20
 $DISK_LATENCY_ACCEPTABLE_MS = 10
 $PORT_EXHAUSTION_THRESHOLD = 0.8
+$NETWORK_PACKET_ERROR_THRESHOLD = 100
+$LOG_RETENTION_DAYS = 30
 
 # Path Configuration
 $script:TempBasePath = Join-Path $env:TEMP "ServerDiagnostics"
 $script:DefaultLogPath = Join-Path $script:TempBasePath "Logs"
 
-# TSS Path Configuration - HARDCODED
-# Change this path to match your TSS installation location
-$script:TSSPath = "C:\TSS"  # Default hardcoded path
+# TSS Path Configuration - Auto-detection
+# Automatically detects TSS from common installation locations
+$script:TSSPath = @(
+    "C:\TSS",
+    "C:\Tools\TSS",
+    "$env:ProgramFiles\TSS",
+    "$env:SystemDrive\TSS"
+) | Where-Object { Test-Path $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
+
+if (-not $script:TSSPath) {
+    $script:TSSPath = "C:\TSS"  # Fallback default
+}
+
+# Process Analysis Cache
+$script:ProcessCacheTimeout = 30  # seconds
+$script:ProcessCache = $null
+$script:ProcessCacheTime = $null
 #endregion
 
 #region Output and Display Functions
@@ -80,28 +101,30 @@ function Write-Success {
     Write-Host "[SUCCESS] $($Text)" -ForegroundColor Green
 }
 
-function Write-Warning {
+function Write-WarningMessage {
     <#
     .SYNOPSIS
-        Displays a warning message
+        Displays a warning message with custom formatting
     .PARAMETER Text
         The warning message to display
+    .OUTPUTS
+        None
     #>
     param([string]$Text)
-    # Forward to the built-in warning cmdlet to preserve expected behavior
-    Microsoft.PowerShell.Utility\Write-Warning -Message $Text
+    Write-Host "[WARNING] $($Text)" -ForegroundColor Yellow
 }
 
-function Write-Error {
+function Write-ErrorMessage {
     <#
     .SYNOPSIS
-        Displays an error message
+        Displays an error message with custom formatting
     .PARAMETER Text
         The error message to display
+    .OUTPUTS
+        None
     #>
     param([string]$Text)
-    # Forward to the built-in error cmdlet to preserve error records and streams
-    Microsoft.PowerShell.Utility\Write-Error -Message $Text
+    Write-Host "[ERROR] $($Text)" -ForegroundColor Red
 }
 
 function Write-Info {
@@ -135,8 +158,9 @@ function Initialize-DiagnosticPaths {
         }
         
         return $true
-    } catch {
-        Write-Error "Failed to initialize diagnostic paths: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to initialize diagnostic paths: $($_.Exception.Message)"
         return $false
     }
 }
@@ -161,7 +185,7 @@ function Test-PathValid {
     
     # Validate path format
     if (-not (Test-Path $Path -IsValid)) {
-        Write-Error "Invalid path format: $($Path)"
+        Write-ErrorMessage "Invalid path format: $($Path)"
         return $false
     }
     
@@ -172,12 +196,14 @@ function Test-PathValid {
                 New-Item -Path $Path -ItemType Directory -Force -ErrorAction Stop | Out-Null
                 Write-Success "Created directory: $($Path)"
                 return $true
-            } catch {
-                Write-Error "Cannot create directory: $($_.Exception.Message)"
+            }
+            catch {
+                Write-ErrorMessage "Cannot create directory: $($_.Exception.Message)"
                 return $false
             }
-        } else {
-            Write-Warning "Path does not exist: $($Path)"
+        }
+        else {
+            Write-WarningMessage "Path does not exist: $($Path)"
             return $false
         }
     }
@@ -213,7 +239,7 @@ function Get-ValidatedChoice {
             return $choice
         }
         
-        Write-Warning "Invalid choice. Please enter one of: $($ValidChoices -join ', ')"
+        Write-WarningMessage "Invalid choice. Please enter one of: $($ValidChoices -join ', ')"
     } while ($true)
 }
 
@@ -241,7 +267,8 @@ function Invoke-WithTSSCheck {
         if ($confirm -eq "Y") {
             Invoke-TSSCommand -Command $TSSCommand
         }
-    } else {
+    }
+    else {
         if ($ManualAlternativeAction) {
             & $ManualAlternativeAction
         }
@@ -251,29 +278,58 @@ function Invoke-WithTSSCheck {
 function Get-ProcessAnalysis {
     <#
     .SYNOPSIS
-        Analyzes process resource usage
+        Analyzes process resource usage with caching
     .DESCRIPTION
         Gets top processes by CPU and Memory usage in a single call
+        Uses caching to avoid redundant WMI calls within the cache timeout period
     .PARAMETER TopCount
         Number of top processes to return (default: 10)
+    .PARAMETER Force
+        Force refresh of cached data
+    .OUTPUTS
+        Hashtable with ByCPU, ByMemory, and Total properties
     #>
     param(
-        [int]$TopCount = 10
+        [int]$TopCount = 10,
+        [switch]$Force
     )
     
+    # Check if cache is valid
+    $cacheValid = $false
+    if (-not $Force -and $script:ProcessCache -and $script:ProcessCacheTime) {
+        $cacheAge = (Get-Date) - $script:ProcessCacheTime
+        if ($cacheAge.TotalSeconds -lt $script:ProcessCacheTimeout) {
+            $cacheValid = $true
+        }
+    }
+    
+    # Return cached data if valid
+    if ($cacheValid) {
+        return $script:ProcessCache
+    }
+    
+    # Retrieve fresh process data
     try {
         $processes = Get-Process -ErrorAction Stop
         
-        return @{
-            ByCPU = $processes | Sort-Object CPU -Descending | Select-Object -First $TopCount
+        $result = @{
+            ByCPU    = $processes | Sort-Object CPU -Descending | Select-Object -First $TopCount
             ByMemory = $processes | Sort-Object WS -Descending | Select-Object -First $TopCount
-            Total = $processes.Count
+            Total    = $processes.Count
         }
-    } catch {
-        Write-Error "Failed to retrieve process information: $($_.Exception.Message)"
+        
+        # Update cache
+        $script:ProcessCache = $result
+        $script:ProcessCacheTime = Get-Date
+        
+        return $result
+    }
+    catch {
+        Write-ErrorMessage "Failed to retrieve process information: $($_.Exception.Message)"
         return $null
     }
 }
+
 #endregion
 
 #region TSS Functions
@@ -305,14 +361,14 @@ function Set-TSSPath {
     
     # Validate the path
     if (-not (Test-Path $userPath -PathType Container)) {
-        Write-Error "Invalid path: Directory does not exist"
+        Write-ErrorMessage "Invalid path: Directory does not exist"
         return $false
     }
     
     # Check if TSS.ps1 exists in the provided path
     $tssScript = Join-Path $userPath "TSS.ps1"
     if (-not (Test-Path $tssScript -PathType Leaf)) {
-        Write-Error "TSS.ps1 not found in the specified directory: $($userPath)"
+        Write-ErrorMessage "TSS.ps1 not found in the specified directory: $($userPath)"
         Write-Info "Please ensure TSS.ps1 exists in the folder you specified."
         return $false
     }
@@ -332,7 +388,7 @@ function Test-TSSAvailable {
         Boolean indicating TSS availability
     #>
     if ([string]::IsNullOrWhiteSpace($script:TSSPath)) {
-        Write-Warning "TSS path not configured"
+        Write-WarningMessage "TSS path not configured"
         Write-Info "Please configure TSS path from the main menu (option 8)"
         Write-Info "Download TSS from:"
         Write-Info "  - https://aka.ms/getTSS"
@@ -342,7 +398,7 @@ function Test-TSSAvailable {
     }
     
     if (-not (Test-Path $script:TSSPath -PathType Container)) {
-        Write-Warning "TSS directory not found at: $($script:TSSPath)"
+        Write-WarningMessage "TSS directory not found at: $($script:TSSPath)"
         Write-Info "Please update TSS path from the main menu (option 8)"
         return $false
     }
@@ -351,8 +407,9 @@ function Test-TSSAvailable {
     if (Test-Path $tssScript) {
         Write-Success "TSS found at: $($tssScript)"
         return $true
-    } else {
-        Write-Warning "TSS.ps1 not found at: $($script:TSSPath)"
+    }
+    else {
+        Write-WarningMessage "TSS.ps1 not found at: $($script:TSSPath)"
         Write-Info "Please verify TSS installation or update path from the main menu (option 8)"
         return $false
     }
@@ -368,23 +425,23 @@ function Invoke-TSSCommand {
         Invoke-TSSCommand "-SDP Net -AcceptEula"
     #>
     param(
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [string]$Command
     )
     
     if ([string]::IsNullOrWhiteSpace($script:TSSPath)) {
-        Write-Error "TSS path not configured. Please configure from main menu (option 8)"
+        Write-ErrorMessage "TSS path not configured. Please configure from main menu (option 8)"
         return $false
     }
     
     if (-not (Test-Path $script:TSSPath -PathType Container)) {
-        Write-Error "TSS directory not found at: $($script:TSSPath)"
+        Write-ErrorMessage "TSS directory not found at: $($script:TSSPath)"
         return $false
     }
     
     $tssScript = Join-Path $script:TSSPath "TSS.ps1"
     if (-not (Test-Path $tssScript)) {
-        Write-Error "TSS.ps1 not found at: $($tssScript)"
+        Write-ErrorMessage "TSS.ps1 not found at: $($tssScript)"
         return $false
     }
     
@@ -394,17 +451,25 @@ function Invoke-TSSCommand {
         # Change to TSS directory
         Set-Location $script:TSSPath
         
-        # Execute TSS command
-        $fullCommand = "& '$tssScript' $Command"
-        Write-Info "Executing: $fullCommand"
-        Invoke-Expression $fullCommand
+        # Execute TSS command securely (avoid Invoke-Expression)
+        Write-Info "Executing: $tssScript $Command"
+        
+        # Split command into arguments and execute directly
+        if ($Command) {
+            & $tssScript $Command.Split(" ")
+        }
+        else {
+            & $tssScript
+        }
         
         Write-Success "TSS command completed"
         return $true
-    } catch {
-        Write-Error "Failed to execute TSS command: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to execute TSS command: $($_.Exception.Message)"
         return $false
-    } finally {
+    }
+    finally {
         # Return to original location
         Set-Location $currentLocation
     }
@@ -434,32 +499,49 @@ function Test-NetworkConfiguration {
         foreach ($adapter in $adapters) {
             if ($adapter.Enabled -eq $true) {
                 Write-Success "RSS is ENABLED on $($adapter.Name)"
-            } else {
-                Write-Warning "RSS is DISABLED on $($adapter.Name)"
+            }
+            else {
+                Write-WarningMessage "RSS is DISABLED on $($adapter.Name)"
                 Write-Info "To enable RSS: Set-NetAdapterRss -Name '$($adapter.Name)' -Enabled `$true"
             }
         }
-    } catch {
-        Write-Error "Failed to check RSS status: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to check RSS status: $($_.Exception.Message)"
     }
      
     # Ephemeral Port Usage (Port Exhaustion)
     Write-Info "`nChecking TCP Ephemeral Ports:"
     try {
-        $tcpParams = Get-NetTCPSetting -ErrorAction Stop | Select-Object DynamicPortRangeStartPort, DynamicPortRangeNumberOfPorts
+        $tcpSettings = Get-NetTCPSetting -ErrorAction Stop
+        # Get the first profile with dynamic port settings
+        $tcpParams = $tcpSettings | Where-Object { $_.DynamicPortRangeNumberOfPorts -gt 0 } | Select-Object -First 1
+        
         $currentConnections = (Get-NetTCPConnection -ErrorAction Stop).Count
-        $maxPorts = $tcpParams.DynamicPortRangeNumberOfPorts
+        
+        # Use the dynamic port range from settings, or default Windows value
+        $maxPorts = if ($tcpParams -and $tcpParams.DynamicPortRangeNumberOfPorts) {
+            $tcpParams.DynamicPortRangeNumberOfPorts
+        }
+        else {
+            49152  # Default Windows dynamic port range size
+        }
         
         Write-Info "  Active TCP Connections: $($currentConnections)"
         Write-Info "  Max Dynamic Ports Available: $($maxPorts)"
         
+        $portUsagePercent = ($currentConnections / $maxPorts) * 100
+        Write-Info "  Port Usage: $([math]::Round($portUsagePercent, 2))%"
+        
         if ($currentConnections -gt ($maxPorts * $PORT_EXHAUSTION_THRESHOLD)) {
-            Write-Error "  CRITICAL: Potential Port Exhaustion (Using >$($PORT_EXHAUSTION_THRESHOLD * 100)% of available ports)"
-        } else {
+            Write-ErrorMessage "  CRITICAL: Potential Port Exhaustion (Using >$($PORT_EXHAUSTION_THRESHOLD * 100)% of available ports)"
+        }
+        else {
             Write-Success "  Port usage is within acceptable range"
         }
-    } catch {
-        Write-Error "Failed to check ephemeral ports: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to check ephemeral ports: $($_.Exception.Message)"
     }
 
     # Check VMQ (Virtual Machine Queue) Status
@@ -470,20 +552,22 @@ function Test-NetworkConfiguration {
             foreach ($v in $vmq) {
                 Write-Info "  $($v.Name): VMQ Enabled: $($v.Enabled)"
                 if ($v.Enabled -eq $true) {
-                    Write-Warning "    Note: If this is a 1Gbps Broadcom adapter, consider disabling VMQ to prevent packet drops."
+                    Write-WarningMessage "    Note: If this is a 1Gbps Broadcom adapter, consider disabling VMQ to prevent packet drops."
                 }
             }
-        } else {
+        }
+        else {
             Write-Info "  No VMQ-capable adapters found or VMQ not available"
         }
-    } catch {
-        Write-Warning "Could not retrieve VMQ information: $($_.Exception.Message)"
+    }
+    catch {
+        Write-WarningMessage "Could not retrieve VMQ information: $($_.Exception.Message)"
     }
 
     # Check Network Adapter Advanced Properties
     Write-Info "`nChecking Network Adapter Buffer Settings..."
     try {
-        $netAdapters = Get-NetAdapter -ErrorAction Stop | Where-Object {$_.Status -eq "Up"}
+        $netAdapters = Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
         
         foreach ($adapter in $netAdapters) {
             Write-Info "`nAdapter: $($adapter.Name)"
@@ -491,32 +575,35 @@ function Test-NetworkConfiguration {
                 $advProps = Get-NetAdapterAdvancedProperty -Name $adapter.Name -ErrorAction Stop
                 
                 # Check Small Rx Buffers
-                $smallRxBuffer = $advProps | Where-Object {$_.DisplayName -like "*Small*Rx*Buffer*" -or $_.RegistryKeyword -like "*SmallRxBuffers*"}
+                $smallRxBuffer = $advProps | Where-Object { $_.DisplayName -like "*Small*Rx*Buffer*" -or $_.RegistryKeyword -like "*SmallRxBuffers*" }
                 if ($smallRxBuffer) {
                     $currentValue = $smallRxBuffer.DisplayValue
                     Write-Info "  Small Rx Buffers: $($currentValue)"
                     if ($currentValue -ne "8192") {
-                        Write-Warning "  Recommended value is 8192"
+                        Write-WarningMessage "  Recommended value is 8192"
                     }
                 }
                 
                 # Check Rx Ring Size
-                $rxRingSize = $advProps | Where-Object {$_.DisplayName -like "*Rx Ring*" -or $_.RegistryKeyword -like "*RxRing*"}
+                $rxRingSize = $advProps | Where-Object { $_.DisplayName -like "*Rx Ring*" -or $_.RegistryKeyword -like "*RxRing*" }
                 if ($rxRingSize) {
                     $currentValue = $rxRingSize.DisplayValue
                     Write-Info "  Rx Ring Size: $($currentValue)"
                     if ($currentValue -ne "4096") {
-                        Write-Warning "  Recommended value is 4096"
+                        Write-WarningMessage "  Recommended value is 4096"
                     }
                 }
-            } catch [Microsoft.PowerShell.Cmdletization.Cim.CimJobException] {
-                Write-Warning "  Network adapter $($adapter.Name) does not support advanced properties"
-            } catch {
-                Write-Warning "  Unable to retrieve advanced properties for $($adapter.Name): $($_.Exception.Message)"
+            }
+            catch [Microsoft.PowerShell.Cmdletization.Cim.CimJobException] {
+                Write-WarningMessage "  Network adapter $($adapter.Name) does not support advanced properties"
+            }
+            catch {
+                Write-WarningMessage "  Unable to retrieve advanced properties for $($adapter.Name): $($_.Exception.Message)"
             }
         }
-    } catch {
-        Write-Error "Failed to enumerate network adapters: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to enumerate network adapters: $($_.Exception.Message)"
     }
     
     # Check Power Plan
@@ -525,19 +612,21 @@ function Test-NetworkConfiguration {
         $powerPlan = powercfg /getactivescheme
         if ($powerPlan -like "*High performance*") {
             Write-Success "Power Plan is set to High Performance"
-        } else {
-            Write-Warning "Power Plan is NOT set to High Performance"
+        }
+        else {
+            Write-WarningMessage "Power Plan is NOT set to High Performance"
             Write-Info "Current: $($powerPlan)"
             Write-Info "To set High Performance: powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
         }
-    } catch {
-        Write-Error "Failed to check power plan: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to check power plan: $($_.Exception.Message)"
     }
     
     # Network Statistics
     Write-Info "`nNetwork Interface Statistics:"
     try {
-        Get-NetAdapter -ErrorAction Stop | Where-Object {$_.Status -eq "Up"} | ForEach-Object {
+        Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq "Up" } | ForEach-Object {
             try {
                 $stats = Get-NetAdapterStatistics -Name $_.Name -ErrorAction Stop
                 Write-Info "  $($_.Name):"
@@ -545,12 +634,14 @@ function Test-NetworkConfiguration {
                 Write-Info "    Sent Packets: $($stats.SentUnicastPackets)"
                 Write-Info "    Received Errors: $($stats.ReceivedPacketErrors)"
                 Write-Info "    Sent Errors: $($stats.OutboundPacketErrors)"
-            } catch {
-                Write-Warning "  Could not retrieve statistics for $($_.Name)"
+            }
+            catch {
+                Write-WarningMessage "  Could not retrieve statistics for $($_.Name)"
             }
         }
-    } catch {
-        Write-Error "Failed to retrieve network statistics: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to retrieve network statistics: $($_.Exception.Message)"
     }
 }
 
@@ -562,8 +653,6 @@ function Start-NetworkLogCollection {
         Provides options for packet drop, network slowness, or manual trace collection
     #>
     Write-Header "Network Issue Log Collection"
-    
-    $tssAvailable = Test-TSSAvailable
     
     Write-Info "Select Network Issue Type:"
     Write-Host "1. Packet Drop / Network Bottleneck (happening NOW)" -ForegroundColor Yellow
@@ -635,14 +724,17 @@ function Test-MemoryUsage {
         Write-Info "Memory Usage: $($memUsagePercent)%"
         
         if ($memUsagePercent -gt $MEMORY_CRITICAL_THRESHOLD) {
-            Write-Error "CRITICAL: Memory usage above $($MEMORY_CRITICAL_THRESHOLD)%!"
-        } elseif ($memUsagePercent -gt $MEMORY_WARNING_THRESHOLD) {
-            Write-Warning "WARNING: Memory usage above $($MEMORY_WARNING_THRESHOLD)%"
-        } else {
+            Write-ErrorMessage "CRITICAL: Memory usage above $($MEMORY_CRITICAL_THRESHOLD)%!"
+        }
+        elseif ($memUsagePercent -gt $MEMORY_WARNING_THRESHOLD) {
+            Write-WarningMessage "WARNING: Memory usage above $($MEMORY_WARNING_THRESHOLD)%"
+        }
+        else {
             Write-Success "Memory usage is within normal range"
         }
-    } catch {
-        Write-Error "Failed to retrieve memory information: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to retrieve memory information: $($_.Exception.Message)"
         return
     }
     
@@ -652,9 +744,9 @@ function Test-MemoryUsage {
     
     if ($processAnalysis) {
         $processAnalysis.ByMemory | Format-Table Name, 
-            @{Label="Memory(MB)"; Expression={[math]::Round($_.WS / 1MB, 2)}},
-            @{Label="CPU(s)"; Expression={[math]::Round($_.CPU, 2)}},
-            Id -AutoSize
+        @{Label = "Memory(MB)"; Expression = { [math]::Round($_.WS / 1MB, 2) } },
+        @{Label = "CPU(s)"; Expression = { [math]::Round($_.CPU, 2) } },
+        Id -AutoSize
     }
     
     # Check committed bytes
@@ -664,11 +756,12 @@ function Test-MemoryUsage {
             $committedPercent = [math]::Round($perfCounter.CounterSamples.CookedValue, 2)
             Write-Info "`nCommitted Bytes In Use: $($committedPercent)%"
             if ($committedPercent -gt $MEMORY_CRITICAL_THRESHOLD) {
-                Write-Error "CRITICAL: Committed bytes above $($MEMORY_CRITICAL_THRESHOLD)%!"
+                Write-ErrorMessage "CRITICAL: Committed bytes above $($MEMORY_CRITICAL_THRESHOLD)%!"
             }
         }
-    } catch {
-        Write-Warning "Could not retrieve committed bytes information: $($_.Exception.Message)"
+    }
+    catch {
+        Write-WarningMessage "Could not retrieve committed bytes information: $($_.Exception.Message)"
     }
 }
 
@@ -680,8 +773,6 @@ function Start-MemoryLogCollection {
         Provides options for immediate, timed, and intermittent memory issue capture
     #>
     Write-Header "Memory Issue Log Collection"
-    
-    $tssAvailable = Test-TSSAvailable
     
     Write-Info "Select Memory Issue Scenario:"
     Write-Host "1. High Memory - Issue happening NOW (manual stop)" -ForegroundColor Yellow
@@ -757,15 +848,18 @@ function Test-CPUUsage {
             Write-Info "Current CPU Usage: $($cpuPercent)%"
             
             if ($cpuPercent -gt $CPU_CRITICAL_THRESHOLD) {
-                Write-Error "CRITICAL: CPU usage above $($CPU_CRITICAL_THRESHOLD)%!"
-            } elseif ($cpuPercent -gt $CPU_WARNING_THRESHOLD) {
-                Write-Warning "WARNING: CPU usage above $($CPU_WARNING_THRESHOLD)%"
-            } else {
+                Write-ErrorMessage "CRITICAL: CPU usage above $($CPU_CRITICAL_THRESHOLD)%!"
+            }
+            elseif ($cpuPercent -gt $CPU_WARNING_THRESHOLD) {
+                Write-WarningMessage "WARNING: CPU usage above $($CPU_WARNING_THRESHOLD)%"
+            }
+            else {
                 Write-Success "CPU usage is within normal range"
             }
         }
-    } catch {
-        Write-Error "Failed to retrieve CPU usage: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to retrieve CPU usage: $($_.Exception.Message)"
     }
     
     # Processor information
@@ -775,8 +869,9 @@ function Test-CPUUsage {
         Write-Info "  Name: $($cpu.Name)"
         Write-Info "  Cores: $($cpu.NumberOfCores)"
         Write-Info "  Logical Processors: $($cpu.NumberOfLogicalProcessors)"
-    } catch {
-        Write-Error "Failed to retrieve processor information: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to retrieve processor information: $($_.Exception.Message)"
     }
     
     # Top CPU consuming processes
@@ -785,9 +880,9 @@ function Test-CPUUsage {
     
     if ($processAnalysis) {
         $processAnalysis.ByCPU | Format-Table Name, 
-            @{Label="CPU(s)"; Expression={[math]::Round($_.CPU, 2)}},
-            @{Label="Memory(MB)"; Expression={[math]::Round($_.WS / 1MB, 2)}},
-            Id -AutoSize
+        @{Label = "CPU(s)"; Expression = { [math]::Round($_.CPU, 2) } },
+        @{Label = "Memory(MB)"; Expression = { [math]::Round($_.WS / 1MB, 2) } },
+        Id -AutoSize
     }
     
     # Check for WMI high CPU
@@ -797,12 +892,13 @@ function Test-CPUUsage {
             $wmiCPU = [math]::Round($wmiProcess.CPU, 2)
             Write-Info "`nWMI Provider Host (WmiPrvSE) CPU Usage: $($wmiCPU) seconds"
             if ($wmiCPU -gt 100) {
-                Write-Warning "WMI Provider Host is consuming significant CPU time"
+                Write-WarningMessage "WMI Provider Host is consuming significant CPU time"
                 Write-Info "Consider using WMI-specific trace: .\TSS.ps1 -UEX_WMIBase -WIN_Kernel -ETWflags 1 -WPR CPU -Perfmon UEX_WMIPrvSE -PerfIntervalSec 1 -noBasicLog"
             }
         }
-    } catch {
-        Write-Warning "Could not check WMI process: $($_.Exception.Message)"
+    }
+    catch {
+        Write-WarningMessage "Could not check WMI process: $($_.Exception.Message)"
     }
 }
 
@@ -814,8 +910,6 @@ function Start-CPULogCollection {
         Provides options for immediate, timed, intermittent, and WMI-specific CPU issue capture
     #>
     Write-Header "CPU Issue Log Collection"
-    
-    $tssAvailable = Test-TSSAvailable
     
     Write-Info "Select CPU Issue Scenario:"
     Write-Host "1. High CPU - Issue happening NOW (manual stop, 60s-3min recommended)" -ForegroundColor Yellow
@@ -884,14 +978,15 @@ function Test-DiskPerformance {
         foreach ($disk in $disks) {
             Write-Info "  $($disk.FriendlyName) - Size: $([math]::Round($disk.Size / 1GB, 2)) GB - Health: $($disk.HealthStatus)"
         }
-    } catch {
-        Write-Error "Failed to retrieve physical disk information: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to retrieve physical disk information: $($_.Exception.Message)"
     }
     
     # Logical disk space
     Write-Info "`nLogical Disk Space:"
     try {
-        $volumes = Get-Volume -ErrorAction Stop | Where-Object {$_.DriveLetter -ne $null}
+        $volumes = Get-Volume -ErrorAction Stop | Where-Object { $null -ne $_.DriveLetter }
         foreach ($vol in $volumes) {
             $usedSpace = $vol.Size - $vol.SizeRemaining
             $usedPercent = [math]::Round(($usedSpace / $vol.Size) * 100, 2)
@@ -899,13 +994,15 @@ function Test-DiskPerformance {
             
             Write-Info "  Drive $($vol.DriveLetter): - $($usedPercent)% used - $($freeGB) GB free"
             if ($usedPercent -gt $DISK_CRITICAL_THRESHOLD) {
-                Write-Error "    CRITICAL: Less than 10% free space!"
-            } elseif ($usedPercent -gt $DISK_WARNING_THRESHOLD) {
-                Write-Warning "    WARNING: Less than 20% free space"
+                Write-ErrorMessage "    CRITICAL: Less than 10% free space!"
+            }
+            elseif ($usedPercent -gt $DISK_WARNING_THRESHOLD) {
+                Write-WarningMessage "    WARNING: Less than 20% free space"
             }
         }
-    } catch {
-        Write-Error "Failed to retrieve volume information: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to retrieve volume information: $($_.Exception.Message)"
     }
     
     # Disk latency check
@@ -920,25 +1017,29 @@ function Test-DiskPerformance {
                     Write-Info "  Read Latency - $($sample.InstanceName): $($latencyMs) ms"
                     
                     if ($latencyMs -gt $DISK_LATENCY_CRITICAL_MS) {
-                        Write-Error "    CRITICAL: Serious I/O bottleneck (>$($DISK_LATENCY_CRITICAL_MS)ms)"
-                    } elseif ($latencyMs -gt $DISK_LATENCY_WARNING_MS) {
-                        Write-Warning "    WARNING: Slow, needs attention ($($DISK_LATENCY_WARNING_MS)-$($DISK_LATENCY_CRITICAL_MS)ms)"
-                    } elseif ($latencyMs -gt $DISK_LATENCY_ACCEPTABLE_MS) {
+                        Write-ErrorMessage "    CRITICAL: Serious I/O bottleneck (>$($DISK_LATENCY_CRITICAL_MS)ms)"
+                    }
+                    elseif ($latencyMs -gt $DISK_LATENCY_WARNING_MS) {
+                        Write-WarningMessage "    WARNING: Slow, needs attention ($($DISK_LATENCY_WARNING_MS)-$($DISK_LATENCY_CRITICAL_MS)ms)"
+                    }
+                    elseif ($latencyMs -gt $DISK_LATENCY_ACCEPTABLE_MS) {
                         Write-Info "    INFO: Acceptable ($($DISK_LATENCY_ACCEPTABLE_MS)-$($DISK_LATENCY_WARNING_MS)ms)"
-                    } else {
+                    }
+                    else {
                         Write-Success "    GOOD: Very good (<$($DISK_LATENCY_ACCEPTABLE_MS)ms)"
                     }
                 }
             }
         }
-    } catch {
-        Write-Warning "Could not retrieve disk latency metrics: $($_.Exception.Message)"
+    }
+    catch {
+        Write-WarningMessage "Could not retrieve disk latency metrics: $($_.Exception.Message)"
     }
     
     # Check cluster size for volumes
     Write-Info "`nChecking Cluster Size (should be 64KB for databases):"
     try {
-        $volumes = Get-Volume -ErrorAction Stop | Where-Object {$_.DriveLetter -ne $null}
+        $volumes = Get-Volume -ErrorAction Stop | Where-Object { $null -ne $_.DriveLetter }
         foreach ($vol in $volumes) {
             $drive = $vol.DriveLetter + ":"
             try {
@@ -947,15 +1048,17 @@ function Test-DiskPerformance {
                     $clusterSizeKB = $clusterSize / 1KB
                     Write-Info "  Drive $($vol.DriveLetter): - Cluster Size: $($clusterSizeKB) KB"
                     if ($clusterSizeKB -ne 64) {
-                        Write-Warning "    Recommended cluster size for SQL/Database servers is 64KB"
+                        Write-WarningMessage "    Recommended cluster size for SQL/Database servers is 64KB"
                     }
                 }
-            } catch {
-                Write-Warning "  Could not retrieve cluster size for drive $($vol.DriveLetter)"
+            }
+            catch {
+                Write-WarningMessage "  Could not retrieve cluster size for drive $($vol.DriveLetter)"
             }
         }
-    } catch {
-        Write-Error "Failed to check cluster sizes: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to check cluster sizes: $($_.Exception.Message)"
     }
 }
 
@@ -967,8 +1070,6 @@ function Start-DiskLogCollection {
         Provides options for StorPort trace and performance monitoring
     #>
     Write-Header "Disk/Storage Issue Log Collection"
-    
-    $tssAvailable = Test-TSSAvailable
     
     Write-Info "Disk/Storage Log Collection Options:"
     Write-Host "1. StorPort trace (10-15 minutes)" -ForegroundColor Yellow
@@ -1043,8 +1144,10 @@ function Show-PerfmonCommand {
     .PARAMETER Scenario
         The monitoring scenario (Memory, CPU, Disk, Assessment)
     #>
-    param([string]$Scenario)
-    
+    param(
+        [ValidateSet("Memory", "CPU", "Disk", "Assessment")]
+        [string]$Scenario
+    )
     Write-Info "`nLong-term Performance Monitor Collection:"
     Write-Host @"
 
@@ -1093,8 +1196,6 @@ function Show-AdditionalScenarios {
     Write-Host "0. Return to Main Menu" -ForegroundColor Yellow
     
     $choice = Get-ValidatedChoice -Prompt "`nEnter choice (0-9)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9")
-    
-    $tssAvailable = Test-TSSAvailable
     
     switch ($choice) {
         "1" {
@@ -1203,20 +1304,48 @@ function Show-AdditionalScenarios {
             }
             
             if (Test-PathValid -Path $exportPath -CreateIfNotExist) {
+                # Check Security log access
+                $securityLogAccess = $true
+                try {
+                    Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop | Out-Null
+                }
+                catch {
+                    $securityLogAccess = $false
+                    Write-WarningMessage "No access to Security event log - skipping Security log export"
+                }
+                
+                # Export System log
                 try {
                     Write-Info "Exporting System event log..."
                     wevtutil epl System (Join-Path $exportPath "system.evtx")
-                    
+                    Write-Success "  System log exported successfully"
+                }
+                catch {
+                    Write-ErrorMessage "  Failed to export System log: $($_.Exception.Message)"
+                }
+                
+                # Export Application log
+                try {
                     Write-Info "Exporting Application event log..."
                     wevtutil epl Application (Join-Path $exportPath "application.evtx")
-                    
-                    Write-Info "Exporting Security event log..."
-                    wevtutil epl Security (Join-Path $exportPath "security.evtx")
-                    
-                    Write-Success "Event logs exported to: $($exportPath)"
-                } catch {
-                    Write-Error "Failed to export event logs: $($_.Exception.Message)"
+                    Write-Success "  Application log exported successfully"
                 }
+                catch {
+                    Write-ErrorMessage "  Failed to export Application log: $($_.Exception.Message)"
+                }
+                
+                # Export Security log if accessible
+                if ($securityLogAccess) {
+                    try {
+                        Write-Info "Exporting Security event log..."
+                        wevtutil epl Security (Join-Path $exportPath "security.evtx")
+                        Write-Success "  Security log exported successfully"
+                    }
+                    catch {
+                        Write-ErrorMessage "  Failed to export Security log: $($_.Exception.Message)"
+                    }
+                }
+                
             }
         }
         "0" {
@@ -1288,15 +1417,19 @@ function Test-TLSConfiguration {
                     
                     if ($clientEnabled.Enabled -eq 1 -and $clientDisabledByDefault.DisabledByDefault -eq 0) {
                         Write-Success "  Client: ENABLED"
-                    } elseif ($clientEnabled.Enabled -eq 0 -or $clientDisabledByDefault.DisabledByDefault -eq 1) {
-                        Write-Warning "  Client: DISABLED"
-                    } else {
+                    }
+                    elseif ($clientEnabled.Enabled -eq 0 -or $clientDisabledByDefault.DisabledByDefault -eq 1) {
+                        Write-WarningMessage "  Client: DISABLED"
+                    }
+                    else {
                         Write-Info "  Client: Not explicitly configured (using system default)"
                     }
-                } catch {
+                }
+                catch {
                     Write-Info "  Client: Not explicitly configured (using system default)"
                 }
-            } else {
+            }
+            else {
                 Write-Info "  Client: Not explicitly configured (using system default)"
             }
             
@@ -1309,18 +1442,23 @@ function Test-TLSConfiguration {
                     
                     if ($serverEnabled.Enabled -eq 1 -and $serverDisabledByDefault.DisabledByDefault -eq 0) {
                         Write-Success "  Server: ENABLED"
-                    } elseif ($serverEnabled.Enabled -eq 0 -or $serverDisabledByDefault.DisabledByDefault -eq 1) {
-                        Write-Warning "  Server: DISABLED"
-                    } else {
+                    }
+                    elseif ($serverEnabled.Enabled -eq 0 -or $serverDisabledByDefault.DisabledByDefault -eq 1) {
+                        Write-WarningMessage "  Server: DISABLED"
+                    }
+                    else {
                         Write-Info "  Server: Not explicitly configured (using system default)"
                     }
-                } catch {
+                }
+                catch {
                     Write-Info "  Server: Not explicitly configured (using system default)"
                 }
-            } else {
+            }
+            else {
                 Write-Info "  Server: Not explicitly configured (using system default)"
             }
-        } else {
+        }
+        else {
             Write-Info "  Protocol registry key does not exist (using system default)"
         }
         
@@ -1329,7 +1467,7 @@ function Test-TLSConfiguration {
     
     # Security Recommendations
     Write-Info "--- Security Recommendations ---"
-    Write-Warning "TLS 1.0 and TLS 1.1 are deprecated and should be disabled"
+    Write-WarningMessage "TLS 1.0 and TLS 1.1 are deprecated and should be disabled"
     Write-Success "TLS 1.2 should be enabled (minimum requirement)"
     Write-Success "TLS 1.3 should be enabled for best security (Windows Server 2022+)"
     Write-Info ""
@@ -1344,14 +1482,16 @@ function Test-TLSConfiguration {
             
             if ($schUseStrongCrypto.SchUseStrongCrypto -eq 1) {
                 Write-Success ".NET 4.x (32-bit): Strong Crypto ENABLED"
-            } else {
-                Write-Warning ".NET 4.x (32-bit): Strong Crypto NOT enabled"
+            }
+            else {
+                Write-WarningMessage ".NET 4.x (32-bit): Strong Crypto NOT enabled"
             }
             
             if ($systemDefaultTls.SystemDefaultTlsVersions -eq 1) {
                 Write-Success ".NET 4.x (32-bit): System Default TLS ENABLED"
-            } else {
-                Write-Warning ".NET 4.x (32-bit): System Default TLS NOT enabled"
+            }
+            else {
+                Write-WarningMessage ".NET 4.x (32-bit): System Default TLS NOT enabled"
             }
         }
         
@@ -1362,18 +1502,21 @@ function Test-TLSConfiguration {
             
             if ($schUseStrongCrypto64.SchUseStrongCrypto -eq 1) {
                 Write-Success ".NET 4.x (64-bit): Strong Crypto ENABLED"
-            } else {
-                Write-Warning ".NET 4.x (64-bit): Strong Crypto NOT enabled"
+            }
+            else {
+                Write-WarningMessage ".NET 4.x (64-bit): Strong Crypto NOT enabled"
             }
             
             if ($systemDefaultTls64.SystemDefaultTlsVersions -eq 1) {
                 Write-Success ".NET 4.x (64-bit): System Default TLS ENABLED"
-            } else {
-                Write-Warning ".NET 4.x (64-bit): System Default TLS NOT enabled"
+            }
+            else {
+                Write-WarningMessage ".NET 4.x (64-bit): System Default TLS NOT enabled"
             }
         }
-    } catch {
-        Write-Error "Failed to check .NET Framework TLS configuration: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to check .NET Framework TLS configuration: $($_.Exception.Message)"
     }
     
     Write-Info ""
@@ -1386,16 +1529,18 @@ function Test-TLSConfiguration {
         
         if ($securityProtocol -match "Tls12") {
             Write-Success "TLS 1.2 is available in PowerShell"
-        } else {
-            Write-Warning "TLS 1.2 is NOT configured in PowerShell"
+        }
+        else {
+            Write-WarningMessage "TLS 1.2 is NOT configured in PowerShell"
             Write-Info "To enable: [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12"
         }
         
         if ($securityProtocol -match "Tls13") {
             Write-Success "TLS 1.3 is available in PowerShell"
         }
-    } catch {
-        Write-Error "Failed to check PowerShell TLS configuration: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to check PowerShell TLS configuration: $($_.Exception.Message)"
     }
     
     Write-Info ""
@@ -1412,11 +1557,14 @@ function Test-TLSConfiguration {
                 $suite = $_.Name
                 if ($suite -match "TLS_AES|TLS_CHACHA20") {
                     Write-Success "  $suite (TLS 1.3)"
-                } elseif ($suite -match "GCM|ECDHE") {
+                }
+                elseif ($suite -match "GCM|ECDHE") {
                     Write-Success "  $suite (Strong)"
-                } elseif ($suite -match "CBC") {
-                    Write-Warning "  $suite (Consider disabling CBC mode ciphers)"
-                } else {
+                }
+                elseif ($suite -match "CBC") {
+                    Write-WarningMessage "  $suite (Consider disabling CBC mode ciphers)"
+                }
+                else {
                     Write-Info "  $suite"
                 }
             }
@@ -1429,21 +1577,46 @@ function Test-TLSConfiguration {
             }
             
             if ($weakCiphers) {
-                Write-Error "CRITICAL: Weak cipher suites detected!"
+                Write-ErrorMessage "CRITICAL: Weak cipher suites detected!"
                 $weakCiphers | ForEach-Object {
-                    Write-Warning "  - $($_.Name)"
+                    Write-WarningMessage "  - $($_.Name)"
                 }
-            } else {
+            }
+            else {
                 Write-Success "No weak cipher suites detected"
             }
-        } else {
-            Write-Warning "Could not retrieve cipher suite information (may require Windows Server 2012 R2+)"
         }
-    } catch {
-        Write-Warning "Could not check cipher suites: $($_.Exception.Message)"
+        else {
+            Write-WarningMessage "Could not retrieve cipher suite information (may require Windows Server 2012 R2+)"
+        }
+    }
+    catch {
+        Write-WarningMessage "Could not check cipher suites: $($_.Exception.Message)"
     }
     
     Write-Info ""
+    
+    # Check FIPS Mode
+    Write-Info "--- FIPS Mode Compliance ---"
+    try {
+        $fipsKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\FipsAlgorithmPolicy"
+        if (Test-Path $fipsKey) {
+            $fipsEnabled = (Get-ItemProperty -Path $fipsKey -Name "Enabled" -ErrorAction SilentlyContinue).Enabled
+            if ($fipsEnabled -eq 1) {
+                Write-Success "FIPS Mode: ENABLED (System is FIPS 140-2 compliant)"
+                Write-Info "  Note: Only FIPS-approved cryptographic algorithms are allowed"
+            }
+            else {
+                Write-Info "FIPS Mode: DISABLED"
+            }
+        }
+        else {
+            Write-Info "FIPS Mode: Not configured (using system defaults)"
+        }
+    }
+    catch {
+        Write-WarningMessage "Could not check FIPS mode: $($_.Exception.Message)"
+    }
     Write-Info "--- Quick Fix Commands ---"
     Write-Host @"
 
@@ -1487,7 +1660,7 @@ function Export-TLSReport {
     $reportPath = Join-Path $script:DefaultLogPath "TLSReport_$($timestamp).txt"
     
     if (-not (Test-PathValid -Path $script:DefaultLogPath -CreateIfNotExist)) {
-        Write-Error "Cannot create report directory"
+        Write-ErrorMessage "Cannot create report directory"
         return
     }
     
@@ -1515,7 +1688,8 @@ Computer: $($env:COMPUTERNAME)
                     $clientProps = Get-ItemProperty -Path $clientPath -ErrorAction SilentlyContinue
                     $report += "Client Enabled: $($clientProps.Enabled)`n"
                     $report += "Client DisabledByDefault: $($clientProps.DisabledByDefault)`n"
-                } else {
+                }
+                else {
                     $report += "Client: Not configured`n"
                 }
                 
@@ -1525,10 +1699,12 @@ Computer: $($env:COMPUTERNAME)
                     $serverProps = Get-ItemProperty -Path $serverPath -ErrorAction SilentlyContinue
                     $report += "Server Enabled: $($serverProps.Enabled)`n"
                     $report += "Server DisabledByDefault: $($serverProps.DisabledByDefault)`n"
-                } else {
+                }
+                else {
                     $report += "Server: Not configured`n"
                 }
-            } else {
+            }
+            else {
                 $report += "Not configured (using system defaults)`n"
             }
         }
@@ -1549,6 +1725,17 @@ Computer: $($env:COMPUTERNAME)
             $report += "SystemDefaultTlsVersions (64-bit): $($netProps64.SystemDefaultTlsVersions)`n"
         }
         
+        
+        # FIPS Mode
+        $report += "`n--- FIPS Mode Compliance ---`n"
+        $fipsKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\FipsAlgorithmPolicy"
+        if (Test-Path $fipsKey) {
+            $fipsEnabled = (Get-ItemProperty -Path $fipsKey -Name "Enabled" -ErrorAction SilentlyContinue).Enabled
+            $report += "FIPS Mode Enabled: $(if($fipsEnabled -eq 1){'Yes (FIPS 140-2 compliant)'}else{'No'})`n"
+        }
+        else {
+            $report += "FIPS Mode: Not configured`n"
+        }
         # Cipher Suites
         $report += "`n--- Enabled Cipher Suites ---`n"
         try {
@@ -1558,7 +1745,8 @@ Computer: $($env:COMPUTERNAME)
                     $report += "$($suite.Name)`n"
                 }
             }
-        } catch {
+        }
+        catch {
             $report += "Could not retrieve cipher suites`n"
         }
         
@@ -1569,12 +1757,14 @@ Computer: $($env:COMPUTERNAME)
         if ($open -eq "Y") {
             try {
                 notepad $reportPath
-            } catch {
-                Write-Warning "Could not open report automatically. Please navigate to: $($reportPath)"
+            }
+            catch {
+                Write-WarningMessage "Could not open report automatically. Please navigate to: $($reportPath)"
             }
         }
-    } catch {
-        Write-Error "Failed to generate TLS report: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to generate TLS report: $($_.Exception.Message)"
     }
 }
 
@@ -1594,7 +1784,7 @@ function Export-SystemReport {
     $reportPath = Join-Path $script:DefaultLogPath "SystemReport_$($timestamp).txt"
     
     if (-not (Test-PathValid -Path $script:DefaultLogPath -CreateIfNotExist)) {
-        Write-Error "Cannot create report directory"
+        Write-ErrorMessage "Cannot create report directory"
         return
     }
     
@@ -1618,7 +1808,8 @@ Computer: $($env:COMPUTERNAME)
             $report += "Model: $($cs.Model)`n"
             $report += "Domain: $($cs.Domain)`n"
             $report += "Last Boot: $($os.LastBootUpTime)`n"
-        } catch {
+        }
+        catch {
             $report += "Error retrieving system information: $($_.Exception.Message)`n"
         }
         
@@ -1630,7 +1821,8 @@ Computer: $($env:COMPUTERNAME)
             $report += "Total: $($totalMemGB) GB`n"
             $report += "Free: $($freeMemGB) GB`n"
             $report += "Usage: $([math]::Round((($totalMemGB - $freeMemGB) / $totalMemGB) * 100, 2))%`n"
-        } catch {
+        }
+        catch {
             $report += "Error retrieving memory information`n"
         }
         
@@ -1641,32 +1833,35 @@ Computer: $($env:COMPUTERNAME)
             $report += "Name: $($cpu.Name)`n"
             $report += "Cores: $($cpu.NumberOfCores)`n"
             $report += "Logical Processors: $($cpu.NumberOfLogicalProcessors)`n"
-        } catch {
+        }
+        catch {
             $report += "Error retrieving CPU information`n"
         }
         
         # Disk
         $report += "`n--- DISK SPACE ---`n"
         try {
-            $volumes = Get-Volume -ErrorAction Stop | Where-Object {$_.DriveLetter -ne $null}
+            $volumes = Get-Volume -ErrorAction Stop | Where-Object { $null -ne $_.DriveLetter }
             foreach ($vol in $volumes) {
                 $freeGB = [math]::Round($vol.SizeRemaining / 1GB, 2)
                 $totalGB = [math]::Round($vol.Size / 1GB, 2)
                 $usedPercent = [math]::Round((($vol.Size - $vol.SizeRemaining) / $vol.Size) * 100, 2)
                 $report += "Drive $($vol.DriveLetter): $($usedPercent)% used - $($freeGB) GB free of $($totalGB) GB`n"
             }
-        } catch {
+        }
+        catch {
             $report += "Error retrieving disk information`n"
         }
         
         # Network
         $report += "`n--- NETWORK ADAPTERS ---`n"
         try {
-            $adapters = Get-NetAdapter -ErrorAction Stop | Where-Object {$_.Status -eq "Up"}
+            $adapters = Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
             foreach ($adapter in $adapters) {
                 $report += "$($adapter.Name): $($adapter.Status) - $($adapter.LinkSpeed)`n"
             }
-        } catch {
+        }
+        catch {
             $report += "Error retrieving network adapter information`n"
         }
         
@@ -1687,15 +1882,17 @@ Computer: $($env:COMPUTERNAME)
         # Services
         $report += "`n--- STOPPED AUTOMATIC SERVICES ---`n"
         try {
-            $stoppedServices = Get-Service -ErrorAction Stop | Where-Object {$_.StartType -eq "Automatic" -and $_.Status -ne "Running"}
+            $stoppedServices = Get-Service -ErrorAction Stop | Where-Object { $_.StartType -eq "Automatic" -and $_.Status -ne "Running" }
             if ($stoppedServices) {
                 foreach ($svc in $stoppedServices) {
                     $report += "$($svc.Name): $($svc.Status)`n"
                 }
-            } else {
+            }
+            else {
                 $report += "All automatic services are running`n"
             }
-        } catch {
+        }
+        catch {
             $report += "Error retrieving service information`n"
         }
         
@@ -1704,7 +1901,8 @@ Computer: $($env:COMPUTERNAME)
         try {
             $powerPlan = powercfg /getactivescheme
             $report += "$($powerPlan)`n"
-        } catch {
+        }
+        catch {
             $report += "Error retrieving power plan information`n"
         }
         
@@ -1717,15 +1915,113 @@ Computer: $($env:COMPUTERNAME)
         if ($open -eq "Y") {
             try {
                 notepad $reportPath
-            } catch {
-                Write-Warning "Could not open report automatically. Please navigate to: $($reportPath)"
+            }
+            catch {
+                Write-WarningMessage "Could not open report automatically. Please navigate to: $($reportPath)"
             }
         }
-    } catch {
-        Write-Error "Failed to generate system report: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "Failed to generate system report: $($_.Exception.Message)"
     }
 }
 #endregion
+
+function Get-ScriptVersion {
+    <#
+    .SYNOPSIS
+        Displays script version information
+    .DESCRIPTION
+        Shows the current version and last updated date
+    .OUTPUTS
+        None
+    #>
+    Write-Header "Script Version Information"
+    Write-Info "Script Name: Windows Server Troubleshooting & Log Collection Tool"
+    Write-Info "Version: $($script:ScriptVersion)"
+    Write-Info "Last Updated: $($script:LastUpdated)"
+    Write-Info ""
+    Write-Info "This script provides comprehensive diagnostics for:"
+    Write-Info "   Network issues (packet loss, slowness, configuration)"
+    Write-Info "   Memory issues (high usage, leaks)"
+    Write-Info "   CPU issues (high usage, process analysis)"
+    Write-Info "   Disk/Storage issues (latency, performance)"
+    Write-Info "   Security (TLS configuration, compliance)"
+    Write-Info "   System reporting and log collection"
+}
+
+function Remove-OldDiagnosticLogs {
+    <#
+    .SYNOPSIS
+        Removes old diagnostic logs
+    .DESCRIPTION
+        Deletes log files older than the specified retention period
+    .PARAMETER DaysToKeep
+        Number of days to retain logs (default: uses $LOG_RETENTION_DAYS constant)
+    .PARAMETER WhatIf
+        Shows what would be deleted without actually deleting
+    .OUTPUTS
+        None
+    #>
+    param(
+        [int]$DaysToKeep = $LOG_RETENTION_DAYS,
+        [switch]$WhatIf
+    )
+    
+    Write-Header "Cleaning Old Diagnostic Logs"
+    
+    if (-not (Test-Path $script:DefaultLogPath)) {
+        Write-Info "No log directory found at: $($script:DefaultLogPath)"
+        return
+    }
+    
+    try {
+        $cutoffDate = (Get-Date).AddDays(-$DaysToKeep)
+        Write-Info "Removing logs older than: $($cutoffDate.ToString('yyyy-MM-dd'))"
+        
+        $oldFiles = Get-ChildItem -Path $script:DefaultLogPath -Recurse -File -ErrorAction Stop | 
+        Where-Object { $_.LastWriteTime -lt $cutoffDate }
+        
+        if ($oldFiles.Count -eq 0) {
+            Write-Success "No old log files found"
+            return
+        }
+        
+        $totalSize = ($oldFiles | Measure-Object -Property Length -Sum).Sum / 1MB
+        
+        if ($WhatIf) {
+            Write-Info "Would delete $($oldFiles.Count) files ($([math]::Round($totalSize, 2)) MB)"
+            $oldFiles | ForEach-Object {
+                Write-Info "   $($_.Name) - $($_.LastWriteTime.ToString('yyyy-MM-dd'))"
+            }
+        }
+        else {
+            Write-Info "Found $($oldFiles.Count) old files ($([math]::Round($totalSize, 2)) MB)"
+            $confirm = Get-ValidatedChoice -Prompt "Delete these files? (Y/N)" -ValidChoices @("Y", "N")
+            
+            if ($confirm -eq "Y") {
+                $deletedCount = 0
+                foreach ($file in $oldFiles) {
+                    try {
+                        Remove-Item -Path $file.FullName -Force -ErrorAction Stop
+                        $deletedCount++
+                    }
+                    catch {
+                        Write-WarningMessage "Could not delete: $($file.Name)"
+                    }
+                }
+                Write-Success "Deleted $deletedCount files"
+            }
+            else {
+                Write-Info "Cleanup cancelled"
+            }
+        }
+    }
+    catch {
+        Write-ErrorMessage "Failed to clean old logs: $($_.Exception.Message)"
+    }
+}
+
 
 #region Main Menu and Execution
 function Show-MainMenu {
@@ -1759,8 +2055,10 @@ function Show-MainMenu {
     Write-Host "  6. Generate System Report" -ForegroundColor White
     Write-Host "  7. TLS Configuration Validation" -ForegroundColor White
     Write-Host "  8. Validator Script Information" -ForegroundColor White
-    Write-Host "  9. Configure TSS Path" -ForegroundColor White
-    Write-Host " 10. Check TSS Status" -ForegroundColor White
+    Write-Host "  9. Script Version Information" -ForegroundColor White
+    Write-Host " 10. Configure TSS Path" -ForegroundColor White
+    Write-Host " 11. Check TSS Status" -ForegroundColor White
+    Write-Host " 12. Clean Old Diagnostic Logs" -ForegroundColor White
     
     Write-Host "`n  0. Exit" -ForegroundColor Red
     
@@ -1788,7 +2086,7 @@ function Start-TroubleshootingTool {
     $isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     
     if (-not $isAdmin) {
-        Write-Error "This script requires Administrator privileges!"
+        Write-ErrorMessage "This script requires Administrator privileges!"
         Write-Info "Please run PowerShell as Administrator and try again."
         Read-Host "Press Enter to exit"
         exit 1
@@ -1796,7 +2094,7 @@ function Start-TroubleshootingTool {
     
     # Initialize diagnostic paths
     if (-not (Initialize-DiagnosticPaths)) {
-        Write-Error "Failed to initialize diagnostic paths. Some features may not work correctly."
+        Write-ErrorMessage "Failed to initialize diagnostic paths. Some features may not work correctly."
     }
     
     # Start transcript logging if requested
@@ -1807,8 +2105,9 @@ function Start-TroubleshootingTool {
         try {
             Start-Transcript -Path $transcriptPath -ErrorAction Stop
             Write-Success "Transcript logging enabled: $($transcriptPath)"
-        } catch {
-            Write-Warning "Could not start transcript logging: $($_.Exception.Message)"
+        }
+        catch {
+            Write-WarningMessage "Could not start transcript logging: $($_.Exception.Message)"
             $EnableLogging = $false
         }
     }
@@ -1816,67 +2115,71 @@ function Start-TroubleshootingTool {
     try {
         do {
             Show-MainMenu
-            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-10)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10")
+            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-12)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")
             
-switch ($choice) {
-    "1" {
-        Clear-Host
-        Test-NetworkConfiguration
-        Write-Host "`n"
-        Start-NetworkLogCollection
-    }
-    "2" {
-        Clear-Host
-        Test-MemoryUsage
-        Write-Host "`n"
-        Start-MemoryLogCollection
-    }
-    "3" {
-        Clear-Host
-        Test-CPUUsage
-        Write-Host "`n"
-        Start-CPULogCollection
-    }
-    "4" {
-        Clear-Host
-        Test-DiskPerformance
-        Write-Host "`n"
-        Start-DiskLogCollection
-    }
-    "5" {
-        Clear-Host
-        Show-AdditionalScenarios
-    }
-    "6" {
-        Clear-Host
-        Export-SystemReport
-    }
-    "7" {
-        Clear-Host
-        Test-TLSConfiguration
-        Write-Host "`n"
-        $export = Get-ValidatedChoice -Prompt "Export TLS report? (Y/N)" -ValidChoices @("Y", "N")
-        if ($export -eq "Y") {
-            Export-TLSReport
-        }
-    }
-    "8" {
-        Clear-Host
-        Show-ValidatorInfo
-    }
-    "9" {
-        Clear-Host
-        Set-TSSPath
-    }
-    "10" {
-        Clear-Host
-        $null = Test-TSSAvailable
-    }
-    "0" {
-        Write-Host "`nExiting... Thank you for using the troubleshooting tool!" -ForegroundColor Cyan
-        break
-    }
-}
+            switch ($choice) {
+                "1" {
+                    Clear-Host
+                    Test-NetworkConfiguration
+                    Write-Host "`n"
+                    Start-NetworkLogCollection
+                }
+                "2" {
+                    Clear-Host
+                    Test-MemoryUsage
+                    Write-Host "`n"
+                    Start-MemoryLogCollection
+                }
+                "3" {
+                    Clear-Host
+                    Test-CPUUsage
+                    Write-Host "`n"
+                    Start-CPULogCollection
+                }
+                "4" {
+                    Clear-Host
+                    Test-DiskPerformance
+                    Write-Host "`n"
+                    Start-DiskLogCollection
+                }
+                "5" {
+                    Clear-Host
+                    Show-AdditionalScenarios
+                }
+                "6" {
+                    Clear-Host
+                    Export-SystemReport
+                }
+                "7" {
+                    Clear-Host
+                    Test-TLSConfiguration
+                    Write-Host "`n"
+                    $export = Get-ValidatedChoice -Prompt "Export TLS report? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($export -eq "Y") {
+                        Export-TLSReport
+                    }
+                }
+                "8" {
+                    Clear-Host
+                    Show-ValidatorInfo
+                }
+                "9" {
+                    Clear-Host                    Get-ScriptVersion
+                }
+                "10" {
+                    Clear-Host                    Set-TSSPath
+                }
+                "11" {
+                    Clear-Host                    $null = Test-TSSAvailable
+                }
+                "12" {
+                    Clear-Host                    Remove-OldDiagnosticLogs
+                }
+                "0" {
+                    Write-Host "`nExiting... Thank you for using the troubleshooting tool!" -ForegroundColor Cyan
+                    break
+                }
+            }
             
             if ($choice -ne "0") {
                 Write-Host "`n"
@@ -1885,17 +2188,20 @@ switch ($choice) {
             }
             
         } while ($choice -ne "0")
-    } catch {
-        Write-Error "An unexpected error occurred: $($_.Exception.Message)"
+    }
+    catch {
+        Write-ErrorMessage "An unexpected error occurred: $($_.Exception.Message)"
         Write-Info "Stack Trace: $($_.ScriptStackTrace)"
-    } finally {
+    }
+    finally {
         # Stop transcript logging if it was enabled
         if ($EnableLogging -and $transcriptPath) {
             try {
                 Stop-Transcript
                 Write-Success "Transcript saved to: $($transcriptPath)"
-            } catch {
-                Write-Warning "Could not stop transcript: $($_.Exception.Message)"
+            }
+            catch {
+                Write-WarningMessage "Could not stop transcript: $($_.Exception.Message)"
             }
         }
     }
@@ -1906,7 +2212,8 @@ switch ($choice) {
 # Script execution starts here
 if ($EnableLogging) {
     Start-TroubleshootingTool -EnableLogging
-} else {
+}
+else {
     Start-TroubleshootingTool
 }
 #endregion
