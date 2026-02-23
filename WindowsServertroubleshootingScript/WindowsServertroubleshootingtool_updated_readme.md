@@ -2,9 +2,9 @@
 
 ## Overview
 
-A comprehensive PowerShell-based interactive tool designed for Windows Server administrators to diagnose and collect logs for common server issues including Network, Memory, CPU, Disk performance problems, and TLS/SSL configuration validation.
+A comprehensive PowerShell-based interactive tool designed for Windows Server administrators to diagnose and collect logs for common server issues including Network, Memory, CPU, Disk performance, Windows Services, Event Logs, DNS, Security & Authentication, Windows Update status, and TLS/SSL configuration validation.
 
-**Version:** 2.0  
+**Version:** 2.5  
 **Requires:** Administrator privileges, PowerShell 5.1 or higher
 
 ---
@@ -16,6 +16,11 @@ A comprehensive PowerShell-based interactive tool designed for Windows Server ad
 - **Memory Issues**: High usage analysis, top memory consumers, committed bytes tracking
 - **CPU Issues**: High usage detection, process analysis, WMI-specific troubleshooting
 - **Disk/Storage Issues**: Latency measurement, performance analysis, cluster size validation
+- **Windows Services Health**: Critical service monitoring, stopped auto-services, crash detection
+- **Event Log Analysis**: 24-hour error scan grouped by EventID/Source, log capacity warnings
+- **DNS Health & Connectivity**: DNS server checks, resolution tests, cache statistics
+- **Security & Authentication**: Account lockout policy, failed logons, Kerberos, firewall status
+- **Windows Update Status**: Recent patches, pending reboot detection, update age warnings
 
 ### 🛠️ Additional Scenarios
 - Unexpected reboots
@@ -121,7 +126,7 @@ Transcript logs are saved to: `%TEMP%\ServerDiagnostics\Logs\`
 ```
 ╔═══════════════════════════════════════════════════════════════╗
 ║     WINDOWS SERVER TROUBLESHOOTING & LOG COLLECTION TOOL      ║
-║                         Version 2.0                           ║
+║                         Version 2.5                           ║
 ╚═══════════════════════════════════════════════════════════════╝
 
 PRIMARY DIAGNOSTICS:
@@ -129,16 +134,21 @@ PRIMARY DIAGNOSTICS:
   2. Memory Issues
   3. CPU Issues
   4. Disk/Storage Issues
+  5. Windows Services Health
+  6. Event Log Analysis
+  7. DNS Health & Connectivity
+  8. Security & Authentication
+  9. Windows Update Status
 
 ADDITIONAL SCENARIOS:
-  5. Additional Troubleshooting Scenarios
+ 10. Additional Troubleshooting Scenarios
 
 UTILITIES:
-  6. Generate System Report
-  7. TLS Configuration Validation
-  8. Validator Script Information
-  9. Configure TSS Path
-  10. Check TSS Status
+ 11. Generate System Report
+ 12. TLS Configuration Validation
+ 13. Validator Script Information
+ 14. Configure TSS Path
+ 15. Check TSS Status
 
   0. Exit
 ```
@@ -258,7 +268,118 @@ UTILITIES:
 
 ---
 
-## Additional Scenarios (Option 5)
+### 5. Windows Services Health
+
+**Checks Performed:**
+- Critical services status (DNS, DHCP, W32Time, EventLog, WinRM, RpcSs, etc.)
+- Stopped automatic services enumeration
+- Disabled services audit
+- Recently crashed/terminated services (Event 7034, last 24 hours)
+
+**Log Collection Options:**
+- Export all service status to file
+- TSS Performance SDP collection
+
+**Recommended When:**
+- Services failing to start
+- Application dependencies not running
+- Unexplained service crashes
+- Post-reboot service health verification
+
+---
+
+### 6. Event Log Analysis
+
+**Checks Performed:**
+- System and Application log scan for Critical/Error events (last 24 hours)
+- Event grouping by EventID and Source (top 10 most frequent)
+- Last 5 critical/error events with timestamps and message snippets
+- Log size and capacity monitoring (warns when >90% full)
+
+**Log Collection Options:**
+- Export System, Application, Security logs (.evtx)
+- TSS Setup SDP collection
+
+**Recommended When:**
+- Investigating recurring errors
+- Post-incident root cause analysis
+- Monitoring event log health
+- Compliance auditing
+
+---
+
+### 7. DNS Health & Connectivity
+
+**Checks Performed:**
+- DNS Client service status
+- Configured DNS servers per network adapter
+- DNS server reachability (ping test with latency measurement)
+- DNS resolution tests (microsoft.com, google.com, domain)
+- DNS cache statistics and recent entries
+
+**Log Collection Options:**
+- TSS Network SDP collection
+- Manual DNS debug logging commands (ipconfig, nslookup, wevtutil)
+
+**Recommended When:**
+- Name resolution failures
+- Slow DNS lookups
+- Domain join or authentication issues
+- Network connectivity problems
+
+---
+
+### 8. Security & Authentication
+
+**Checks Performed:**
+- Account lockout policy (threshold, duration, observation window)
+- Recent failed logon attempts (Event 4625, last 24 hours) grouped by target account
+- Kerberos ticket status (cached tickets, server targets)
+- Domain secure channel health (Test-ComputerSecureChannel)
+- Windows Firewall status per profile (Domain, Private, Public)
+
+**Log Collection Options:**
+- Export firewall rules and configuration
+- TSS Authentication trace
+- Export Security event log
+
+**Recommended When:**
+- Account lockouts
+- Authentication failures
+- Kerberos/NTLM issues
+- Firewall rule troubleshooting
+- Security audit preparation
+
+---
+
+### 9. Windows Update Status
+
+**Checks Performed:**
+- Windows Update and BITS service status
+- Last 10 installed hotfixes with dates
+- Days since last update (warns at 30+, critical at 90+)
+- Pending reboot detection (CBS, Windows Update, PendingFileRenameOperations)
+- OS version, build, last boot time, and uptime
+
+**Log Collection Options:**
+- Collect CBS and DISM logs
+- TSS DND_SetupReport collection
+- Generate WindowsUpdate.log (Windows 10/Server 2016+)
+
+**Recommended When:**
+- Patching issues or failures
+- Verifying update compliance
+- Pending reboot investigations
+- Post-patch troubleshooting
+
+**Update Age Thresholds:**
+- 🟢 Normal: Updated within 30 days
+- 🟡 Warning: 30-90 days since last update
+- 🔴 Critical: Over 90 days since last update
+
+---
+
+## Additional Scenarios (Option 10)
 
 ### 1. Unexpected Reboot
 - Collects memory dumps and system diagnostics
@@ -309,7 +430,7 @@ UTILITIES:
 
 ---
 
-## System Report (Option 6)
+## System Report (Option 11)
 
 Generates a comprehensive text report including:
 
@@ -326,7 +447,7 @@ Generates a comprehensive text report including:
 
 ---
 
-## TLS Configuration Validation (Option 7)
+## TLS Configuration Validation (Option 12)
 
 ### Overview
 Comprehensive TLS/SSL protocol analysis and security validation tool that helps ensure your server meets modern security standards and compliance requirements.
@@ -466,11 +587,11 @@ $script:TSSPath = "D:\YourPath\TSS"
 
 **Method 2: Runtime Update** (Temporary)
 1. Run the script
-2. Select option 9: "Configure TSS Path"
+2. Select option 14: "Configure TSS Path"
 3. Enter your TSS installation path
 4. Press Enter to validate
 
-### TSS Status Check (Option 10)
+### TSS Status Check (Option 15)
 Verifies:
 - TSS directory exists
 - TSS.ps1 file is present
@@ -594,8 +715,8 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 #### Issue: "TSS not found"
 **Solution:** 
 1. Download TSS from provided links
-2. Extract to `C:\TSS` or update path (Option 9)
-3. Verify with Option 10
+2. Extract to `C:\TSS` or update path (Option 14)
+3. Verify with Option 15
 
 #### Issue: "Cannot create directory"
 **Solution:** Check permissions and disk space
@@ -667,7 +788,23 @@ Suggestions for improvements are welcome. Consider:
 
 ## Version History
 
-### Version 2.0 (Current)
+### Version 2.5 (Current)
+- ✨ **NEW: Windows Services Health** — Critical service monitoring, stopped auto-service detection, crash analysis (Event 7034)
+- ✨ **NEW: Event Log Analysis** — 24-hour error scan, grouped by EventID/Source, log capacity monitoring
+- ✨ **NEW: DNS Health & Connectivity** — DNS server checks, resolution tests, cache statistics, service status
+- ✨ **NEW: Security & Authentication** — Account lockout policy, failed logons (Event 4625), Kerberos tickets, secure channel, firewall status
+- ✨ **NEW: Windows Update Status** — Recent hotfixes, pending reboot detection, update age warnings, OS version info
+- 🛡️ Replaced `Invoke-Expression` with safe `&` call operator (security fix)
+- 🛡️ Renamed `Write-Warning`/`Write-Error` overrides to `Write-DiagWarning`/`Write-DiagError` to avoid shadowing built-in cmdlets
+- 🐛 Fixed port exhaustion check (now uses scalar `Get-NetTCPSetting -SettingName "Internet"`)
+- 🐛 Added division-by-zero guard on disk volume calculations
+- 🐛 Fixed `wevtutil` argument parsing (pre-computed `Join-Path` variables)
+- 🐛 Replaced `Set-Location` with `Push-Location`/`Pop-Location` for safer directory handling
+- 🐛 Fixed `$null` comparison order per PSScriptAnalyzer best practices
+- 🐛 Removed unused `$tssAvailable` variables
+- 📊 Expanded main menu from 10 to 15 options
+
+### Version 2.0
 - ✨ Complete rewrite with enhanced error handling
 - ✨ Hardcoded TSS path with runtime update capability
 - ✨ Comprehensive input validation
@@ -676,7 +813,7 @@ Suggestions for improvements are welcome. Consider:
 - ✨ Enhanced documentation and help
 - ✨ Transcript logging support
 - ✨ Improved user experience with validated inputs
-- ✨ **NEW: TLS Configuration Validation**
+- ✨ **TLS Configuration Validation**
   - Protocol status checking (TLS 1.0, 1.1, 1.2, 1.3)
   - .NET Framework TLS support validation
   - Cipher suite analysis with weak cipher detection
@@ -722,8 +859,8 @@ This script is intended for:
 - [ ] Run PowerShell as Administrator
 - [ ] Download and extract TSS to `C:\TSS`
 - [ ] Execute script
-- [ ] Run diagnostics (Options 1-4)
-- [ ] Run TLS validation (Option 7) for security audit
+- [ ] Run diagnostics (Options 1-9)
+- [ ] Run TLS validation (Option 12) for security audit
 - [ ] Collect logs if issues found
 - [ ] Review output and collected logs
 
@@ -742,26 +879,35 @@ This script is intended for:
 4. Wait for automatic capture at 90% threshold
 
 **Performance Baseline:**
-1. Option 6 → Generate system report
+1. Option 11 → Generate system report
 2. Option 2, 3, or 4 → Select long-term Perfmon (Option 4/5)
 3. Run for 2-4 hours during normal operations
 4. Analyze .blg files with Performance Monitor
 
 **Security Audit:**
-1. Option 7 → Run TLS Configuration Validation
-2. Review protocol status and cipher suites
-3. Export TLS report for documentation
-4. Apply remediation commands if needed
-5. Restart server
-6. Re-run validation to confirm changes
+1. Option 8 → Run Security & Authentication check
+2. Option 12 → Run TLS Configuration Validation
+3. Review protocol status and cipher suites
+4. Export TLS report for documentation
+5. Apply remediation commands if needed
+6. Restart server
+7. Re-run validation to confirm changes
+
+**Services & Update Health Check:**
+1. Option 5 → Check Windows Services Health
+2. Option 9 → Check Windows Update Status
+3. Option 6 → Review Event Log Analysis
+4. Option 7 → Verify DNS Health
+5. Option 11 → Generate system report
 
 **Pre-Deployment Security Check:**
-1. Option 7 → Validate current TLS configuration
-2. Option 6 → Generate system report
-3. Document current state
-4. Apply security hardening
-5. Option 7 → Verify changes
-6. Export reports for compliance documentation
+1. Option 12 → Validate current TLS configuration
+2. Option 8 → Review Security & Authentication
+3. Option 11 → Generate system report
+4. Document current state
+5. Apply security hardening
+6. Option 12 → Verify changes
+7. Export reports for compliance documentation
 
 ---
 
@@ -830,6 +976,6 @@ This script is intended for:
 
 ---
 
-**Last Updated:** December 2024  
-**Script Version:** 2.0  
-**Documentation Version:** 2.0
+**Last Updated:** February 2026  
+**Script Version:** 2.5  
+**Documentation Version:** 2.5
