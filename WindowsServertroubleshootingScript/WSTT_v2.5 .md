@@ -2,25 +2,29 @@
 
 ## Overview
 
-A comprehensive PowerShell-based interactive tool designed for Windows Server administrators to diagnose and collect logs for common server issues including Network, Memory, CPU, Disk performance, Windows Services, Event Logs, DNS, Security & Authentication, Windows Update status, and TLS/SSL configuration validation.
+A comprehensive PowerShell-based interactive tool designed for Windows Server administrators to diagnose and collect logs for common server issues including Network, Memory, CPU, Disk performance, Windows Services, Event Logs, DNS, Security & Authentication, Windows Update status, TLS/SSL configuration validation, and cross-category health scoring.
 
 **Version:** 2.5  
 **Requires:** Administrator privileges, PowerShell 5.1 or higher
+
+> [!NOTE]
+> Performance counter names (`Get-Counter`) are locale-dependent and require an English OS installation. External tools (`w32tm`, `net accounts`, `klist`, `secedit`) also produce English-only output. On non-English Windows installations, some checks may report "Could not…" or display unexpected results.
 
 ---
 
 ## Features
 
 ### 🔍 Primary Diagnostics
-- **Network Issues**: Packet loss, network slowness, RSS checks, port exhaustion detection
-- **Memory Issues**: High usage analysis, top memory consumers, committed bytes tracking
-- **CPU Issues**: High usage detection, process analysis, WMI-specific troubleshooting
-- **Disk/Storage Issues**: Latency measurement, performance analysis, cluster size validation
-- **Windows Services Health**: Critical service monitoring, stopped auto-services, crash detection
-- **Event Log Analysis**: 24-hour error scan grouped by EventID/Source, log capacity warnings
-- **DNS Health & Connectivity**: DNS server checks, resolution tests, cache statistics
-- **Security & Authentication**: Account lockout policy, failed logons, Kerberos, firewall status
-- **Windows Update Status**: Recent patches, pending reboot detection, update age warnings
+- **Network Issues**: Packet loss, network slowness, RSS checks, port exhaustion detection, VMQ status, NIC teaming, packet discards, WAN heartbeat loss
+- **Memory Issues**: High usage analysis, top memory consumers, committed bytes tracking, NonPaged Pool usage, Modified Page List, paging activity, known leaky process detection
+- **CPU Issues**: High usage detection, process analysis, WMI-specific troubleshooting, svchost breakdown, monitoring agent CPU storms, Java process detection, Split I/O check
+- **Disk/Storage Issues**: Latency measurement (read & write), performance analysis, cluster size validation, storage disconnect events (129/153), disk queue length, NTFS corruption detection, VM pause-critical risk
+- **Windows Services Health**: Critical service monitoring, stopped auto-services, crash detection (Event 7034), W32Time NTP sync, Task Scheduler health, EventLog service errors, Netlogon events, RDP licensing
+- **Event Log Analysis**: 24-hour error scan grouped by EventID/Source, log capacity warnings, cluster events (1135/1672), storage events (129/153), DNS update failures, high-priority known critical event summary
+- **DNS Health & Connectivity**: DNS server checks, resolution tests, cache statistics, Bad Key errors, cluster name resolution, reverse DNS lookup, DNS dynamic update failures
+- **Security & Authentication**: Account lockout policy, failed logons, Kerberos, firewall status, account lockout events (4740), logon-as-a-service policy, Schannel/TLS errors, NTLM vs Kerberos detection, MachineKeys permissions
+- **Windows Update Status**: Recent patches, pending reboot detection, update age warnings, CBS store health, pending.xml check, OS lifecycle check, failed update events
+- **Cross-Category Health Scorecard**: Quick consolidated check across cluster/AG stability, storage health, DNS, RDP connectivity, account lockouts, pending reboots, and TLS/Schannel health
 
 ### 🛠️ Additional Scenarios
 - Unexpected reboots
@@ -45,7 +49,7 @@ A comprehensive PowerShell-based interactive tool designed for Windows Server ad
 ### 📊 Utilities
 - Comprehensive system report generation
 - TLS configuration validation and reporting
-- TSS (TroubleShootingScript) integration
+- TSS (TroubleShootingScript) integration with digital signature verification
 - Validator script information
 - Transcript logging support
 
@@ -74,12 +78,12 @@ A comprehensive PowerShell-based interactive tool designed for Windows Server ad
 1. **Download the script**
    ```powershell
    # Save the script to a location, for example:
-   C:\Scripts\WindowsServerTroubleshooting.ps1
+   C:\Scripts\WindowsServertroubleshootingtool_v2.5.ps1
    ```
 
 2. **Configure TSS Path (if not using C:\TSS)**
    - Open the script in a text editor
-   - Locate line 17: `$script:TSSPath = "C:\TSS"`
+   - Locate line 60: `$script:TSSPath = "C:\TSS"`
    - Update to your TSS installation path
    - Save the file
 
@@ -104,7 +108,7 @@ A comprehensive PowerShell-based interactive tool designed for Windows Server ad
 
 3. **Run the script**
    ```powershell
-   .\WindowsServerTroubleshooting.ps1
+   .\WindowsServertroubleshootingtool_v2.5.ps1
    ```
 
 ### With Transcript Logging
@@ -112,7 +116,7 @@ A comprehensive PowerShell-based interactive tool designed for Windows Server ad
 To enable session logging for auditing or documentation:
 
 ```powershell
-.\WindowsServerTroubleshooting.ps1 -EnableLogging
+.\WindowsServertroubleshootingtool_v2.5.ps1 -EnableLogging
 ```
 
 Transcript logs are saved to: `%TEMP%\ServerDiagnostics\Logs\`
@@ -124,31 +128,31 @@ Transcript logs are saved to: `%TEMP%\ServerDiagnostics\Logs\`
 ### Main Menu
 
 ```
-╔═══════════════════════════════════════════════════════════════╗
-║     WINDOWS SERVER TROUBLESHOOTING & LOG COLLECTION TOOL      ║
-║                         Version 2.5                           ║
-╚═══════════════════════════════════════════════════════════════╝
+ WINDOWS SERVER TROUBLESHOOTING & LOG COLLECTION TOOL
+                      Version 2.5
 
 PRIMARY DIAGNOSTICS:
-  1. Network Issues
-  2. Memory Issues
-  3. CPU Issues
-  4. Disk/Storage Issues
+  1. Network Issues (Packet Loss, Slowness, RSS Check)
+  2. Memory Issues (High Usage, Top Consumers)
+  3. CPU Issues (High Usage, Process Analysis)
+  4. Disk/Storage Issues (Latency, Performance)
   5. Windows Services Health
   6. Event Log Analysis
   7. DNS Health & Connectivity
   8. Security & Authentication
   9. Windows Update Status
+ 10. Cross-Category Health Scorecard
 
 ADDITIONAL SCENARIOS:
- 10. Additional Troubleshooting Scenarios
+ 11. Additional Troubleshooting Scenarios
+     (Reboot, Crash, SQL, Cluster, Patching, etc.)
 
 UTILITIES:
- 11. Generate System Report
- 12. TLS Configuration Validation
- 13. Validator Script Information
- 14. Configure TSS Path
- 15. Check TSS Status
+ 12. Generate System Report
+ 13. TLS Configuration Validation
+ 14. Validator Script Information
+ 15. Configure TSS Path
+ 16. Check TSS Status
 
   0. Exit
 ```
@@ -166,6 +170,10 @@ UTILITIES:
 - Network adapter buffer settings (Small Rx Buffers, Rx Ring Size)
 - Power plan configuration
 - Network interface statistics (packets, errors)
+- Packet discards with vmxnet3 adapter detection
+- Port reachability test (localhost, 2s timeout via TcpClient)
+- NIC Teaming / Dual MAC detection (SwitchIndependent + AddressHash risk)
+- WAN heartbeat / cluster link flapping (Events 1135, 1129 last 24h)
 
 **Log Collection Options:**
 - Packet drop/network bottleneck trace (real-time)
@@ -187,6 +195,10 @@ UTILITIES:
 - Memory usage percentage with threshold alerts
 - Top 10 memory-consuming processes
 - Committed bytes analysis
+- NonPaged Pool usage (critical >300MB, warning >200MB)
+- Modified Page List size (file cache pressure, warning >2GB)
+- Paging activity (Pages/sec, critical >1000, warning >500)
+- Known memory-intensive process detection (java, BMCMainEngine, MonitoringHost, WinCollect, sqlservr)
 
 **Log Collection Options:**
 - High memory trace (manual stop after 60s-3min)
@@ -211,9 +223,13 @@ UTILITIES:
 
 **Checks Performed:**
 - Current CPU usage percentage
-- Processor information (cores, logical processors)
+- Processor information (cores, logical processors, multi-socket support)
 - Top 10 CPU-consuming processes
-- WMI Provider Host (WmiPrvSE) analysis
+- WMI Provider Host (WmiPrvSE) analysis (warning >100s CPU time)
+- Top 5 svchost.exe instances with hosted service identification
+- Monitoring agent CPU check (MonitoringHost, HealthService, WinCollect, MOMAgent — warning >50s)
+- Java process CPU check (warning >100s)
+- Split I/O check (storage fragmentation indicator, warning >100/sec)
 
 **Log Collection Options:**
 - High CPU trace (manual stop, 60s-3min recommended)
@@ -240,8 +256,13 @@ UTILITIES:
 **Checks Performed:**
 - Physical disk information and health status
 - Logical disk space usage
-- Disk read/write latency measurements
+- Disk read latency measurements
+- Disk write latency measurements
 - Cluster size validation (important for databases)
+- Storage disconnect events (Events 129, 153 — last 7 days)
+- Disk queue length (warning >2)
+- NTFS file system corruption errors (Event 55 — last 30 days)
+- VM pause-critical risk check (volumes >95% full)
 
 **Log Collection Options:**
 - StorPort trace (10-15 minutes)
@@ -271,10 +292,15 @@ UTILITIES:
 ### 5. Windows Services Health
 
 **Checks Performed:**
-- Critical services status (DNS, DHCP, W32Time, EventLog, WinRM, RpcSs, etc.)
+- Critical services status (DNS, DHCP, W32Time, EventLog, WinRM, RpcSs, LanmanServer, LanmanWorkstation, MSSQLSERVER, SQLSERVERAGENT, W3SVC, IISADMIN, Netlogon, Schedule, TermServLicensing)
 - Stopped automatic services enumeration
-- Disabled services audit
+- Disabled services audit (first 15 shown)
 - Recently crashed/terminated services (Event 7034, last 24 hours)
+- W32Time NTP sync status (source, stratum, last sync time)
+- Task Scheduler health (last 24h errors from Operational log)
+- EventLog service errors (Event 1108, last 7 days)
+- Netlogon / domain connectivity events (Events 5719, 7023, 7024 — last 24h)
+- RDP licensing status and errors (Events 1128, 1129 — last 7 days)
 
 **Log Collection Options:**
 - Export all service status to file
@@ -295,6 +321,28 @@ UTILITIES:
 - Event grouping by EventID and Source (top 10 most frequent)
 - Last 5 critical/error events with timestamps and message snippets
 - Log size and capacity monitoring (warns when >90% full)
+- Cluster heartbeat/quarantine events (Events 1135, 1672 — last 7 days)
+- Storage adapter events (Events 129, 153 — last 7 days)
+- DNS update failure events (Events 8018, 8019 — last 7 days)
+- High-priority known critical event summary (last 24h) scanning across System, Security, and Application logs for known critical Event IDs
+
+**Known Critical Event IDs Scanned:**
+| Log | Event ID | Description |
+|-----|----------|-------------|
+| System | 1135 | Cluster node removed (heartbeat loss) |
+| System | 1672 | Cluster node quarantined |
+| System | 129 | Storage adapter reset/timeout |
+| System | 153 | Disk write retry (storage path failure) |
+| System | 55 | NTFS file system corruption |
+| System | 7034 | Service terminated unexpectedly |
+| System | 5719 | Netlogon cannot connect to DC |
+| System | 36870 | Schannel TLS fatal error |
+| System | 6008 | Unexpected shutdown |
+| System | 8018/8019 | DNS dynamic update failure |
+| Security | 4625 | Failed logon attempt |
+| Security | 4740 | Account lockout |
+| Application | 1000 | Application crash |
+| Application | 1026 | .NET runtime error |
 
 **Log Collection Options:**
 - Export System, Application, Security logs (.evtx)
@@ -316,6 +364,10 @@ UTILITIES:
 - DNS server reachability (ping test with latency measurement)
 - DNS resolution tests (microsoft.com, google.com, domain)
 - DNS cache statistics and recent entries
+- DNS "Bad Key" errors (cluster CNO/VCO failures — DNS Server log, last 7 days)
+- Cluster name resolution (resolves cluster name if Failover Clustering is running)
+- AD secure dynamic DNS update failures (Events 8018, 8019 — last 7 days)
+- Reverse DNS lookup (PTR records for server IPs)
 
 **Log Collection Options:**
 - TSS Network SDP collection
@@ -326,6 +378,7 @@ UTILITIES:
 - Slow DNS lookups
 - Domain join or authentication issues
 - Network connectivity problems
+- Cluster name objects cannot update DNS
 
 ---
 
@@ -337,6 +390,11 @@ UTILITIES:
 - Kerberos ticket status (cached tickets, server targets)
 - Domain secure channel health (Test-ComputerSecureChannel)
 - Windows Firewall status per profile (Domain, Private, Public)
+- Account lockout events (Event 4740, last 24h) grouped by account
+- Logon as a Service policy (SeServiceLogonRight — exported via secedit with restricted temp file ACL)
+- Schannel TLS errors (Events 36870, 36871, 36874 — last 7 days)
+- Authentication protocol usage analysis — NTLM vs Kerberos detection (last 100 logons from Event 4624)
+- MachineKeys directory permissions check (SYSTEM and Administrators access)
 
 **Log Collection Options:**
 - Export firewall rules and configuration
@@ -349,6 +407,7 @@ UTILITIES:
 - Kerberos/NTLM issues
 - Firewall rule troubleshooting
 - Security audit preparation
+- Schannel/TLS certificate issues
 
 ---
 
@@ -360,6 +419,10 @@ UTILITIES:
 - Days since last update (warns at 30+, critical at 90+)
 - Pending reboot detection (CBS, Windows Update, PendingFileRenameOperations)
 - OS version, build, last boot time, and uptime
+- CBS store health (ERROR count in last 200 lines of CBS.log)
+- Pending.xml check (detects stale pending operations that block role installations)
+- OS lifecycle check (alerts for Server 2012/2012 R2 end-of-support, recommends upgrade for Server 2016)
+- Failed update events (Setup log, last 7 days)
 
 **Log Collection Options:**
 - Collect CBS and DISM logs
@@ -379,7 +442,37 @@ UTILITIES:
 
 ---
 
-## Additional Scenarios (Option 10)
+### 10. Cross-Category Health Scorecard
+
+**Overview:**
+A consolidated quick-check that surfaces the highest-frequency cross-cutting issues across all diagnostic categories in a single pass.
+
+**Checks Performed:**
+
+| # | Category | What It Checks |
+|---|----------|----------------|
+| 1 | Cluster / AG Stability | Events 1135, 1672 (last 7 days) |
+| 2 | Storage Health | Events 129, 153 (last 7 days) |
+| 3 | DNS Health | Events 8018, 8019 (last 7 days) |
+| 4 | RDP Connectivity | Port 3389 listening + MachineKeys SYSTEM permissions |
+| 5 | Account Lockouts | Event 4740 (last 24h) |
+| 6 | Pending Reboot | CBS RebootPending + Windows Update RebootRequired |
+| 7 | TLS/Schannel Health | Events 36870, 36871 (last 7 days) |
+
+**Output:**
+- Per-category OK/ISSUE status
+- Final scorecard summary with total issue count
+- Directs to individual diagnostics (options 1-9) for deeper analysis
+
+**Recommended When:**
+- Quick health check of a server
+- Daily monitoring routine
+- Pre-deployment validation
+- Post-incident triage to identify affected areas
+
+---
+
+## Additional Scenarios (Option 11)
 
 ### 1. Unexpected Reboot
 - Collects memory dumps and system diagnostics
@@ -430,7 +523,7 @@ UTILITIES:
 
 ---
 
-## System Report (Option 11)
+## System Report (Option 12)
 
 Generates a comprehensive text report including:
 
@@ -447,7 +540,7 @@ Generates a comprehensive text report including:
 
 ---
 
-## TLS Configuration Validation (Option 12)
+## TLS Configuration Validation (Option 13)
 
 ### Overview
 Comprehensive TLS/SSL protocol analysis and security validation tool that helps ensure your server meets modern security standards and compliance requirements.
@@ -581,21 +674,27 @@ The script is hardcoded to use: `C:\TSS`
 
 **Method 1: Edit Script** (Permanent)
 ```powershell
-# Open script and modify line 17:
+# Open script and modify line 60:
 $script:TSSPath = "D:\YourPath\TSS"
 ```
 
 **Method 2: Runtime Update** (Temporary)
 1. Run the script
-2. Select option 14: "Configure TSS Path"
+2. Select option 15: "Configure TSS Path"
 3. Enter your TSS installation path
 4. Press Enter to validate
 
-### TSS Status Check (Option 15)
+### TSS Status Check (Option 16)
 Verifies:
 - TSS directory exists
 - TSS.ps1 file is present
 - Path configuration is valid
+
+### TSS Digital Signature Verification
+When executing TSS commands, the script verifies the `TSS.ps1` digital signature:
+- **Valid**: Proceeds with execution, showing signer certificate
+- **NotSigned**: Warns user and prompts for confirmation
+- **Other**: Shows status/message and prompts for confirmation
 
 ---
 
@@ -603,9 +702,10 @@ Verifies:
 
 ### Threshold Customization
 
-Edit the following constants at the top of the script (lines 5-13):
+Edit the following constants at the top of the script (lines 33-52):
 
 ```powershell
+# Resource Thresholds
 $MEMORY_CRITICAL_THRESHOLD = 90    # Memory usage critical level (%)
 $MEMORY_WARNING_THRESHOLD = 80     # Memory usage warning level (%)
 $CPU_CRITICAL_THRESHOLD = 90       # CPU usage critical level (%)
@@ -616,16 +716,59 @@ $DISK_LATENCY_CRITICAL_MS = 50     # Disk latency critical level (ms)
 $DISK_LATENCY_WARNING_MS = 20      # Disk latency warning level (ms)
 $DISK_LATENCY_ACCEPTABLE_MS = 10   # Disk latency acceptable level (ms)
 $PORT_EXHAUSTION_THRESHOLD = 0.8   # Port exhaustion threshold (80%)
+
+# Memory-Specific Thresholds
+$NONPAGED_POOL_CRITICAL_MB = 300   # NonPaged Pool critical (MB)
+$NONPAGED_POOL_WARNING_MB = 200    # NonPaged Pool warning (MB)
+$MODIFIED_PAGE_LIST_WARNING_GB = 2 # Modified Page List warning (GB)
+$PAGING_CRITICAL_THRESHOLD = 1000  # Pages/sec critical
+$PAGING_WARNING_THRESHOLD = 500    # Pages/sec warning
+
+# CPU-Specific Thresholds
+$WMI_CPU_WARNING_SECONDS = 100     # WMI provider CPU warning (seconds)
+$MONITORING_AGENT_CPU_WARNING = 50 # Monitoring agent CPU warning (seconds)
+$JAVA_CPU_WARNING_SECONDS = 100    # Java process CPU warning (seconds)
+
+# Disk-Specific Thresholds
+$SPLIT_IO_WARNING_THRESHOLD = 100  # Split IO/sec warning
+$DISK_QUEUE_WARNING_THRESHOLD = 2  # Disk queue length warning
 ```
 
 ### Log Path Customization
 
 Default log location: `%TEMP%\ServerDiagnostics\`
 
-To change, edit lines 16-17:
+To change, edit lines 55-56:
 ```powershell
 $script:TempBasePath = "D:\CustomPath\ServerDiagnostics"
 $script:DefaultLogPath = Join-Path $script:TempBasePath "Logs"
+```
+
+### Critical Services List
+
+To customize which services are checked in Service Health diagnostics, edit the `$script:CriticalServices` array (lines 63-68):
+```powershell
+$script:CriticalServices = @(
+    "DNS", "DHCP", "Spooler", "W32Time", "EventLog",
+    "WinRM", "RpcSs", "LanmanServer", "LanmanWorkstation",
+    "MSSQLSERVER", "SQLSERVERAGENT", "W3SVC", "IISADMIN",
+    "Netlogon", "Schedule", "TermServLicensing"
+)
+```
+
+### Common Ports List
+
+To customize localhost port reachability checks, edit the `$script:CommonPorts` array (lines 71-79):
+```powershell
+$script:CommonPorts = @(
+    @{ Port = 3389; Name = "RDP" },
+    @{ Port = 445;  Name = "SMB" },
+    @{ Port = 135;  Name = "RPC" },
+    @{ Port = 5985; Name = "WinRM" },
+    @{ Port = 1433; Name = "SQL Server" },
+    @{ Port = 80;   Name = "HTTP" },
+    @{ Port = 443;  Name = "HTTPS" }
+)
 ```
 
 ---
@@ -642,6 +785,9 @@ $script:DefaultLogPath = Join-Path $script:TempBasePath "Logs"
 | TSS Logs | `C:\MS_DATA\` | TSS-generated logs (configurable) |
 | Event Logs | `%TEMP%\ServerDiagnostics\Logs\EventLogs\` | Exported event logs |
 | Performance Logs | User-specified or default | Perfmon .blg files |
+| Service Status | `%TEMP%\ServerDiagnostics\Logs\` | Exported service status |
+| Firewall Export | `%TEMP%\ServerDiagnostics\Logs\` | Firewall rules and config |
+| WU Logs | `%TEMP%\ServerDiagnostics\Logs\` | CBS.log, DISM.log copies |
 
 ### TSS Output
 When using TSS commands, logs are typically saved to:
@@ -678,11 +824,12 @@ When using TSS commands, logs are typically saved to:
 
 ### 🔧 Troubleshooting Tips
 
-1. **Start with Diagnostics**: Run diagnostic checks before log collection
-2. **Check Thresholds**: Review warnings/errors from diagnostic output
-3. **TSS Integration**: Use TSS for comprehensive automated collection
-4. **Manual Fallback**: Use manual commands if TSS is unavailable
-5. **Stop Traces Promptly**: Don't let traces run longer than necessary
+1. **Start with Scorecard**: Run Cross-Category Health Scorecard (option 10) for a quick overview
+2. **Then Diagnostics**: Run specific diagnostic checks for flagged areas
+3. **Check Thresholds**: Review warnings/errors from diagnostic output
+4. **TSS Integration**: Use TSS for comprehensive automated collection
+5. **Manual Fallback**: Use manual commands if TSS is unavailable
+6. **Stop Traces Promptly**: Don't let traces run longer than necessary
 
 ### 📊 Log Analysis
 
@@ -715,8 +862,8 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 #### Issue: "TSS not found"
 **Solution:** 
 1. Download TSS from provided links
-2. Extract to `C:\TSS` or update path (Option 14)
-3. Verify with Option 15
+2. Extract to `C:\TSS` or update path (Option 15)
+3. Verify with Option 16
 
 #### Issue: "Cannot create directory"
 **Solution:** Check permissions and disk space
@@ -735,6 +882,11 @@ Test-Path $env:TEMP -PathType Container
 - TLS validation will work partially
 - Cipher suite analysis will be skipped
 
+#### Issue: "Could not parse lockout policy (non-English locale?)"
+**Solution:** The `net accounts` command outputs English text
+- On non-English Windows, lockout policy parsing may fail
+- Manually verify via `secpol.msc` or Group Policy
+
 ---
 
 ## Performance Impact
@@ -744,6 +896,7 @@ Test-Path $env:TEMP -PathType Container
 | Activity | CPU Impact | Memory Impact | Disk I/O | Network I/O |
 |----------|------------|---------------|----------|-------------|
 | Diagnostics Only | Minimal (<5%) | Minimal (<100MB) | Low | Low |
+| Health Scorecard | Minimal (<3%) | Minimal (<50MB) | Low | None |
 | TLS Validation | Minimal (<2%) | Minimal (<50MB) | Low | None |
 | TSS Traces | Low-Medium (5-15%) | Medium (200-500MB) | Medium-High | Low-Medium |
 | Performance Monitor | Minimal (<2%) | Low (50-200MB) | Medium | Minimal |
@@ -751,7 +904,7 @@ Test-Path $env:TEMP -PathType Container
 
 ### Recommendations
 
-- **Production Servers**: Safe to run diagnostics and TLS validation anytime
+- **Production Servers**: Safe to run diagnostics, scorecard, and TLS validation anytime
 - **Trace Collection**: Monitor system resources during collection
 - **Peak Hours**: Avoid long-term traces during critical operations
 - **Resource-Constrained**: Use shorter capture windows or specific traces
@@ -789,11 +942,17 @@ Suggestions for improvements are welcome. Consider:
 ## Version History
 
 ### Version 2.5 (Current)
-- ✨ **NEW: Windows Services Health** — Critical service monitoring, stopped auto-service detection, crash analysis (Event 7034)
-- ✨ **NEW: Event Log Analysis** — 24-hour error scan, grouped by EventID/Source, log capacity monitoring
-- ✨ **NEW: DNS Health & Connectivity** — DNS server checks, resolution tests, cache statistics, service status
-- ✨ **NEW: Security & Authentication** — Account lockout policy, failed logons (Event 4625), Kerberos tickets, secure channel, firewall status
-- ✨ **NEW: Windows Update Status** — Recent hotfixes, pending reboot detection, update age warnings, OS version info
+- ✨ **NEW: Cross-Category Health Scorecard** — Consolidated quick-check across 7 issue areas (cluster, storage, DNS, RDP, lockouts, reboot, TLS)
+- ✨ **NEW: Windows Services Health** — Critical service monitoring, stopped auto-service detection, crash analysis (Event 7034), W32Time NTP sync, Task Scheduler health, EventLog errors, Netlogon events, RDP licensing
+- ✨ **NEW: Event Log Analysis** — 24-hour error scan, grouped by EventID/Source, log capacity monitoring, cluster/storage/DNS event correlation, known critical event summary
+- ✨ **NEW: DNS Health & Connectivity** — DNS server checks, resolution tests, cache statistics, Bad Key errors, cluster name resolution, reverse DNS, DNS dynamic update failures
+- ✨ **NEW: Security & Authentication** — Account lockout policy, failed logons (Event 4625), Kerberos tickets, secure channel, firewall status, account lockout events (4740), logon-as-a-service policy, Schannel TLS errors, NTLM vs Kerberos detection, MachineKeys permissions
+- ✨ **NEW: Windows Update Status** — Recent hotfixes, pending reboot detection, update age warnings, OS version info, CBS store health, pending.xml check, OS lifecycle check, failed update events
+- 🔒 **Enhanced TSS security** — Digital signature verification (Authenticode) before executing TSS.ps1, restricted temp file ACL for secedit export
+- 🔧 **Enhanced Memory diagnostics** — NonPaged Pool usage, Modified Page List, paging activity (Pages/sec), known leaky process detection
+- 🔧 **Enhanced CPU diagnostics** — Svchost.exe breakdown with hosted services, monitoring agent CPU storm detection, Java CPU check, Split I/O check
+- 🔧 **Enhanced Disk diagnostics** — Write latency, disk queue length, storage disconnect events (129/153), NTFS corruption (Event 55), VM pause-critical risk
+- 🔧 **Enhanced Network diagnostics** — Packet discard detection with vmxnet3 alert, NIC teaming dual MAC risk, WAN heartbeat/cluster link flapping, port reachability via TcpClient with 2s timeout
 - 🛡️ Replaced `Invoke-Expression` with safe `&` call operator (security fix)
 - 🛡️ Renamed `Write-Warning`/`Write-Error` overrides to `Write-DiagWarning`/`Write-DiagError` to avoid shadowing built-in cmdlets
 - 🐛 Fixed port exhaustion check (now uses scalar `Get-NetTCPSetting -SettingName "Internet"`)
@@ -802,7 +961,7 @@ Suggestions for improvements are welcome. Consider:
 - 🐛 Replaced `Set-Location` with `Push-Location`/`Pop-Location` for safer directory handling
 - 🐛 Fixed `$null` comparison order per PSScriptAnalyzer best practices
 - 🐛 Removed unused `$tssAvailable` variables
-- 📊 Expanded main menu from 10 to 15 options
+- 📊 Expanded main menu from 10 to 16 options
 
 ### Version 2.0
 - ✨ Complete rewrite with enhanced error handling
@@ -859,34 +1018,40 @@ This script is intended for:
 - [ ] Run PowerShell as Administrator
 - [ ] Download and extract TSS to `C:\TSS`
 - [ ] Execute script
-- [ ] Run diagnostics (Options 1-9)
-- [ ] Run TLS validation (Option 12) for security audit
+- [ ] Run Health Scorecard (Option 10) for quick overview
+- [ ] Run specific diagnostics (Options 1-9) for flagged areas
+- [ ] Run TLS validation (Option 13) for security audit
 - [ ] Collect logs if issues found
 - [ ] Review output and collected logs
 
 ### Common Command Sequences
 
+**Quick Health Check:**
+1. Option 10 → Run Cross-Category Health Scorecard
+2. Review flagged issue areas
+3. Run specific diagnostics for any ISSUE categories
+
 **Network Issue Investigation:**
 1. Option 1 → Run network diagnostics
-2. Review RSS, VMQ, port usage
+2. Review RSS, VMQ, port usage, packet discards, NIC teaming
 3. Option 1 → Choose log collection method
 4. Reproduce issue during trace
 
 **Memory Leak Investigation:**
 1. Option 2 → Check current memory usage
-2. Note top consumers
+2. Note top consumers, NonPaged Pool, Modified Page List, paging activity
 3. Option 2 → Select intermittent capture (Option 3)
 4. Wait for automatic capture at 90% threshold
 
 **Performance Baseline:**
-1. Option 11 → Generate system report
+1. Option 12 → Generate system report
 2. Option 2, 3, or 4 → Select long-term Perfmon (Option 4/5)
 3. Run for 2-4 hours during normal operations
 4. Analyze .blg files with Performance Monitor
 
 **Security Audit:**
 1. Option 8 → Run Security & Authentication check
-2. Option 12 → Run TLS Configuration Validation
+2. Option 13 → Run TLS Configuration Validation
 3. Review protocol status and cipher suites
 4. Export TLS report for documentation
 5. Apply remediation commands if needed
@@ -894,20 +1059,22 @@ This script is intended for:
 7. Re-run validation to confirm changes
 
 **Services & Update Health Check:**
-1. Option 5 → Check Windows Services Health
-2. Option 9 → Check Windows Update Status
-3. Option 6 → Review Event Log Analysis
-4. Option 7 → Verify DNS Health
-5. Option 11 → Generate system report
+1. Option 10 → Run Health Scorecard first
+2. Option 5 → Check Windows Services Health
+3. Option 9 → Check Windows Update Status
+4. Option 6 → Review Event Log Analysis
+5. Option 7 → Verify DNS Health
+6. Option 12 → Generate system report
 
 **Pre-Deployment Security Check:**
-1. Option 12 → Validate current TLS configuration
-2. Option 8 → Review Security & Authentication
-3. Option 11 → Generate system report
-4. Document current state
-5. Apply security hardening
-6. Option 12 → Verify changes
-7. Export reports for compliance documentation
+1. Option 10 → Run Health Scorecard for baseline
+2. Option 13 → Validate current TLS configuration
+3. Option 8 → Review Security & Authentication
+4. Option 12 → Generate system report
+5. Document current state
+6. Apply security hardening
+7. Option 13 → Verify changes
+8. Export reports for compliance documentation
 
 ---
 
@@ -962,6 +1129,7 @@ This script is intended for:
 | Baseline Collection | 2 hours | 4 hours |
 | Disk Performance | 10 minutes | 15 minutes |
 | TLS Validation | Instant | N/A |
+| Health Scorecard | Instant | N/A |
 
 ### TLS Protocol Support by Windows Version
 
@@ -974,8 +1142,33 @@ This script is intended for:
 | Server 2019 | ✅ (Disabled) | ✅ (Disabled) | ✅ Default | ❌ |
 | Server 2022 | ❌ Disabled | ❌ Disabled | ✅ Default | ✅ Available |
 
+### Script Architecture
+
+The script is organized into the following regions:
+
+| Region | Lines | Description |
+|--------|-------|-------------|
+| Constants and Configuration | 31-105 | Thresholds, paths, services, ports, critical event IDs |
+| Output and Display Functions | 107-167 | Write-Header, Write-Success, Write-DiagWarning, Write-DiagError, Write-Info |
+| Event Helpers | 169-234 | Get-EventSnippet, Get-RecentEvents |
+| Helper Functions | 236-398 | Path validation, input validation, TSS wrapper, process analysis |
+| TSS Functions | 401-567 | Set-TSSPath, Test-TSSAvailable, Invoke-TSSCommand |
+| Network Diagnostics | 570-882 | Test-NetworkConfiguration, Start-NetworkLogCollection |
+| Memory Diagnostics | 884-1103 | Test-MemoryUsage, Start-MemoryLogCollection |
+| CPU Diagnostics | 1105-1331 | Test-CPUUsage, Start-CPULogCollection |
+| Disk/Storage Diagnostics | 1333-1649 | Test-DiskPerformance, Start-DiskLogCollection |
+| Services Health | 1651-1913 | Test-ServicesHealth, Start-ServicesLogCollection |
+| Event Log Analysis | 1916-2125 | Test-EventLogHealth, Start-EventLogCollection |
+| DNS Health | 2127-2387 | Test-DNSHealth, Start-DNSLogCollection |
+| Security & Authentication | 2389-2731 | Test-SecurityAuthentication, Start-SecurityLogCollection |
+| Windows Update Status | 2733-3011 | Test-WindowsUpdateStatus, Start-WindowsUpdateLogCollection |
+| Cross-Category Health | 3013-3181 | Test-CrossCategoryHealth |
+| Additional Scenarios | 3183-3359 | Show-AdditionalScenarios |
+| Report Functions | 3361-3898 | Validator info, TLS validation, TLS report, System report |
+| Main Menu and Execution | 3901-4133 | Show-MainMenu, Start-TroubleshootingTool |
+
 ---
 
-**Last Updated:** February 2026  
+**Last Updated:** March 2026  
 **Script Version:** 2.5  
 **Documentation Version:** 2.5
