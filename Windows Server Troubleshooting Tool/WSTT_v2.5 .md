@@ -1,4 +1,4 @@
-# Windows Server Troubleshooting & Log Collection Tool (WSTT)
+# Windows Server Troubleshooting & Log Collection Tool
 
 ## Overview
 
@@ -50,6 +50,7 @@ A comprehensive PowerShell-based interactive tool designed for Windows Server ad
 - Comprehensive system report generation
 - TLS configuration validation and reporting
 - **.NET Framework version checking**
+- **IIS Troubleshooting & Diagnostics**
 - TSS (TroubleShootingScript) integration with digital signature verification
 - Validator script information
 - Transcript logging support
@@ -155,6 +156,7 @@ UTILITIES:
  15. Configure TSS Path
  16. Check TSS Status
  17. Check .NET Framework Versions
+ 18. IIS Troubleshooting & Diagnostics
 
   0. Exit
 ```
@@ -714,6 +716,26 @@ Scans the local registry to determine all installed versions of .NET Framework a
 
 ---
 
+## IIS Troubleshooting & Diagnostics (Option 18)
+
+### Overview
+Performs comprehensive health checks and diagnostics for Internet Information Services (IIS) components, including core services, application pools, websites, and worker processes.
+
+### Checks Performed
+- **IIS Installation**: Validates if the Web-Server role is installed and the WebAdministration module is available.
+- **Core Services Status**: Checks the running state of `W3SVC`, `WAS`, and `IISADMIN` services.
+- **Application Pools**: Discovers all IIS Application Pools, reporting their running state and configured process identity.
+- **Websites**: Enumerates all configured Websites, displaying their running state, physical path, and protocol bindings.
+- **Worker Processes (`w3wp.exe`)**: Identifies active IIS worker processes, associates them with their Application Pool, and reports current Memory and CPU usage.
+
+**Recommended When:**
+- IIS websites are down or slow
+- Application pools are stopping unexpectedly
+- Investigating high resource usage related to web applications
+- Verifying IIS configuration status
+
+---
+
 ## Configuration & Customization
 
 ### Threshold Customization
@@ -959,6 +981,7 @@ Suggestions for improvements are welcome. Consider:
 ## Version History
 
 ### Version 2.5 (Current)
+- ✨ **NEW: IIS Troubleshooting & Diagnostics** — Comprehensive checks for IIS services, AppPools, Websites, and worker processes (Option 18)
 - ✨ **NEW: Cross-Category Health Scorecard** — Consolidated quick-check across 7 issue areas (cluster, storage, DNS, RDP, lockouts, reboot, TLS)
 - ✨ **NEW: Windows Services Health** — Critical service monitoring, stopped auto-service detection, crash analysis (Event 7034), W32Time NTP sync, Task Scheduler health, EventLog errors, Netlogon events, RDP licensing
 - ✨ **NEW: Event Log Analysis** — 24-hour error scan, grouped by EventID/Source, log capacity monitoring, cluster/storage/DNS event correlation, known critical event summary
@@ -1082,6 +1105,12 @@ This script is intended for:
 4. Option 6 → Review Event Log Analysis
 5. Option 7 → Verify DNS Health
 6. Option 12 → Generate system report
+
+**IIS Issue Investigation:**
+1. Option 18 → Run IIS Troubleshooting & Diagnostics
+2. Review Core Services status
+3. Check Application Pools and Website states
+4. Monitor worker process (w3wp) CPU and Memory usage
 
 **Pre-Deployment Security Check:**
 1. Option 10 → Run Health Scorecard for baseline
