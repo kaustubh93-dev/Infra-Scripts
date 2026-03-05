@@ -49,6 +49,7 @@ A comprehensive PowerShell-based interactive tool designed for Windows Server ad
 ### 📊 Utilities
 - Comprehensive system report generation
 - TLS configuration validation and reporting
+- **.NET Framework version checking**
 - TSS (TroubleShootingScript) integration with digital signature verification
 - Validator script information
 - Transcript logging support
@@ -153,6 +154,7 @@ UTILITIES:
  14. Validator Script Information
  15. Configure TSS Path
  16. Check TSS Status
+ 17. Check .NET Framework Versions
 
   0. Exit
 ```
@@ -698,6 +700,20 @@ When executing TSS commands, the script verifies the `TSS.ps1` digital signature
 
 ---
 
+## .NET Framework Versions (Option 17)
+
+### Overview
+Scans the local registry to determine all installed versions of .NET Framework and .NET Core Runtime. The output is displayed in a formatted table and can optionally be exported to a CSV file.
+
+### Checks Performed
+- **.NET Framework Releases**: Scans `HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full` to identify the most recent .NET 4.x release installed.
+- **.NET Framework Legacy/Subcomponents**: Enumerates `HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP` recursively.
+- **.NET Core Runtime**: Inspects common uninstall registry nodes to find installed .NET Core runtimes.
+
+**Report Location:** `%TEMP%\ServerDiagnostics\Logs\DotNetVersions_YYYYMMDD_HHMMSS.csv`
+
+---
+
 ## Configuration & Customization
 
 ### Threshold Customization
@@ -781,6 +797,7 @@ $script:CommonPorts = @(
 |-----------|------------------|-------------|
 | System Reports | `%TEMP%\ServerDiagnostics\Logs\` | Comprehensive system reports |
 | TLS Reports | `%TEMP%\ServerDiagnostics\Logs\` | TLS configuration reports |
+| .NET Version Reports | `%TEMP%\ServerDiagnostics\Logs\` | Installed .NET versions CSV |
 | Transcript Logs | `%TEMP%\ServerDiagnostics\Logs\` | Session transcript logs |
 | TSS Logs | `C:\MS_DATA\` | TSS-generated logs (configurable) |
 | Event Logs | `%TEMP%\ServerDiagnostics\Logs\EventLogs\` | Exported event logs |
