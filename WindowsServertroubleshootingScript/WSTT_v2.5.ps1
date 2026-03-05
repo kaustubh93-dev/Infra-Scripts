@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Comprehensive Windows Server Troubleshooting and Log Collection Script
@@ -7,8 +7,8 @@
 .PARAMETER EnableLogging
     Enables transcript logging of the entire session
 .EXAMPLE
-    .\WindowsServertroubleshootingtool_v1.ps1
-    .\WindowsServertroubleshootingtool_v1.ps1 -EnableLogging
+    .\WindowsServertroubleshootingtool_v2.5.ps1
+    .\WindowsServertroubleshootingtool_v2.5.ps1 -EnableLogging
 .NOTES
     Version: 2.5
     Requires: Administrator privileges
@@ -22,19 +22,34 @@ param(
 # Requirements: PowerShell 5.1+ and the NetTCPIP module (Get-Net* cmdlets).
 # Custom display functions use Write-DiagWarning/Write-DiagError to avoid overriding built-in cmdlets.
 # If running on older PowerShell versions, some cmdlets may be unavailable.
+#
+# LOCALE NOTE: Performance counter names (Get-Counter) are locale-dependent and require
+# an English OS installation. External tools (w32tm, net accounts, klist, secedit) also
+# produce English-only output that this script parses. On non-English Windows installations,
+# some checks may report "Could not..." or display unexpected results.
 
 #region Constants and Configuration
-# Threshold Constants
-$MEMORY_CRITICAL_THRESHOLD = 90
-$MEMORY_WARNING_THRESHOLD = 80
-$CPU_CRITICAL_THRESHOLD = 90
-$CPU_WARNING_THRESHOLD = 80
-$DISK_CRITICAL_THRESHOLD = 90
-$DISK_WARNING_THRESHOLD = 80
-$DISK_LATENCY_CRITICAL_MS = 50
-$DISK_LATENCY_WARNING_MS = 20
-$DISK_LATENCY_ACCEPTABLE_MS = 10
-$PORT_EXHAUSTION_THRESHOLD = 0.8
+# Threshold Constants (ReadOnly to prevent accidental reassignment)
+Set-Variable -Name MEMORY_CRITICAL_THRESHOLD -Value 90 -Option ReadOnly -Force
+Set-Variable -Name MEMORY_WARNING_THRESHOLD -Value 80 -Option ReadOnly -Force
+Set-Variable -Name CPU_CRITICAL_THRESHOLD -Value 90 -Option ReadOnly -Force
+Set-Variable -Name CPU_WARNING_THRESHOLD -Value 80 -Option ReadOnly -Force
+Set-Variable -Name DISK_CRITICAL_THRESHOLD -Value 90 -Option ReadOnly -Force
+Set-Variable -Name DISK_WARNING_THRESHOLD -Value 80 -Option ReadOnly -Force
+Set-Variable -Name DISK_LATENCY_CRITICAL_MS -Value 50 -Option ReadOnly -Force
+Set-Variable -Name DISK_LATENCY_WARNING_MS -Value 20 -Option ReadOnly -Force
+Set-Variable -Name DISK_LATENCY_ACCEPTABLE_MS -Value 10 -Option ReadOnly -Force
+Set-Variable -Name PORT_EXHAUSTION_THRESHOLD -Value 0.8 -Option ReadOnly -Force
+Set-Variable -Name NONPAGED_POOL_CRITICAL_MB -Value 300 -Option ReadOnly -Force
+Set-Variable -Name NONPAGED_POOL_WARNING_MB -Value 200 -Option ReadOnly -Force
+Set-Variable -Name MODIFIED_PAGE_LIST_WARNING_GB -Value 2 -Option ReadOnly -Force
+Set-Variable -Name PAGING_CRITICAL_THRESHOLD -Value 1000 -Option ReadOnly -Force
+Set-Variable -Name PAGING_WARNING_THRESHOLD -Value 500 -Option ReadOnly -Force
+Set-Variable -Name WMI_CPU_WARNING_SECONDS -Value 100 -Option ReadOnly -Force
+Set-Variable -Name MONITORING_AGENT_CPU_WARNING -Value 50 -Option ReadOnly -Force
+Set-Variable -Name JAVA_CPU_WARNING_SECONDS -Value 100 -Option ReadOnly -Force
+Set-Variable -Name SPLIT_IO_WARNING_THRESHOLD -Value 100 -Option ReadOnly -Force
+Set-Variable -Name DISK_QUEUE_WARNING_THRESHOLD -Value 2 -Option ReadOnly -Force
 
 # Path Configuration
 $script:TempBasePath = Join-Path $env:TEMP "ServerDiagnostics"
@@ -48,20 +63,48 @@ $script:TSSPath = "C:\TSS"  # Default hardcoded path
 $script:CriticalServices = @(
     "DNS", "DHCP", "Spooler", "W32Time", "EventLog",
     "WinRM", "RpcSs", "LanmanServer", "LanmanWorkstation",
-    "MSSQLSERVER", "SQLSERVERAGENT", "W3SVC", "IISADMIN"
+    "MSSQLSERVER", "SQLSERVERAGENT", "W3SVC", "IISADMIN",
+    "Netlogon", "Schedule", "TermServLicensing"
 )
+
+# Common Ports for reachability test
+$script:CommonPorts = @(
+    @{ Port = 3389; Name = "RDP" },
+    @{ Port = 445; Name = "SMB" },
+    @{ Port = 135; Name = "RPC" },
+    @{ Port = 5985; Name = "WinRM" },
+    @{ Port = 1433; Name = "SQL Server" },
+    @{ Port = 80; Name = "HTTP" },
+    @{ Port = 443; Name = "HTTPS" }
+)
+
+# Known Critical Event IDs to scan across categories
+$script:KnownCriticalEventIDs = @{
+    System      = @(
+        @{ Id = 1135; Desc = "Cluster node removed (heartbeat loss)" },
+        @{ Id = 1672; Desc = "Cluster node quarantined" },
+        @{ Id = 129; Desc = "Storage adapter reset/timeout" },
+        @{ Id = 153; Desc = "Disk write retry (storage path failure)" },
+        @{ Id = 55; Desc = "NTFS file system corruption" },
+        @{ Id = 7034; Desc = "Service terminated unexpectedly" },
+        @{ Id = 5719; Desc = "Netlogon cannot connect to domain controller" },
+        @{ Id = 36870; Desc = "Schannel TLS fatal error (certificate/key)" },
+        @{ Id = 6008; Desc = "Unexpected shutdown" },
+        @{ Id = 8018; Desc = "DNS dynamic update failure" },
+        @{ Id = 8019; Desc = "DNS dynamic update failure (access denied)" }
+    )
+    Security    = @(
+        @{ Id = 4625; Desc = "Failed logon attempt" },
+        @{ Id = 4740; Desc = "Account lockout" }
+    )
+    Application = @(
+        @{ Id = 1000; Desc = "Application crash" },
+        @{ Id = 1026; Desc = ".NET runtime error" }
+    )
+}
 #endregion
 
 #region Output and Display Functions
-function Write-ColorOutput {
-    param(
-        [System.ConsoleColor]$ForegroundColor
-    )
-    $fc = $host.UI.RawUI.ForegroundColor
-    $host.UI.RawUI.ForegroundColor = $ForegroundColor
-    if ($args) { Write-Output $args }
-    $host.UI.RawUI.ForegroundColor = $fc
-}
 
 function Write-Header {
     <#
@@ -120,6 +163,73 @@ function Write-Info {
     #>
     param([string]$Text)
     Write-Host "[INFO] $($Text)" -ForegroundColor White
+}
+#endregion
+
+#region Event Message Helper
+function Get-EventSnippet {
+    <#
+    .SYNOPSIS
+        Safely extracts a message snippet from an event log entry
+    .PARAMETER Event
+        The event log entry
+    .PARAMETER MaxLength
+        Maximum number of characters to return (default: 100)
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Event,
+        [int]$MaxLength = 100
+    )
+    
+    $msg = $Event.Message
+    if ([string]::IsNullOrEmpty($msg)) {
+        return "(No message available)"
+    }
+    $msg = $msg -replace '[\r\n]+', ' '
+    if ($msg.Length -gt $MaxLength) {
+        return $msg.Substring(0, $MaxLength)
+    }
+    return $msg
+}
+#endregion
+
+#region Event Query Helper
+function Get-RecentEvents {
+    <#
+    .SYNOPSIS
+        Shared helper to query recent Windows Event Log entries
+    .PARAMETER LogName
+        Event log name (e.g. System, Application, Security)
+    .PARAMETER EventIds
+        Array of Event IDs to search for
+    .PARAMETER HoursBack
+        Number of hours to look back (default: 24)
+    .PARAMETER DaysBack
+        Number of days to look back (overrides HoursBack if specified)
+    .PARAMETER MaxEvents
+        Maximum events to return (default: 50)
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$LogName,
+        [Parameter(Mandatory = $true)][int[]]$EventIds,
+        [int]$HoursBack = 0,
+        [int]$DaysBack = 0,
+        [int]$MaxEvents = 50
+    )
+    
+    $startTime = if ($DaysBack -gt 0) { (Get-Date).AddDays(-$DaysBack) } elseif ($HoursBack -gt 0) { (Get-Date).AddHours(-$HoursBack) } else { (Get-Date).AddHours(-24) }
+    
+    try {
+        @(Get-WinEvent -FilterHashtable @{
+                LogName   = $LogName
+                Id        = $EventIds
+                StartTime = $startTime
+            } -MaxEvents $MaxEvents -ErrorAction SilentlyContinue)
+    }
+    catch {
+        @()
+    }
 }
 #endregion
 
@@ -401,14 +511,47 @@ function Invoke-TSSCommand {
         return $false
     }
     
+    # S1: Verify the TSS script has a valid digital signature
+    try {
+        $sig = Get-AuthenticodeSignature -FilePath $tssScript -ErrorAction Stop
+        switch ($sig.Status) {
+            'Valid' {
+                Write-Success "TSS.ps1 signature verified (signed by: $($sig.SignerCertificate.Subject))"
+            }
+            'NotSigned' {
+                Write-DiagWarning "TSS.ps1 is NOT digitally signed. Verify you downloaded it from an official Microsoft source."
+                $proceed = Get-ValidatedChoice -Prompt "Continue anyway? (Y/N)" -ValidChoices @("Y", "N")
+                if ($proceed -ne "Y") {
+                    Write-Info "TSS command cancelled by user."
+                    return $false
+                }
+            }
+            default {
+                Write-DiagError "TSS.ps1 signature status: $($sig.Status) - $($sig.StatusMessage)"
+                $proceed = Get-ValidatedChoice -Prompt "Continue anyway? (Y/N)" -ValidChoices @("Y", "N")
+                if ($proceed -ne "Y") {
+                    Write-Info "TSS command cancelled by user."
+                    return $false
+                }
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "Could not verify TSS.ps1 signature: $($_.Exception.Message)"
+    }
+    
     try {
         # Change to TSS directory safely
         Push-Location $script:TSSPath
         
-        # Execute TSS command using safe call operator (no Invoke-Expression)
-        $arguments = $Command -split '\s+'
-        Write-Info "Executing: & '$tssScript' $Command"
-        & $tssScript @arguments
+        # Execute TSS command using Start-Process to preserve quoted arguments
+        Write-Info "Executing: powershell -File '$tssScript' $Command"
+        $proc = Start-Process -FilePath "powershell.exe" `
+            -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tssScript`" $Command" `
+            -Wait -NoNewWindow -PassThru
+        if ($proc.ExitCode -ne 0) {
+            Write-DiagWarning "TSS process exited with code: $($proc.ExitCode)"
+        }
         
         Write-Success "TSS command completed"
         return $true
@@ -437,7 +580,19 @@ function Test-NetworkConfiguration {
     .NOTES
         Requires administrator privileges
     #>
+    [CmdletBinding()]
+    param()
+    
     Write-Header "Network Configuration Check"
+    
+    # Cache active adapters once for reuse throughout this function
+    $activeAdapters = $null
+    try {
+        $activeAdapters = Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
+    }
+    catch {
+        Write-DiagError "Failed to enumerate network adapters: $($_.Exception.Message)"
+    }
     
     try {
         # Check RSS (Receive Side Scaling)
@@ -462,16 +617,24 @@ function Test-NetworkConfiguration {
     Write-Info "`nChecking TCP Ephemeral Ports:"
     try {
         $tcpParams = Get-NetTCPSetting -SettingName "Internet" -ErrorAction Stop
-        $currentConnections = (Get-NetTCPConnection -ErrorAction Stop).Count
         $maxPorts = $tcpParams.DynamicPortRangeNumberOfPorts
         $startPort = $tcpParams.DynamicPortRangeStartPort
+        $endPort = $startPort + $maxPorts - 1
         
-        Write-Info "  Dynamic Port Range: $($startPort) - $($startPort + $maxPorts - 1)"
-        Write-Info "  Active TCP Connections: $($currentConnections)"
+        # Count only connections in ephemeral range with states that consume ports
+        $ephemeralStates = @('Bound', 'Established', 'TimeWait', 'CloseWait', 'FinWait1', 'FinWait2', 'LastAck', 'Closing')
+        $allConnections = Get-NetTCPConnection -ErrorAction Stop
+        $ephemeralConnections = ($allConnections | Where-Object {
+                $_.LocalPort -ge $startPort -and $_.LocalPort -le $endPort -and $_.State -in $ephemeralStates
+            }).Count
+        
+        Write-Info "  Dynamic Port Range: $($startPort) - $($endPort)"
+        Write-Info "  Total TCP Connections: $($allConnections.Count)"
+        Write-Info "  Ephemeral Ports In Use: $($ephemeralConnections)"
         Write-Info "  Max Dynamic Ports Available: $($maxPorts)"
         
-        if ($maxPorts -gt 0 -and $currentConnections -gt ($maxPorts * $PORT_EXHAUSTION_THRESHOLD)) {
-            Write-DiagError "  CRITICAL: Potential Port Exhaustion (Using >$($PORT_EXHAUSTION_THRESHOLD * 100)% of available ports)"
+        if ($maxPorts -gt 0 -and $ephemeralConnections -gt ($maxPorts * $PORT_EXHAUSTION_THRESHOLD)) {
+            Write-DiagError "  CRITICAL: Potential Port Exhaustion (Using >$($PORT_EXHAUSTION_THRESHOLD * 100)% of available ephemeral ports)"
         }
         else {
             Write-Success "  Port usage is within acceptable range"
@@ -503,10 +666,8 @@ function Test-NetworkConfiguration {
 
     # Check Network Adapter Advanced Properties
     Write-Info "`nChecking Network Adapter Buffer Settings..."
-    try {
-        $netAdapters = Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
-        
-        foreach ($adapter in $netAdapters) {
+    if ($activeAdapters) {
+        foreach ($adapter in $activeAdapters) {
             Write-Info "`nAdapter: $($adapter.Name)"
             try {
                 $advProps = Get-NetAdapterAdvancedProperty -Name $adapter.Name -ErrorAction Stop
@@ -539,9 +700,6 @@ function Test-NetworkConfiguration {
             }
         }
     }
-    catch {
-        Write-DiagError "Failed to enumerate network adapters: $($_.Exception.Message)"
-    }
     
     # Check Power Plan
     Write-Info "`nChecking Power Plan..."
@@ -560,25 +718,113 @@ function Test-NetworkConfiguration {
         Write-DiagError "Failed to check power plan: $($_.Exception.Message)"
     }
     
-    # Network Statistics
+    # Network Statistics (reuses cached $activeAdapters)
     Write-Info "`nNetwork Interface Statistics:"
-    try {
-        Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq "Up" } | ForEach-Object {
+    if ($activeAdapters) {
+        foreach ($adpt in $activeAdapters) {
             try {
-                $stats = Get-NetAdapterStatistics -Name $_.Name -ErrorAction Stop
-                Write-Info "  $($_.Name):"
+                $stats = Get-NetAdapterStatistics -Name $adpt.Name -ErrorAction Stop
+                Write-Info "  $($adpt.Name):"
                 Write-Info "    Received Packets: $($stats.ReceivedUnicastPackets)"
                 Write-Info "    Sent Packets: $($stats.SentUnicastPackets)"
                 Write-Info "    Received Errors: $($stats.ReceivedPacketErrors)"
                 Write-Info "    Sent Errors: $($stats.OutboundPacketErrors)"
             }
             catch {
-                Write-DiagWarning "  Could not retrieve statistics for $($_.Name)"
+                Write-DiagWarning "  Could not retrieve statistics for $($adpt.Name)"
             }
         }
     }
+    else {
+        Write-DiagWarning "  No active adapters available"
+    }
+
+    # Packet Discards (vmxnet3 alert) — reuses cached $activeAdapters
+    Write-Info "`nChecking Packet Discards..."
+    if ($activeAdapters) {
+        foreach ($adpt in $activeAdapters) {
+            try {
+                $stats = Get-NetAdapterStatistics -Name $adpt.Name -ErrorAction Stop
+                $discardIn = $stats.ReceivedDiscardedPackets
+                $discardOut = $stats.OutboundDiscardedPackets
+                if ($discardIn -gt 0 -or $discardOut -gt 0) {
+                    Write-DiagWarning "  $($adpt.Name): Discards IN=$discardIn OUT=$discardOut"
+                    if ($adpt.DriverDescription -like "*vmxnet3*") {
+                        Write-DiagError "    vmxnet3 adapter with discards - check ring buffer size and driver version"
+                    }
+                }
+            }
+            catch { }
+        }
+    }
+
+    # Port Reachability (self-telnet) — uses TcpClient with 2s timeout instead of Test-NetConnection
+    Write-Info "`nPort Reachability (localhost):"
+    foreach ($portDef in $script:CommonPorts) {
+        try {
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $connectTask = $tcpClient.ConnectAsync('127.0.0.1', $portDef.Port)
+            $completed = $connectTask.Wait(2000)  # 2-second timeout
+            if ($completed -and $tcpClient.Connected) {
+                Write-Success "  $($portDef.Name) (port $($portDef.Port)): OPEN"
+            }
+            else {
+                Write-Info "  $($portDef.Name) (port $($portDef.Port)): Closed/Not listening"
+            }
+            $tcpClient.Close()
+            $tcpClient.Dispose()
+        }
+        catch {
+            Write-Info "  $($portDef.Name) (port $($portDef.Port)): Closed/Not listening"
+            if ($tcpClient) { $tcpClient.Dispose() }
+        }
+    }
+
+    # NIC Teaming / Dual MAC Detection
+    Write-Info "`nNIC Teaming Configuration:"
+    try {
+        $teams = Get-NetLbfoTeam -ErrorAction SilentlyContinue
+        if ($teams) {
+            foreach ($team in $teams) {
+                Write-Info "  Team: $($team.Name) - Mode: $($team.TeamingMode) - LB: $($team.LoadBalancingAlgorithm)"
+                if ($team.TeamingMode -eq "SwitchIndependent" -and $team.LoadBalancingAlgorithm -eq "AddressHash") {
+                    Write-DiagWarning "    Dual MAC risk: SwitchIndependent + AddressHash may cause connectivity issues"
+                }
+                $members = Get-NetLbfoTeamMember -Team $team.Name -ErrorAction SilentlyContinue
+                foreach ($m in $members) {
+                    Write-Info "    Member: $($m.Name) - Status: $($m.AdministrativeMode)"
+                }
+            }
+        }
+        else {
+            Write-Info "  No NIC teams configured"
+        }
+    }
     catch {
-        Write-DiagError "Failed to retrieve network statistics: $($_.Exception.Message)"
+        Write-Info "  NIC teaming not available (LBFO cmdlets missing)"
+    }
+
+    # WAN Heartbeat / Cluster Link Flapping
+    Write-Info "`nChecking for WAN/Heartbeat Loss Events (last 24h):"
+    try {
+        $heartbeatEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 1135, 1129
+            StartTime = (Get-Date).AddHours(-24)
+        } -MaxEvents 5 -ErrorAction SilentlyContinue
+        
+        if ($heartbeatEvents) {
+            Write-DiagError "  Found $($heartbeatEvents.Count) heartbeat/cluster connectivity event(s):"
+            foreach ($evt in $heartbeatEvents) {
+                Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] EventID $($evt.Id): $(Get-EventSnippet -Event $evt -MaxLength 100)"
+            }
+        }
+        else {
+            Write-Success "  No heartbeat loss events detected"
+        }
+    }
+    catch {
+        Write-Info "  Could not query heartbeat events (Failover Clustering may not be installed)"
     }
 }
 
@@ -645,11 +891,16 @@ function Test-MemoryUsage {
     .EXAMPLE
         Test-MemoryUsage
     #>
+    [CmdletBinding()]
+    param()
+    
     Write-Header "Memory Usage Analysis"
     
     try {
         # Get system memory info
         $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        # TotalVisibleMemorySize and FreePhysicalMemory are in KB;
+        # dividing by 1MB (1,048,576) converts KB to GB
         $totalMemGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
         $freeMemGB = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
         $usedMemGB = $totalMemGB - $freeMemGB
@@ -677,7 +928,9 @@ function Test-MemoryUsage {
     
     # Top memory consuming processes
     Write-Info "`nTop 10 Memory Consuming Processes:"
-    $processAnalysis = Get-ProcessAnalysis
+    # Cache process analysis for reuse in CPU diagnostics
+    $script:LastProcessAnalysis = Get-ProcessAnalysis
+    $processAnalysis = $script:LastProcessAnalysis
     
     if ($processAnalysis) {
         $processAnalysis.ByMemory | Format-Table Name, 
@@ -699,6 +952,78 @@ function Test-MemoryUsage {
     }
     catch {
         Write-DiagWarning "Could not retrieve committed bytes information: $($_.Exception.Message)"
+    }
+
+    # NonPagedPool Usage
+    Write-Info "`nNonPaged Pool Usage:"
+    try {
+        $npPool = Get-Counter '\Memory\Pool Nonpaged Bytes' -ErrorAction Stop
+        $npMB = [math]::Round($npPool.CounterSamples.CookedValue / 1MB, 2)
+        Write-Info "  NonPaged Pool: $npMB MB"
+        if ($npMB -gt $NONPAGED_POOL_CRITICAL_MB) {
+            Write-DiagError "  CRITICAL: NonPaged Pool >$($NONPAGED_POOL_CRITICAL_MB)MB - possible ETW buffer or driver leak"
+        }
+        elseif ($npMB -gt $NONPAGED_POOL_WARNING_MB) {
+            Write-DiagWarning "  WARNING: NonPaged Pool elevated (>$($NONPAGED_POOL_WARNING_MB)MB)"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check NonPaged Pool"
+    }
+
+    # Modified Page List (file cache pressure)
+    Write-Info "`nModified Page List:"
+    try {
+        $modPages = Get-Counter '\Memory\Modified Page List Bytes' -ErrorAction Stop
+        $modGB = [math]::Round($modPages.CounterSamples.CookedValue / 1GB, 2)
+        Write-Info "  Modified Page List: $modGB GB"
+        if ($modGB -gt $MODIFIED_PAGE_LIST_WARNING_GB) {
+            Write-DiagWarning "  WARNING: Large modified page list ($modGB GB) - file cache consuming RAM"
+            Write-Info "  Consider: Disable 'Large System Cache' or tune MaxCacheSizeInMB"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check Modified Page List"
+    }
+
+    # Paging Spikes
+    Write-Info "`nPaging Activity:"
+    try {
+        $pagesPerSec = Get-Counter '\Memory\Pages/sec' -ErrorAction Stop
+        $pps = [math]::Round($pagesPerSec.CounterSamples.CookedValue, 0)
+        Write-Info "  Pages/sec: $pps"
+        if ($pps -gt $PAGING_CRITICAL_THRESHOLD) {
+            Write-DiagError "  CRITICAL: High paging activity (>$($PAGING_CRITICAL_THRESHOLD) pages/sec) - severe memory pressure"
+        }
+        elseif ($pps -gt $PAGING_WARNING_THRESHOLD) {
+            Write-DiagWarning "  WARNING: Elevated paging activity (>$($PAGING_WARNING_THRESHOLD) pages/sec)"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check paging activity"
+    }
+
+    # Known Leaky Process Detection
+    Write-Info "`nKnown Memory-Intensive Processes:"
+    $leakSuspects = @("java", "BMCMainEngine", "MonitoringHost", "WinCollect", "sqlservr")
+    try {
+        foreach ($suspect in $leakSuspects) {
+            $procs = Get-Process -Name $suspect -ErrorAction SilentlyContinue
+            if ($procs) {
+                foreach ($p in $procs) {
+                    $wsMB = [math]::Round($p.WorkingSet64 / 1MB, 0)
+                    if ($wsMB -gt 1024) {
+                        Write-DiagWarning "  $($p.Name) (PID $($p.Id)): $wsMB MB - high memory consumer"
+                    }
+                    else {
+                        Write-Info "  $($p.Name) (PID $($p.Id)): $wsMB MB"
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check known processes"
     }
 }
 
@@ -742,6 +1067,11 @@ function Start-MemoryLogCollection {
                     }
                 }
             }
+            else {
+                Write-DiagWarning "TSS is not available. Please install TSS (option 15) to use this trace."
+                Write-Info "Manual alternative: Use Performance Monitor to capture memory counters."
+                Show-PerfmonCommand "Memory"
+            }
         }
         "3" {
             if ($tssAvailable) {
@@ -758,6 +1088,11 @@ function Start-MemoryLogCollection {
                         Invoke-TSSCommand -Command "-Xperf Memory -WaitEvent HighMemory:90 -StopWaitTimeInSec 300 -LogFolderPath $logPath"
                     }
                 }
+            }
+            else {
+                Write-DiagWarning "TSS is not available. Please install TSS (option 15) to use this trace."
+                Write-Info "Manual alternative: Use Performance Monitor to capture memory counters."
+                Show-PerfmonCommand "Memory"
             }
         }
         "4" {
@@ -777,6 +1112,9 @@ function Test-CPUUsage {
     .EXAMPLE
         Test-CPUUsage
     #>
+    [CmdletBinding()]
+    param()
+    
     Write-Header "CPU Usage Analysis"
     
     # Current CPU usage
@@ -801,13 +1139,23 @@ function Test-CPUUsage {
         Write-DiagError "Failed to retrieve CPU usage: $($_.Exception.Message)"
     }
     
-    # Processor information
+    # Processor information (handle multi-socket servers)
     try {
-        $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop
+        $cpus = @(Get-CimInstance Win32_Processor -ErrorAction Stop)
         Write-Info "`nProcessor Information:"
-        Write-Info "  Name: $($cpu.Name)"
-        Write-Info "  Cores: $($cpu.NumberOfCores)"
-        Write-Info "  Logical Processors: $($cpu.NumberOfLogicalProcessors)"
+        if ($cpus.Count -gt 1) {
+            Write-Info "  Sockets: $($cpus.Count)"
+        }
+        foreach ($cpu in $cpus) {
+            Write-Info "  Name: $($cpu.Name)"
+            Write-Info "  Cores: $($cpu.NumberOfCores)"
+            Write-Info "  Logical Processors: $($cpu.NumberOfLogicalProcessors)"
+        }
+        $totalCores = ($cpus | Measure-Object -Property NumberOfCores -Sum).Sum
+        $totalLP = ($cpus | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+        if ($cpus.Count -gt 1) {
+            Write-Info "  Total Cores: $totalCores | Total Logical Processors: $totalLP"
+        }
     }
     catch {
         Write-DiagError "Failed to retrieve processor information: $($_.Exception.Message)"
@@ -815,7 +1163,8 @@ function Test-CPUUsage {
     
     # Top CPU consuming processes
     Write-Info "`nTop 10 CPU Consuming Processes:"
-    $processAnalysis = Get-ProcessAnalysis
+    # Reuse cached process data if available (from memory diagnostics), otherwise fetch fresh
+    $processAnalysis = if ($script:LastProcessAnalysis) { $script:LastProcessAnalysis } else { Get-ProcessAnalysis }
     
     if ($processAnalysis) {
         $processAnalysis.ByCPU | Format-Table Name, 
@@ -830,7 +1179,7 @@ function Test-CPUUsage {
         if ($wmiProcess) {
             $wmiCPU = [math]::Round($wmiProcess.CPU, 2)
             Write-Info "`nWMI Provider Host (WmiPrvSE) CPU Usage: $($wmiCPU) seconds"
-            if ($wmiCPU -gt 100) {
+            if ($wmiCPU -gt $WMI_CPU_WARNING_SECONDS) {
                 Write-DiagWarning "WMI Provider Host is consuming significant CPU time"
                 Write-Info "Consider using WMI-specific trace: .\TSS.ps1 -UEX_WMIBase -WIN_Kernel -ETWflags 1 -WPR CPU -Perfmon UEX_WMIPrvSE -PerfIntervalSec 1 -noBasicLog"
             }
@@ -838,6 +1187,82 @@ function Test-CPUUsage {
     }
     catch {
         Write-DiagWarning "Could not check WMI process: $($_.Exception.Message)"
+    }
+
+    # Svchost.exe Breakdown (top consumers)
+    Write-Info "`nTop svchost.exe Instances by CPU:"
+    try {
+        $svchosts = Get-Process -Name "svchost" -ErrorAction SilentlyContinue | Sort-Object CPU -Descending | Select-Object -First 5
+        foreach ($sh in $svchosts) {
+            $cpuSec = [math]::Round($sh.CPU, 1)
+            $memMB = [math]::Round($sh.WorkingSet64 / 1MB, 0)
+            # Try to get hosted services
+            try {
+                $services = Get-CimInstance Win32_Service -Filter "ProcessId = $($sh.Id)" -ErrorAction SilentlyContinue
+                $svcNames = ($services.Name | Select-Object -First 3) -join ', '
+                Write-Info "  PID $($sh.Id): CPU=${cpuSec}s Mem=${memMB}MB - $svcNames"
+            }
+            catch {
+                Write-Info "  PID $($sh.Id): CPU=${cpuSec}s Mem=${memMB}MB"
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "Could not analyze svchost processes"
+    }
+
+    # Monitoring Agent Detection
+    Write-Info "`nMonitoring Agent CPU Check:"
+    $monitoringAgents = @("MonitoringHost", "HealthService", "WinCollect", "MOMAgent")
+    try {
+        foreach ($agent in $monitoringAgents) {
+            $procs = Get-Process -Name $agent -ErrorAction SilentlyContinue
+            if ($procs) {
+                foreach ($p in $procs) {
+                    $cpuSec = [math]::Round($p.CPU, 1)
+                    if ($cpuSec -gt $MONITORING_AGENT_CPU_WARNING) {
+                        Write-DiagWarning "  $($p.Name) (PID $($p.Id)): CPU=${cpuSec}s - monitoring agent CPU storm"
+                    }
+                    else {
+                        Write-Info "  $($p.Name) (PID $($p.Id)): CPU=${cpuSec}s"
+                    }
+                }
+            }
+        }
+    }
+    catch { }
+
+    # Java.exe High CPU
+    try {
+        $javaProcs = Get-Process -Name "java" -ErrorAction SilentlyContinue
+        if ($javaProcs) {
+            Write-Info "`nJava Process CPU Check:"
+            foreach ($jp in $javaProcs) {
+                $cpuSec = [math]::Round($jp.CPU, 1)
+                $memMB = [math]::Round($jp.WorkingSet64 / 1MB, 0)
+                if ($cpuSec -gt $JAVA_CPU_WARNING_SECONDS) {
+                    Write-DiagWarning "  java.exe (PID $($jp.Id)): CPU=${cpuSec}s Mem=${memMB}MB - high CPU"
+                }
+                else {
+                    Write-Info "  java.exe (PID $($jp.Id)): CPU=${cpuSec}s Mem=${memMB}MB"
+                }
+            }
+        }
+    }
+    catch { }
+
+    # Split I/O Check (storage fragmentation indicator)
+    Write-Info "`nSplit I/O Check:"
+    try {
+        $splitIO = Get-Counter '\PhysicalDisk(_Total)\Split IO/sec' -ErrorAction Stop
+        $splitRate = [math]::Round($splitIO.CounterSamples.CookedValue, 0)
+        Write-Info "  Split IO/sec: $splitRate"
+        if ($splitRate -gt $SPLIT_IO_WARNING_THRESHOLD) {
+            Write-DiagWarning "  HIGH Split I/O ($splitRate/sec) - storage fragmentation may be causing extra CPU load"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check Split I/O"
     }
 }
 
@@ -882,6 +1307,11 @@ function Start-CPULogCollection {
                     }
                 }
             }
+            else {
+                Write-DiagWarning "TSS is not available. Please install TSS (option 15) to use this trace."
+                Write-Info "Manual alternative: Use Performance Monitor to capture CPU counters."
+                Show-PerfmonCommand "CPU"
+            }
         }
         "3" {
             Invoke-WithTSSCheck `
@@ -910,6 +1340,9 @@ function Test-DiskPerformance {
     .EXAMPLE
         Test-DiskPerformance
     #>
+    [CmdletBinding()]
+    param()
+    
     Write-Header "Disk Performance Analysis"
     
     # Disk information
@@ -981,7 +1414,7 @@ function Test-DiskPerformance {
     # Check cluster size for volumes
     Write-Info "`nChecking Cluster Size (should be 64KB for databases):"
     try {
-        $volumes = Get-Volume -ErrorAction Stop | Where-Object { $_.DriveLetter -ne $null }
+        $volumes = Get-Volume -ErrorAction Stop | Where-Object { $null -ne $_.DriveLetter }
         foreach ($vol in $volumes) {
             $drive = $vol.DriveLetter + ":"
             try {
@@ -1002,6 +1435,107 @@ function Test-DiskPerformance {
     catch {
         Write-DiagError "Failed to check cluster sizes: $($_.Exception.Message)"
     }
+
+    # Storage Disconnect Events (129, 153)
+    Write-Info "`nStorage Error Events (last 7 days):"
+    try {
+        $storageEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 129, 153
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 20 -ErrorAction SilentlyContinue
+
+        if ($storageEvents) {
+            $grouped = $storageEvents | Group-Object Id
+            foreach ($g in $grouped) {
+                Write-DiagError "  Event $($g.Name): $($g.Count) occurrence(s) in last 7 days"
+                $g.Group | Select-Object -First 2 | ForEach-Object {
+                    Write-DiagWarning "    [$($_.TimeCreated.ToString('MM-dd HH:mm'))] $(Get-EventSnippet -Event $_ -MaxLength 80)"
+                }
+            }
+        }
+        else {
+            Write-Success "  No storage error events (129/153) found"
+        }
+    }
+    catch {
+        Write-Info "  Could not query storage events"
+    }
+
+    # Disk Queue Length
+    Write-Info "`nDisk Queue Length:"
+    try {
+        $queueLength = Get-Counter '\PhysicalDisk(*)\Current Disk Queue Length' -ErrorAction Stop
+        foreach ($sample in $queueLength.CounterSamples) {
+            if ($sample.InstanceName -ne "_total" -and $sample.CookedValue -gt 0) {
+                Write-Info "  $($sample.InstanceName): Queue Length = $([math]::Round($sample.CookedValue, 1))"
+                if ($sample.CookedValue -gt $DISK_QUEUE_WARNING_THRESHOLD) {
+                    Write-DiagWarning "    WARNING: Queue length >$($DISK_QUEUE_WARNING_THRESHOLD) - I/O bottleneck on this disk"
+                }
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check disk queue length"
+    }
+
+    # Write Latency (supplement to existing read latency)
+    Write-Info "`nDisk Write Latency:"
+    try {
+        $writeLatency = Get-Counter '\PhysicalDisk(*)\Avg. Disk sec/Write' -ErrorAction Stop
+        foreach ($sample in $writeLatency.CounterSamples) {
+            if ($sample.InstanceName -ne "_total") {
+                $latencyMs = [math]::Round($sample.CookedValue * 1000, 2)
+                Write-Info "  Write Latency - $($sample.InstanceName): $latencyMs ms"
+                if ($latencyMs -gt $DISK_LATENCY_CRITICAL_MS) {
+                    Write-DiagError "    CRITICAL: Write latency >$($DISK_LATENCY_CRITICAL_MS)ms"
+                }
+                elseif ($latencyMs -gt $DISK_LATENCY_WARNING_MS) {
+                    Write-DiagWarning "    WARNING: Write latency elevated"
+                }
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check write latency"
+    }
+
+    # NTFS Metadata / Corruption Errors
+    Write-Info "`nNTFS Errors (last 30 days):"
+    try {
+        $ntfsEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 55
+            StartTime = (Get-Date).AddDays(-30)
+        } -MaxEvents 5 -ErrorAction SilentlyContinue
+
+        if ($ntfsEvents) {
+            Write-DiagError "  Found $($ntfsEvents.Count) NTFS corruption event(s)!"
+            $ntfsEvents | Select-Object -First 3 | ForEach-Object {
+                Write-DiagWarning "    [$($_.TimeCreated.ToString('MM-dd HH:mm'))] $(Get-EventSnippet -Event $_ -MaxLength 100)"
+            }
+            Write-Info "  Run: chkdsk /R on affected volume"
+        }
+        else {
+            Write-Success "  No NTFS errors detected"
+        }
+    }
+    catch {
+        Write-Info "  Could not query NTFS events"
+    }
+
+    # VM Pause-Critical Risk (>95% full)
+    Write-Info "`nVM Pause-Critical Risk Check:"
+    try {
+        $volumes = Get-Volume -ErrorAction Stop | Where-Object { $null -ne $_.DriveLetter -and $_.Size -gt 0 }
+        foreach ($vol in $volumes) {
+            $usedPercent = [math]::Round((($vol.Size - $vol.SizeRemaining) / $vol.Size) * 100, 1)
+            if ($usedPercent -gt 95) {
+                Write-DiagError "  Drive $($vol.DriveLetter): $usedPercent% full - VM MAY PAUSE if disk fills completely!"
+            }
+        }
+    }
+    catch { }
 }
 
 function Start-DiskLogCollection {
@@ -1050,10 +1584,10 @@ function Start-DiskLogCollection {
     Write-Info "  5. Place database files and transaction logs on separate disks"
     Write-Info "  6. Consider using SSDs for better I/O performance"
     Write-Info "`nLatency Guidelines:"
-    Write-Info "  â€¢ <$($DISK_LATENCY_ACCEPTABLE_MS)ms: Very good"
-    Write-Info "  â€¢ $($DISK_LATENCY_ACCEPTABLE_MS)-$($DISK_LATENCY_WARNING_MS)ms: Okay"
-    Write-Info "  â€¢ $($DISK_LATENCY_WARNING_MS)-$($DISK_LATENCY_CRITICAL_MS)ms: Slow, needs attention"
-    Write-Info "  â€¢ >$($DISK_LATENCY_CRITICAL_MS)ms: Serious I/O bottleneck"
+    Write-Info "  * <$($DISK_LATENCY_ACCEPTABLE_MS)ms: Very good"
+    Write-Info "  * $($DISK_LATENCY_ACCEPTABLE_MS)-$($DISK_LATENCY_WARNING_MS)ms: Okay"
+    Write-Info "  * $($DISK_LATENCY_WARNING_MS)-$($DISK_LATENCY_CRITICAL_MS)ms: Slow, needs attention"
+    Write-Info "  * >$($DISK_LATENCY_CRITICAL_MS)ms: Serious I/O bottleneck"
 }
 
 function Show-StorPortCommands {
@@ -1103,9 +1637,9 @@ STOP COLLECTION:
 logman stop PerfLog-$($env:COMPUTERNAME)
 
 INTERVAL GUIDANCE:
-  â€¢ 24 hours: -si 00:01:16 (1 min 16 sec)
-  â€¢ 4 hours: -si 00:00:14 (14 seconds)
-  â€¢ 2 hours: -si 00:00:07 (7 seconds)
+  * 24 hours: -si 00:01:16 (1 min 16 sec)
+  * 4 hours: -si 00:00:14 (14 seconds)
+  * 2 hours: -si 00:00:07 (7 seconds)
 
 You can also use -b MM/DD/YYYY HH:MM:SS AM/PM for begin time
 and -e MM/DD/YYYY HH:MM:SS AM/PM for end time
@@ -1216,7 +1750,7 @@ function Test-ServicesHealth {
         if ($crashEvents) {
             Write-DiagWarning "  Found $($crashEvents.Count) service crash event(s):"
             foreach ($evt in $crashEvents) {
-                Write-DiagWarning "    [$($evt.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))] $($evt.Message -replace '[\r\n]+', ' ' | Select-Object -First 1)"
+                Write-DiagWarning "    [$($evt.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))] $(Get-EventSnippet -Event $evt -MaxLength 120)"
             }
         }
         else {
@@ -1226,6 +1760,114 @@ function Test-ServicesHealth {
     catch {
         Write-Info "  Could not query service crash events"
     }
+
+    # W32Time NTP Sync Status
+    Write-Info "`nTime Service (NTP) Sync Status:"
+    try {
+        $w32tmOutput = w32tm /query /status 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $sourceMatch = $w32tmOutput | Select-String 'Source:'
+            $stratumMatch = $w32tmOutput | Select-String 'Stratum:'
+            $lastSync = $w32tmOutput | Select-String 'Last Successful Sync Time:'
+            if ($sourceMatch) { Write-Info "  $($sourceMatch.Line.Trim())" }
+            if ($stratumMatch) { Write-Info "  $($stratumMatch.Line.Trim())" }
+            if ($lastSync) {
+                Write-Info "  $($lastSync.Line.Trim())"
+            }
+            else {
+                Write-DiagWarning "  NTP has never synced successfully"
+            }
+        }
+        else {
+            Write-DiagWarning "  W32Time service may not be running"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check NTP status"
+    }
+
+    # Task Scheduler Health
+    Write-Info "`nTask Scheduler Health:"
+    try {
+        $schedEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'Microsoft-Windows-TaskScheduler/Operational'
+            Level     = 1, 2
+            StartTime = (Get-Date).AddHours(-24)
+        } -MaxEvents 5 -ErrorAction SilentlyContinue
+
+        if ($schedEvents) {
+            Write-DiagWarning "  Found $($schedEvents.Count) Task Scheduler error(s) in last 24h:"
+            foreach ($evt in $schedEvents) {
+                Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] ID:$($evt.Id) $(Get-EventSnippet -Event $evt -MaxLength 80)"
+            }
+        }
+        else {
+            Write-Success "  No Task Scheduler errors in last 24 hours"
+        }
+    }
+    catch {
+        Write-Info "  Task Scheduler Operational log not accessible"
+    }
+
+    # EventLog Service Errors
+    Write-Info "`nEventLog Service Errors:"
+    try {
+        $evtLogErrors = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 1108
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 3 -ErrorAction SilentlyContinue
+
+        if ($evtLogErrors) {
+            Write-DiagError "  EventLog service errors detected (Event 1108):"
+            foreach ($evt in $evtLogErrors) {
+                Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] $(Get-EventSnippet -Event $evt -MaxLength 80)"
+            }
+        }
+        else {
+            Write-Success "  No EventLog service errors"
+        }
+    }
+    catch { Write-Info "  Could not query EventLog errors" }
+
+    # Netlogon / Domain Connectivity Events
+    Write-Info "`nNetlogon Events:"
+    try {
+        $netlogonEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 5719, 7023, 7024
+            StartTime = (Get-Date).AddHours(-24)
+        } -MaxEvents 5 -ErrorAction SilentlyContinue
+
+        if ($netlogonEvents) {
+            Write-DiagWarning "  Found Netlogon/Service failure events:"
+            foreach ($evt in $netlogonEvents) {
+                Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] EventID $($evt.Id): $(Get-EventSnippet -Event $evt -MaxLength 80)"
+            }
+        }
+        else {
+            Write-Success "  No Netlogon connectivity issues"
+        }
+    }
+    catch { Write-Info "  Could not query Netlogon events" }
+
+    # RDP Licensing Service
+    Write-Info "`nRDP Licensing:"
+    try {
+        $rdpLic = Get-Service -Name "TermServLicensing" -ErrorAction SilentlyContinue
+        if ($null -ne $rdpLic) {
+            Write-Info "  TermServLicensing: $($rdpLic.Status) ($($rdpLic.StartType))"
+        }
+        $rdpEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 1128, 1129
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 3 -ErrorAction SilentlyContinue
+        if ($rdpEvents) {
+            Write-DiagWarning "  RDP licensing errors found in last 7 days"
+        }
+    }
+    catch { }
 }
 
 function Start-ServicesLogCollection {
@@ -1338,7 +1980,7 @@ function Test-EventLogHealth {
                 Write-Info "`n  Last 5 Events:"
                 $events | Select-Object -First 5 | ForEach-Object {
                     $levelText = switch ($_.Level) { 1 { "CRITICAL" } 2 { "ERROR" } default { "UNKNOWN" } }
-                    $msgSnippet = ($_.Message -replace '[\r\n]+', ' ').Substring(0, [Math]::Min(120, ($_.Message -replace '[\r\n]+', ' ').Length))
+                    $msgSnippet = $(Get-EventSnippet -Event $_ -MaxLength 120)
                     Write-Info "    [$($_.TimeCreated.ToString('MM-dd HH:mm'))] [$levelText] ID:$($_.Id) - $msgSnippet"
                 }
             }
@@ -1348,6 +1990,86 @@ function Test-EventLogHealth {
         }
         catch {
             Write-Info "  No matching events found or unable to query $logName log"
+        }
+    }
+
+    # Cluster Events (1135, 1672)
+    Write-Info "`nCluster Heartbeat/Quarantine Events (last 7 days):"
+    try {
+        $clusterEvts = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 1135, 1672
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 10 -ErrorAction SilentlyContinue
+
+        if ($clusterEvts) {
+            Write-DiagError "  Found $($clusterEvts.Count) cluster event(s):"
+            foreach ($g in ($clusterEvts | Group-Object Id)) {
+                Write-DiagWarning "    Event $($g.Name): $($g.Count) occurrence(s)"
+            }
+        }
+        else {
+            Write-Success "  No cluster heartbeat/quarantine events"
+        }
+    }
+    catch { Write-Info "  Failover Clustering may not be installed" }
+
+    # Storage Events (129, 153)
+    Write-Info "`nStorage Adapter Events (129/153, last 7 days):"
+    try {
+        $storEvts = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 129, 153
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 10 -ErrorAction SilentlyContinue
+
+        if ($storEvts) {
+            Write-DiagError "  Found $($storEvts.Count) storage error event(s):"
+            foreach ($g in ($storEvts | Group-Object Id)) {
+                Write-DiagWarning "    Event $($g.Name): $($g.Count) occurrence(s)"
+            }
+        }
+        else {
+            Write-Success "  No storage adapter errors"
+        }
+    }
+    catch { }
+
+    # DNS Update Failures (1196)
+    Write-Info "`nDNS Update Failure Events:"
+    try {
+        $dnsEvts = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 8018, 8019
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 5 -ErrorAction SilentlyContinue
+
+        if ($dnsEvts) {
+            Write-DiagWarning "  Found $($dnsEvts.Count) DNS dynamic update failure(s)"
+        }
+        else {
+            Write-Success "  No DNS update failures"
+        }
+    }
+    catch { }
+
+    # Known Critical Event Summary (from $script:KnownCriticalEventIDs)
+    Write-Info "`nHigh-Priority Event Summary (last 24h):"
+    foreach ($logName in $script:KnownCriticalEventIDs.Keys) {
+        foreach ($evtDef in $script:KnownCriticalEventIDs[$logName]) {
+            try {
+                # Single query instead of two — get all matching events and count
+                $found = @(Get-WinEvent -FilterHashtable @{
+                        LogName   = $logName
+                        Id        = $evtDef.Id
+                        StartTime = (Get-Date).AddHours(-24)
+                    } -ErrorAction SilentlyContinue)
+
+                if ($found.Count -gt 0) {
+                    Write-DiagWarning "  [$logName] Event $($evtDef.Id) ($($evtDef.Desc)): $($found.Count) occurrence(s)"
+                }
+            }
+            catch { }
         }
     }
 }
@@ -1523,6 +2245,91 @@ function Test-DNSHealth {
     catch {
         Write-DiagWarning "  Could not retrieve DNS cache: $($_.Exception.Message)"
     }
+
+    # DNS "Bad Key" Errors
+    Write-Info "`nDNS 'Bad Key' Errors (cluster CNO/VCO failures):"
+    try {
+        $badKeyEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'DNS Server'
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 50 -ErrorAction SilentlyContinue | Where-Object { $_.Message -like "*BADKEY*" -or $_.Message -like "*Bad Key*" }
+
+        if ($badKeyEvents) {
+            Write-DiagError "  Found $($badKeyEvents.Count) DNS Bad Key event(s) in last 7 days!"
+            Write-Info "  This typically means cluster name objects (CNO/VCO) cannot update DNS"
+            Write-Info "  Fix: Grant the cluster computer object 'Full Control' on the DNS record"
+        }
+        else {
+            Write-Success "  No DNS Bad Key errors"
+        }
+    }
+    catch {
+        Write-Info "  DNS Server log not available (server may not have DNS role)"
+    }
+
+    # Cluster Listener Name Resolution
+    Write-Info "`nCluster Name Resolution:"
+    try {
+        $clusterSvc = Get-Service -Name "ClusSvc" -ErrorAction SilentlyContinue
+        if ($null -ne $clusterSvc -and $clusterSvc.Status -eq "Running") {
+            $clusterName = (Get-Cluster -ErrorAction SilentlyContinue).Name
+            if ($clusterName) {
+                Write-Info "  Cluster: $clusterName"
+                try {
+                    $resolved = Resolve-DnsName $clusterName -ErrorAction Stop
+                    Write-Success "  $clusterName resolves to $($resolved.IPAddress -join ', ')"
+                }
+                catch {
+                    Write-DiagError "  FAILED to resolve cluster name '$clusterName'!"
+                }
+            }
+        }
+        else {
+            Write-Info "  Failover Clustering not running on this server"
+        }
+    }
+    catch {
+        Write-Info "  Could not check cluster name resolution"
+    }
+
+    # AD Secure Dynamic DNS Update Failures
+    Write-Info "`nDNS Dynamic Update Failures:"
+    try {
+        $dnsUpdateFail = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 8018, 8019
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 5 -ErrorAction SilentlyContinue
+
+        if ($dnsUpdateFail) {
+            Write-DiagWarning "  Found $($dnsUpdateFail.Count) DNS dynamic update failure(s) in last 7 days"
+            foreach ($evt in $dnsUpdateFail) {
+                Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] $(Get-EventSnippet -Event $evt -MaxLength 100)"
+            }
+        }
+        else {
+            Write-Success "  No DNS dynamic update failures"
+        }
+    }
+    catch { }
+
+    # Reverse DNS Check
+    Write-Info "`nReverse DNS Lookup:"
+    try {
+        $serverIPs = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' }
+        foreach ($ip in $serverIPs | Select-Object -First 2) {
+            try {
+                $ptr = Resolve-DnsName $ip.IPAddress -Type PTR -ErrorAction Stop
+                Write-Success "  $($ip.IPAddress) -> $($ptr.NameHost)"
+            }
+            catch {
+                Write-DiagWarning "  $($ip.IPAddress) -> No PTR record (reverse DNS missing)"
+            }
+        }
+    }
+    catch {
+        Write-Info "  Could not perform reverse DNS check"
+    }
 }
 
 function Start-DNSLogCollection {
@@ -1599,15 +2406,27 @@ function Test-SecurityAuthentication {
     Write-Info "Account Lockout Policy:"
     try {
         $lockoutPolicy = net accounts 2>&1
-        $lockoutThreshold = ($lockoutPolicy | Select-String "Lockout threshold").ToString().Trim()
-        $lockoutDuration = ($lockoutPolicy | Select-String "Lockout duration").ToString().Trim()
-        $lockoutWindow = ($lockoutPolicy | Select-String "Lockout observation window").ToString().Trim()
+        $lockoutThresholdMatch = $lockoutPolicy | Select-String "Lockout threshold"
+        $lockoutDurationMatch = $lockoutPolicy | Select-String "Lockout duration"
+        $lockoutWindowMatch = $lockoutPolicy | Select-String "Lockout observation window"
         
-        Write-Info "  $lockoutThreshold"
-        Write-Info "  $lockoutDuration"
-        Write-Info "  $lockoutWindow"
+        if ($null -ne $lockoutThresholdMatch) {
+            $lockoutThreshold = $lockoutThresholdMatch.ToString().Trim()
+            Write-Info "  $lockoutThreshold"
+        }
+        if ($null -ne $lockoutDurationMatch) {
+            $lockoutDuration = $lockoutDurationMatch.ToString().Trim()
+            Write-Info "  $lockoutDuration"
+        }
+        if ($null -ne $lockoutWindowMatch) {
+            $lockoutWindow = $lockoutWindowMatch.ToString().Trim()
+            Write-Info "  $lockoutWindow"
+        }
         
-        if ($lockoutThreshold -match "Never") {
+        if ($null -eq $lockoutThresholdMatch) {
+            Write-DiagWarning "  Could not parse lockout policy (non-English locale?)"
+        }
+        elseif ($lockoutThreshold -match "Never") {
             Write-DiagWarning "  WARNING: No account lockout threshold configured!"
         }
     }
@@ -1697,7 +2516,6 @@ function Test-SecurityAuthentication {
         $fwProfiles = Get-NetFirewallProfile -ErrorAction Stop
         foreach ($profile in $fwProfiles) {
             $status = if ($profile.Enabled) { "ENABLED" } else { "DISABLED" }
-            $color = if ($profile.Enabled) { "Write-Success" } else { "Write-DiagWarning" }
             
             if ($profile.Enabled) {
                 Write-Success "  $($profile.Name): $status (Inbound: $($profile.DefaultInboundAction), Outbound: $($profile.DefaultOutboundAction))"
@@ -1709,6 +2527,143 @@ function Test-SecurityAuthentication {
     }
     catch {
         Write-DiagWarning "  Could not check Firewall status: $($_.Exception.Message)"
+    }
+
+    # Account Lockout Events (4740)
+    Write-Info "`nAccount Lockout Events (4740, last 24h):"
+    try {
+        $lockoutEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'Security'
+            Id        = 4740
+            StartTime = (Get-Date).AddHours(-24)
+        } -MaxEvents 10 -ErrorAction SilentlyContinue
+
+        if ($lockoutEvents) {
+            Write-DiagWarning "  Found $($lockoutEvents.Count) account lockout event(s):"
+            $lockoutEvents | Group-Object { $_.Properties[0].Value } | ForEach-Object {
+                Write-DiagWarning "    Account '$($_.Name)': $($_.Count) lockout(s)"
+            }
+        }
+        else {
+            Write-Success "  No account lockouts in last 24 hours"
+        }
+    }
+    catch {
+        Write-Info "  Could not query lockout events (Security log may require audit policy)"
+    }
+
+    # Logon as a Service Policy
+    Write-Info "`nLogon as a Service Policy:"
+    try {
+        $tmpFile = Join-Path $env:TEMP "secedit_export_$(Get-Random).cfg"
+        try {
+            $null = secedit /export /cfg $tmpFile /quiet 2>&1
+            if (Test-Path $tmpFile) {
+                # S2: Restrict temp file ACL — only current user + SYSTEM can read
+                try {
+                    $acl = Get-Acl $tmpFile
+                    $acl.SetAccessRuleProtection($true, $false)  # Disable inheritance, remove inherited rules
+                    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+                    $userRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        $currentUser, 'FullControl', 'Allow')
+                    $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        'NT AUTHORITY\SYSTEM', 'FullControl', 'Allow')
+                    $acl.AddAccessRule($userRule)
+                    $acl.AddAccessRule($systemRule)
+                    Set-Acl $tmpFile $acl -ErrorAction Stop
+                }
+                catch {
+                    Write-DiagWarning "  Could not restrict temp file permissions: $($_.Exception.Message)"
+                }
+                
+                $content = Get-Content $tmpFile -Raw
+                $match = [regex]::Match($content, 'SeServiceLogonRight\s*=\s*(.*)')
+                if ($match.Success) {
+                    Write-Info "  Accounts with 'Log on as a service' right:"
+                    $accounts = $match.Groups[1].Value -split ','
+                    foreach ($acct in $accounts) {
+                        Write-Info "    - $($acct.Trim())"
+                    }
+                }
+                else {
+                    Write-DiagWarning "  SeServiceLogonRight not found in security policy"
+                }
+            }
+        }
+        finally {
+            if (Test-Path $tmpFile -ErrorAction SilentlyContinue) {
+                Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    catch {
+        Write-Info "  Could not export security policy"
+    }
+
+    # Schannel Errors (36870)
+    Write-Info "`nSchannel TLS Errors:"
+    try {
+        $schannelEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 36870, 36871, 36874
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 5 -ErrorAction SilentlyContinue
+
+        if ($schannelEvents) {
+            Write-DiagError "  Found $($schannelEvents.Count) Schannel error(s) in last 7 days:"
+            foreach ($evt in $schannelEvents) {
+                Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] Event $($evt.Id): $(Get-EventSnippet -Event $evt -MaxLength 80)"
+            }
+            Write-Info "  Common cause: Certificate private key not readable, or TLS version mismatch"
+        }
+        else {
+            Write-Success "  No Schannel errors"
+        }
+    }
+    catch { }
+
+    # NTLM vs Kerberos Detection
+    Write-Info "`nAuthentication Protocol Usage (last 100 logons):"
+    try {
+        $logonEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'Security'
+            Id        = 4624
+            StartTime = (Get-Date).AddHours(-24)
+        } -MaxEvents 100 -ErrorAction SilentlyContinue
+
+        if ($logonEvents) {
+            $ntlmCount = ($logonEvents | Where-Object { $_.Properties[14].Value -eq 'NTLM' -or $_.Properties[14].Value -like 'NtLm*' }).Count
+            $kerbCount = ($logonEvents | Where-Object { $_.Properties[14].Value -eq 'Kerberos' }).Count
+            Write-Info "  Kerberos logons: $kerbCount"
+            Write-Info "  NTLM logons: $ntlmCount"
+            if ($ntlmCount -gt $kerbCount -and $ntlmCount -gt 10) {
+                Write-DiagWarning "  WARNING: NTLM usage is high - consider investigating Kerberos fallback issues"
+            }
+        }
+    }
+    catch {
+        Write-Info "  Could not analyze authentication protocols"
+    }
+
+    # MachineKeys Permissions
+    Write-Info "`nMachineKeys Directory Permissions:"
+    try {
+        $mkPath = "$env:ProgramData\Microsoft\Crypto\RSA\MachineKeys"
+        if (Test-Path $mkPath) {
+            $acl = Get-Acl $mkPath -ErrorAction Stop
+            $hasSystem = $acl.Access | Where-Object { $_.IdentityReference -like '*SYSTEM*' }
+            $hasAdmins = $acl.Access | Where-Object { $_.IdentityReference -like '*Administrators*' }
+            if ($hasSystem -and $hasAdmins) {
+                Write-Success "  MachineKeys has SYSTEM and Administrators access"
+            }
+            else {
+                Write-DiagError "  MachineKeys missing SYSTEM or Administrators permissions!"
+                Write-Info "  This can cause RDP, TLS certificate, and encryption failures"
+            }
+        }
+    }
+    catch {
+        Write-Info "  Could not check MachineKeys permissions"
     }
 }
 
@@ -1904,6 +2859,80 @@ function Test-WindowsUpdateStatus {
     catch {
         Write-DiagError "Failed to retrieve OS information: $($_.Exception.Message)"
     }
+
+    # CBS Store Health
+    Write-Info "`nCBS Store Health:"
+    try {
+        $cbsLog = "$env:SystemRoot\Logs\CBS\CBS.log"
+        if (Test-Path $cbsLog) {
+            $cbsErrors = Get-Content $cbsLog -Tail 200 | Select-String -Pattern '\bERROR\b' -AllMatches
+            if ($cbsErrors.Count -gt 10) {
+                Write-DiagWarning "  CBS.log has $($cbsErrors.Count) ERROR entries in last 200 lines"
+                Write-Info "  Run: DISM /Online /Cleanup-Image /CheckHealth"
+            }
+            else {
+                Write-Success "  CBS store appears healthy"
+            }
+        }
+    }
+    catch {
+        Write-Info "  Could not check CBS store"
+    }
+
+    # Pending.xml Check
+    Write-Info "`nPending.xml Check:"
+    try {
+        $pendingXml = "$env:SystemRoot\WinSxS\pending.xml"
+        if (Test-Path $pendingXml) {
+            $fileSize = [math]::Round((Get-Item $pendingXml).Length / 1KB, 1)
+            Write-DiagWarning "  pending.xml EXISTS ($fileSize KB) - this can block role installations and updates"
+            Write-Info "  If stale, a reboot should clear it. If persistent, CBS repair may be needed."
+        }
+        else {
+            Write-Success "  No pending.xml found (good)"
+        }
+    }
+    catch { }
+
+    # Legacy OS Detection
+    Write-Info "`nOS Lifecycle Check:"
+    try {
+        $build = [int]$os.BuildNumber
+        if ($build -lt 14393) {
+            Write-DiagError "  OS Build $build (Server 2012/2012 R2 or older) - End of extended support"
+            Write-Info "  Strongly recommend in-place upgrade or migration to Server 2019/2022"
+        }
+        elseif ($build -lt 17763) {
+            Write-DiagWarning "  OS Build $build (Server 2016) - Consider upgrade to Server 2019/2022"
+        }
+        else {
+            Write-Success "  OS Build $build - supported version"
+        }
+    }
+    catch { }
+
+    # Failed Update Events
+    Write-Info "`nFailed Update Events (last 7 days):"
+    try {
+        $updateFail = Get-WinEvent -FilterHashtable @{
+            LogName   = 'Setup'
+            Level     = 1, 2, 3
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 10 -ErrorAction SilentlyContinue
+
+        if ($updateFail) {
+            Write-DiagWarning "  Found $($updateFail.Count) failed setup/update event(s):"
+            foreach ($evt in $updateFail) {
+                Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] $(Get-EventSnippet -Event $evt -MaxLength 100)"
+            }
+        }
+        else {
+            Write-Success "  No failed update events"
+        }
+    }
+    catch {
+        Write-Info "  Could not query Setup event log"
+    }
 }
 
 function Start-WindowsUpdateLogCollection {
@@ -1981,6 +3010,176 @@ function Start-WindowsUpdateLogCollection {
 }
 #endregion
 
+#region Cross-Category Health Scorecard
+function Test-CrossCategoryHealth {
+    <#
+    .SYNOPSIS
+        Consolidated health scorecard surfacing highest-frequency cross-cutting issues
+    .DESCRIPTION
+        Quick summary of the most common production issues across all categories:
+        cluster/AG instability, storage errors, DNS failures, RDP connectivity
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Header "Cross-Category Health Scorecard"
+    $issues = 0
+
+    # 1. Cluster / AG Instability (heartbeat loss + network discards)
+    Write-Info "1. Cluster / AG Stability:"
+    try {
+        $clusterEvts = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 1135, 1672
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 5 -ErrorAction SilentlyContinue
+
+        if ($clusterEvts) {
+            $issues++
+            Write-DiagError "   ISSUE: $($clusterEvts.Count) cluster heartbeat/quarantine events in 7 days"
+        }
+        else {
+            Write-Success "   OK - No cluster instability events"
+        }
+    }
+    catch {
+        Write-Info "   Skipped (Failover Clustering not installed)"
+    }
+
+    # 2. Storage 129/153 Errors
+    Write-Info "2. Storage Health:"
+    try {
+        $storEvts = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 129, 153
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 5 -ErrorAction SilentlyContinue
+
+        if ($storEvts) {
+            $issues++
+            Write-DiagError "   ISSUE: $($storEvts.Count) storage adapter errors (129/153) in 7 days"
+        }
+        else {
+            Write-Success "   OK - No storage path errors"
+        }
+    }
+    catch { Write-Info "   Could not check" }
+
+    # 3. DNS Bad Key / Cluster DNS
+    Write-Info "3. DNS Health:"
+    try {
+        $dnsFailures = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 8018, 8019
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 5 -ErrorAction SilentlyContinue
+
+        if ($dnsFailures) {
+            $issues++
+            Write-DiagWarning "   ISSUE: DNS dynamic update failures detected"
+        }
+        else {
+            Write-Success "   OK - No DNS update failures"
+        }
+    }
+    catch { Write-Info "   Could not check" }
+
+    # 4. RDP Connectivity & MachineKeys
+    Write-Info "4. RDP Connectivity:"
+    try {
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $connectTask = $tcpClient.ConnectAsync('127.0.0.1', 3389)
+        $completed = $connectTask.Wait(2000)  # 2-second timeout
+        if ($completed -and $tcpClient.Connected) {
+            Write-Success "   OK - RDP port 3389 is listening"
+        }
+        else {
+            $issues++
+            Write-DiagError "   ISSUE: RDP port 3389 is NOT listening"
+        }
+        $tcpClient.Close()
+        $tcpClient.Dispose()
+    }
+    catch {
+        Write-Info "   Could not test RDP port"
+        if ($tcpClient) { $tcpClient.Dispose() }
+    }
+
+    try {
+        $mkPath = "$env:ProgramData\Microsoft\Crypto\RSA\MachineKeys"
+        if (Test-Path $mkPath) {
+            $acl = Get-Acl $mkPath -ErrorAction Stop
+            $hasSystem = $acl.Access | Where-Object { $_.IdentityReference -like '*SYSTEM*' }
+            if (-not $hasSystem) {
+                $issues++
+                Write-DiagError "   ISSUE: MachineKeys missing SYSTEM permissions (RDP/TLS may break)"
+            }
+        }
+    }
+    catch { }
+
+    # 5. Account Lockouts
+    Write-Info "5. Account Lockouts:"
+    try {
+        $lockouts = Get-WinEvent -FilterHashtable @{
+            LogName   = 'Security'
+            Id        = 4740
+            StartTime = (Get-Date).AddHours(-24)
+        } -MaxEvents 5 -ErrorAction SilentlyContinue
+
+        if ($lockouts) {
+            $issues++
+            Write-DiagWarning "   ISSUE: $($lockouts.Count) account lockout(s) in last 24h"
+        }
+        else {
+            Write-Success "   OK - No account lockouts"
+        }
+    }
+    catch { Write-Info "   Could not check (audit policy may be needed)" }
+
+    # 6. Pending Reboot
+    Write-Info "6. Pending Reboot:"
+    $rebootNeeded = (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") -or
+    (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired")
+    if ($rebootNeeded) {
+        $issues++
+        Write-DiagWarning "   ISSUE: Pending reboot detected"
+    }
+    else {
+        Write-Success "   OK - No pending reboot"
+    }
+
+    # 7. Schannel / TLS Errors
+    Write-Info "7. TLS/Schannel Health:"
+    try {
+        $schannelEvts = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 36870, 36871
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 3 -ErrorAction SilentlyContinue
+
+        if ($schannelEvts) {
+            $issues++
+            Write-DiagWarning "   ISSUE: Schannel TLS errors detected ($($schannelEvts.Count) in 7 days)"
+        }
+        else {
+            Write-Success "   OK - No Schannel errors"
+        }
+    }
+    catch { Write-Info "   Could not check" }
+
+    # Summary
+    Write-Host ""
+    if ($issues -eq 0) {
+        Write-Success "SCORECARD: All clear - no cross-category issues detected!"
+    }
+    else {
+        Write-DiagWarning "SCORECARD: $issues issue area(s) need attention (see details above)"
+    }
+    Write-Info "Run individual diagnostics (options 1-9) for deeper analysis."
+}
+#endregion
+
 #region Additional Scenarios
 function Show-AdditionalScenarios {
     <#
@@ -2014,8 +3213,11 @@ function Show-AdditionalScenarios {
                 Write-Host "TSS.ps1 -SDP Perf -AcceptEula" -ForegroundColor Cyan
                 Write-Host "TSS.ps1 -SDP Setup -AcceptEula" -ForegroundColor Cyan
                 Write-Host "TSS.ps1 -Collectlog DND_Setup" -ForegroundColor Cyan
-                Write-Info "Ensure to collect Memory.dmp from C:\Windows\ and minidump files from C:\Windows\Minidump\"
             }
+            else {
+                Write-DiagWarning "TSS is not available. Install TSS from the main menu (option 15)."
+            }
+            Write-Info "Ensure to collect Memory.dmp from C:\Windows\ and minidump files from C:\Windows\Minidump\"
         }
         "2" {
             Write-Info "Slow Boot/Slow Logon (<30 minutes):"
@@ -2026,6 +3228,9 @@ function Show-AdditionalScenarios {
                 if ($confirm -eq "Y") {
                     Invoke-TSSCommand -Command "-Start -Scenario ADS_SBSL"
                 }
+            }
+            else {
+                Write-DiagWarning "TSS is not available. Install TSS from the main menu (option 15)."
             }
             Write-Info "`nFor boot-time issues:"
             Write-Host "TSS.ps1 -StartAutoLogger -Procmon -WPR General -Netsh" -ForegroundColor Cyan
@@ -2059,12 +3264,19 @@ function Show-AdditionalScenarios {
                 Write-Info "For SQL on Failover Cluster:"
                 Write-Host "TSS.ps1 -SDP Cluster,SQLBase -AcceptEula" -ForegroundColor Cyan
             }
+            else {
+                Write-DiagWarning "TSS is not available. Install TSS from the main menu (option 15)."
+                Write-Info "Manual: Collect SQL Server error logs from the SQL Server log directory."
+            }
         }
         "6" {
             Write-Info "Cluster Related Issues:"
             if ($tssAvailable) {
                 Write-Host "TSS.ps1 -SDP Cluster -AcceptEula" -ForegroundColor Cyan
                 Write-Info "Run on ALL cluster nodes"
+            }
+            else {
+                Write-DiagWarning "TSS is not available. Install TSS from the main menu (option 15)."
             }
             Write-Info "`nCluster Logs:"
             Write-Host "Get-ClusterLog -TimeSpan 60 -UseLocalTime -Destination D:\clusterlog\" -ForegroundColor Cyan
@@ -2156,9 +3368,9 @@ function Show-ValidatorInfo {
     #>
     Write-Header "Validator Script Information"
     Write-Info "The validator script generates HTML output with:"
-    Write-Info "  â€¢ Key server sizing and specifications"
-    Write-Info "  â€¢ High-level health status"
-    Write-Info "  â€¢ Configuration details"
+    Write-Info "  * Key server sizing and specifications"
+    Write-Info "  * High-level health status"
+    Write-Info "  * Configuration details"
     Write-Info "`nOutput location: C:\Windows\ServerScanner"
     Write-Info "`nRequired: Run on ALL servers (cluster nodes or standalone)"
     Write-Info "Zip the ServerScanner folder and share for analysis"
@@ -2566,17 +3778,22 @@ Computer: $($env:COMPUTERNAME)
             $report += "Error retrieving system information: $($_.Exception.Message)`n"
         }
         
-        # Memory
-        try {
-            $totalMemGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
-            $freeMemGB = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
-            $report += "`n--- MEMORY ---`n"
-            $report += "Total: $($totalMemGB) GB`n"
-            $report += "Free: $($freeMemGB) GB`n"
-            $report += "Usage: $([math]::Round((($totalMemGB - $freeMemGB) / $totalMemGB) * 100, 2))%`n"
+        # Memory (guard against $os being $null if system info retrieval failed)
+        if ($null -ne $os) {
+            try {
+                $totalMemGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
+                $freeMemGB = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+                $report += "`n--- MEMORY ---`n"
+                $report += "Total: $($totalMemGB) GB`n"
+                $report += "Free: $($freeMemGB) GB`n"
+                $report += "Usage: $([math]::Round((($totalMemGB - $freeMemGB) / $totalMemGB) * 100, 2))%`n"
+            }
+            catch {
+                $report += "Error retrieving memory information`n"
+            }
         }
-        catch {
-            $report += "Error retrieving memory information`n"
+        else {
+            $report += "`n--- MEMORY ---`nSkipped (system information unavailable)`n"
         }
         
         # CPU
@@ -2596,6 +3813,7 @@ Computer: $($env:COMPUTERNAME)
         try {
             $volumes = Get-Volume -ErrorAction Stop | Where-Object { $null -ne $_.DriveLetter }
             foreach ($vol in $volumes) {
+                if ($vol.Size -le 0) { continue }
                 $freeGB = [math]::Round($vol.SizeRemaining / 1GB, 2)
                 $totalGB = [math]::Round($vol.Size / 1GB, 2)
                 $usedPercent = [math]::Round((($vol.Size - $vol.SizeRemaining) / $vol.Size) * 100, 2)
@@ -2690,15 +3908,16 @@ function Show-MainMenu {
     #>
     Clear-Host
     Write-Host @"
-╔═══════════════════════════════════════════════════════════════╗
-║                                                               ║
-║     WINDOWS SERVER TROUBLESHOOTING & LOG COLLECTION TOOL      ║
-║                         Version 2.5                           ║
-║                                                               ║
-╚═══════════════════════════════════════════════════════════════╝
+
+                                                                
+     WINDOWS SERVER TROUBLESHOOTING & LOG COLLECTION TOOL       
+                         Version 2.5                            
+                                                                
+
 "@ -ForegroundColor Cyan
 
-    Write-Host "`nPRIMARY DIAGNOSTICS:" -ForegroundColor Yellow
+    Write-Host "
+PRIMARY DIAGNOSTICS:" -ForegroundColor Yellow
     Write-Host "  1. Network Issues (Packet Loss, Slowness, RSS Check)" -ForegroundColor White
     Write-Host "  2. Memory Issues (High Usage, Top Consumers)" -ForegroundColor White
     Write-Host "  3. CPU Issues (High Usage, Process Analysis)" -ForegroundColor White
@@ -2708,21 +3927,26 @@ function Show-MainMenu {
     Write-Host "  7. DNS Health & Connectivity" -ForegroundColor White
     Write-Host "  8. Security & Authentication" -ForegroundColor White
     Write-Host "  9. Windows Update Status" -ForegroundColor White
+    Write-Host " 10. Cross-Category Health Scorecard" -ForegroundColor Green
     
-    Write-Host "`nADDITIONAL SCENARIOS:" -ForegroundColor Yellow
-    Write-Host " 10. Additional Troubleshooting Scenarios" -ForegroundColor White
+    Write-Host "
+ADDITIONAL SCENARIOS:" -ForegroundColor Yellow
+    Write-Host " 11. Additional Troubleshooting Scenarios" -ForegroundColor White
     Write-Host "     (Reboot, Crash, SQL, Cluster, Patching, etc.)" -ForegroundColor Gray
     
-    Write-Host "`nUTILITIES:" -ForegroundColor Yellow
-    Write-Host " 11. Generate System Report" -ForegroundColor White
-    Write-Host " 12. TLS Configuration Validation" -ForegroundColor White
-    Write-Host " 13. Validator Script Information" -ForegroundColor White
-    Write-Host " 14. Configure TSS Path" -ForegroundColor White
-    Write-Host " 15. Check TSS Status" -ForegroundColor White
+    Write-Host "
+UTILITIES:" -ForegroundColor Yellow
+    Write-Host " 12. Generate System Report" -ForegroundColor White
+    Write-Host " 13. TLS Configuration Validation" -ForegroundColor White
+    Write-Host " 14. Validator Script Information" -ForegroundColor White
+    Write-Host " 15. Configure TSS Path" -ForegroundColor White
+    Write-Host " 16. Check TSS Status" -ForegroundColor White
     
-    Write-Host "`n  0. Exit" -ForegroundColor Red
+    Write-Host "
+  0. Exit" -ForegroundColor Red
     
-    Write-Host ("`n" + "═" * 65) -ForegroundColor Cyan
+    Write-Host ("
+" + "" * 65) -ForegroundColor Cyan
 }
 
 function Start-TroubleshootingTool {
@@ -2775,7 +3999,7 @@ function Start-TroubleshootingTool {
     try {
         do {
             Show-MainMenu
-            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-15)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15")
+            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-16)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16")
             
             switch ($choice) {
                 "1" {
@@ -2834,13 +4058,17 @@ function Start-TroubleshootingTool {
                 }
                 "10" {
                     Clear-Host
-                    Show-AdditionalScenarios
+                    Test-CrossCategoryHealth
                 }
                 "11" {
                     Clear-Host
-                    Export-SystemReport
+                    Show-AdditionalScenarios
                 }
                 "12" {
+                    Clear-Host
+                    Export-SystemReport
+                }
+                "13" {
                     Clear-Host
                     Test-TLSConfiguration
                     Write-Host "`n"
@@ -2849,15 +4077,15 @@ function Start-TroubleshootingTool {
                         Export-TLSReport
                     }
                 }
-                "13" {
+                "14" {
                     Clear-Host
                     Show-ValidatorInfo
                 }
-                "14" {
+                "15" {
                     Clear-Host
                     Set-TSSPath
                 }
-                "15" {
+                "16" {
                     Clear-Host
                     $null = Test-TSSAvailable
                 }

@@ -101,7 +101,8 @@ function Initialize-DiagnosticPaths {
         }
         
         return $true
-    } catch {
+    }
+    catch {
         Write-Error "Failed to initialize diagnostic paths: $($_.Exception.Message)"
         return $false
     }
@@ -128,11 +129,13 @@ function Test-PathValid {
                 New-Item -Path $Path -ItemType Directory -Force -ErrorAction Stop | Out-Null
                 Write-Success "Created directory: $($Path)"
                 return $true
-            } catch {
+            }
+            catch {
                 Write-Error "Cannot create directory: $($_.Exception.Message)"
                 return $false
             }
-        } else {
+        }
+        else {
             Write-Warning "Path does not exist: $($Path)"
             return $false
         }
@@ -177,7 +180,8 @@ function Invoke-WithTSSCheck {
         if ($confirm -eq "Y") {
             Invoke-TSSCommand -Command $TSSCommand
         }
-    } else {
+    }
+    else {
         if ($ManualAlternativeAction) {
             & $ManualAlternativeAction
         }
@@ -193,11 +197,12 @@ function Get-ProcessAnalysis {
         $processes = Get-Process -ErrorAction Stop
         
         return @{
-            ByCPU = $processes | Sort-Object CPU -Descending | Select-Object -First $TopCount
+            ByCPU    = $processes | Sort-Object CPU -Descending | Select-Object -First $TopCount
             ByMemory = $processes | Sort-Object WS -Descending | Select-Object -First $TopCount
-            Total = $processes.Count
+            Total    = $processes.Count
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to retrieve process information: $($_.Exception.Message)"
         return $null
     }
@@ -261,7 +266,8 @@ function Test-TSSAvailable {
     if (Test-Path $tssScript) {
         Write-Success "TSS found at: $($tssScript)"
         return $true
-    } else {
+    }
+    else {
         Write-Warning "TSS.ps1 not found at: $($script:TSSPath)"
         Write-Info "Please verify TSS installation or update path from the main menu (option 12)"
         return $false
@@ -270,7 +276,7 @@ function Test-TSSAvailable {
 
 function Invoke-TSSCommand {
     param(
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [string]$Command
     )
     
@@ -299,10 +305,12 @@ function Invoke-TSSCommand {
         Invoke-Expression $fullCommand
         Write-Success "TSS command completed"
         return $true
-    } catch {
+    }
+    catch {
         Write-Error "Failed to execute TSS command: $($_.Exception.Message)"
         return $false
-    } finally {
+    }
+    finally {
         Set-Location $currentLocation
     }
 }
@@ -317,7 +325,7 @@ function Test-TCPIPConfiguration {
     #>
     Write-Info "`n=== TCP/IP Configuration ==="
     try {
-        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object {$_.Status -eq "Up"}
+        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
         
         foreach ($adapter in $adapters) {
             Write-Info "`nAdapter: $($adapter.Name) [$($adapter.InterfaceDescription)]"
@@ -335,7 +343,7 @@ function Test-TCPIPConfiguration {
             }
             
             # IPv6 Configuration
-            $ipv6 = Get-NetIPAddress -InterfaceAlias $adapter.Name -AddressFamily IPv6 -ErrorAction SilentlyContinue | Where-Object {$_.AddressState -eq "Preferred"}
+            $ipv6 = Get-NetIPAddress -InterfaceAlias $adapter.Name -AddressFamily IPv6 -ErrorAction SilentlyContinue | Where-Object { $_.AddressState -eq "Preferred" }
             if ($ipv6) {
                 Write-Info "  IPv6 Address: $($ipv6.IPAddress)"
             }
@@ -350,19 +358,23 @@ function Test-TCPIPConfiguration {
                 if ($pingResult) {
                     $ping = Test-Connection -ComputerName $gateway.NextHop -Count 1 -ErrorAction SilentlyContinue
                     if ($ping) {
-                        $latency = $ping.ResponseTime
+                        $latency = if ($ping.PSObject.Properties['Latency']) { $ping.Latency } else { $ping.ResponseTime }
                         if ($latency -lt 5) {
                             Write-Success "    Gateway Reachable (${latency}ms - Excellent)"
-                        } elseif ($latency -lt 20) {
+                        }
+                        elseif ($latency -lt 20) {
                             Write-Info "    Gateway Reachable (${latency}ms - Good)"
-                        } else {
+                        }
+                        else {
                             Write-Warning "    Gateway Reachable (${latency}ms - High Latency)"
                         }
                     }
-                } else {
+                }
+                else {
                     Write-Error "    Gateway NOT Reachable!"
                 }
-            } else {
+            }
+            else {
                 Write-Warning "  No default gateway configured"
             }
             
@@ -373,7 +385,8 @@ function Test-TCPIPConfiguration {
                 Write-Info "  Interface Metric: $interfaceMetric"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check TCP/IP configuration: $($_.Exception.Message)"
     }
 }
@@ -385,7 +398,7 @@ function Test-NetworkDriverInfo {
     #>
     Write-Info "`n=== Network Adapter Driver Information ==="
     try {
-        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object {$_.Status -eq "Up"}
+        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
         
         foreach ($adapter in $adapters) {
             Write-Info "`nAdapter: $($adapter.Name)"
@@ -402,11 +415,15 @@ function Test-NetworkDriverInfo {
                 $driverAge = (New-TimeSpan -Start $driver.DriverDate -End (Get-Date)).Days
                 Write-Info "  Driver Age: $driverAge days"
                 
-                if ($driverAge -gt 730) {  # 2 years
+                if ($driverAge -gt 730) {
+                    # 2 years
                     Write-Warning "    Driver is over 2 years old - consider updating"
-                } elseif ($driverAge -gt 365) {  # 1 year
+                }
+                elseif ($driverAge -gt 365) {
+                    # 1 year
                     Write-Info "    Driver is over 1 year old - check for updates"
-                } else {
+                }
+                else {
                     Write-Success "    Driver is relatively current"
                 }
                 
@@ -415,11 +432,13 @@ function Test-NetworkDriverInfo {
                 Write-Info "  Media Type: $($adapter.MediaType)"
                 Write-Info "  Physical Media Type: $($adapter.PhysicalMediaType)"
                 
-            } catch {
+            }
+            catch {
                 Write-Warning "  Could not retrieve driver information: $($_.Exception.Message)"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to enumerate adapters for driver check: $($_.Exception.Message)"
     }
 }
@@ -431,7 +450,7 @@ function Test-NetworkPerformanceMetrics {
     #>
     Write-Info "`n=== Network Performance Metrics ==="
     try {
-        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object {$_.Status -eq "Up"}
+        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
         
         foreach ($adapter in $adapters) {
             Write-Info "`nAdapter: $($adapter.Name)"
@@ -449,7 +468,8 @@ function Test-NetworkPerformanceMetrics {
                 if ($stats.ReceivedPacketErrors -gt 0 -or $stats.OutboundPacketErrors -gt 0) {
                     Write-Warning "  Received Errors: $($stats.ReceivedPacketErrors)"
                     Write-Warning "  Sent Errors: $($stats.OutboundPacketErrors)"
-                } else {
+                }
+                else {
                     Write-Success "  No packet errors detected"
                 }
                 
@@ -469,15 +489,18 @@ function Test-NetworkPerformanceMetrics {
                             Write-Warning "    High output queue - possible bottleneck"
                         }
                     }
-                } catch {
+                }
+                catch {
                     # Performance counter not available
                 }
                 
-            } catch {
+            }
+            catch {
                 Write-Warning "  Could not retrieve performance metrics: $($_.Exception.Message)"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check network performance: $($_.Exception.Message)"
     }
 }
@@ -489,7 +512,7 @@ function Test-NetworkOffloading {
     #>
     Write-Info "`n=== Network Adapter Offloading Features ==="
     try {
-        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object {$_.Status -eq "Up"}
+        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
         
         foreach ($adapter in $adapters) {
             Write-Info "`nAdapter: $($adapter.Name)"
@@ -521,7 +544,8 @@ function Test-NetworkOffloading {
                     if ($rsc) {
                         Write-Info "  Receive Segment Coalescing (IPv4): $($rsc.IPv4Enabled)"
                     }
-                } catch {
+                }
+                catch {
                     # RSC not available on this adapter
                 }
                 
@@ -532,15 +556,18 @@ function Test-NetworkOffloading {
                 
                 if ($offloadCount -eq 0) {
                     Write-Warning "    Consider enabling offload features for better performance"
-                } else {
+                }
+                else {
                     Write-Success "    Offload features are enabled"
                 }
                 
-            } catch {
+            }
+            catch {
                 Write-Warning "  Could not retrieve offload settings: $($_.Exception.Message)"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check offload features: $($_.Exception.Message)"
     }
 }
@@ -566,7 +593,8 @@ function Test-SMBConfiguration {
             if ($smb1Feature.State -eq "Enabled") {
                 Write-Error "  SMB 1.0: ENABLED - CRITICAL SECURITY RISK!"
                 Write-Info "    Disable with: Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol"
-            } else {
+            }
+            else {
                 Write-Success "  SMB 1.0: Disabled (Secure)"
             }
         }
@@ -578,8 +606,8 @@ function Test-SMBConfiguration {
         Write-Info "`nActive SMB Sessions: $($smbSessions.Count)"
         
         if ($smbSessions.Count -gt 0) {
-            $smb3Sessions = $smbSessions | Where-Object {$_.Dialect -like "3.*"}
-            $smb2Sessions = $smbSessions | Where-Object {$_.Dialect -like "2.*"}
+            $smb3Sessions = $smbSessions | Where-Object { $_.Dialect -like "3.*" }
+            $smb2Sessions = $smbSessions | Where-Object { $_.Dialect -like "2.*" }
             
             Write-Info "  SMB 3.x Sessions: $($smb3Sessions.Count)"
             Write-Info "  SMB 2.x Sessions: $($smb2Sessions.Count)"
@@ -590,7 +618,7 @@ function Test-SMBConfiguration {
         }
         
         # Check SMB shares
-        $smbShares = Get-SmbShare -ErrorAction SilentlyContinue | Where-Object {$_.Special -eq $false}
+        $smbShares = Get-SmbShare -ErrorAction SilentlyContinue | Where-Object { $_.Special -eq $false }
         if ($smbShares) {
             Write-Info "`nSMB Shares: $($smbShares.Count) non-system shares"
         }
@@ -603,11 +631,13 @@ function Test-SMBConfiguration {
                 Write-Info "  Connection Count: $($smbClient.ConnectionCountPerRssNetworkInterface)"
                 Write-Info "  Multichannel: $($smbClient.EnableMultiChannel)"
             }
-        } catch {
+        }
+        catch {
             # Not available on this system
         }
         
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check SMB configuration: $($_.Exception.Message)"
         Write-Info "  SMB server may not be installed or running"
     }
@@ -623,29 +653,33 @@ function Test-ConnectivityTests {
     # Test internet connectivity
     Write-Info "`nInternet Connectivity:"
     $testHosts = @(
-        @{Name="Google DNS"; IP="8.8.8.8"},
-        @{Name="Cloudflare DNS"; IP="1.1.1.1"},
-        @{Name="Microsoft"; IP="microsoft.com"}
+        @{Name = "Google DNS"; IP = "8.8.8.8" },
+        @{Name = "Cloudflare DNS"; IP = "1.1.1.1" },
+        @{Name = "Microsoft"; IP = "microsoft.com" }
     )
     
     foreach ($testHost in $testHosts) {
         try {
             $result = Test-Connection -ComputerName $testHost.IP -Count 2 -ErrorAction SilentlyContinue
             if ($result) {
-                $avgLatency = ($result | Measure-Object -Property ResponseTime -Average).Average
+                $avgLatency = ($result | Measure-Object -Property @(if ($result[0].PSObject.Properties['Latency']) { 'Latency' } else { 'ResponseTime' }) -Average).Average
                 $avgLatency = [math]::Round($avgLatency, 2)
                 
                 if ($avgLatency -lt 50) {
                     Write-Success "  $($testHost.Name): Reachable (${avgLatency}ms - Good)"
-                } elseif ($avgLatency -lt 150) {
+                }
+                elseif ($avgLatency -lt 150) {
                     Write-Info "  $($testHost.Name): Reachable (${avgLatency}ms - Acceptable)"
-                } else {
+                }
+                else {
                     Write-Warning "  $($testHost.Name): Reachable (${avgLatency}ms - High Latency)"
                 }
-            } else {
+            }
+            else {
                 Write-Error "  $($testHost.Name): NOT Reachable"
             }
-        } catch {
+        }
+        catch {
             Write-Error "  $($testHost.Name): Connection test failed"
         }
     }
@@ -660,17 +694,22 @@ function Test-ConnectivityTests {
             
             if ($loss -eq 0) {
                 Write-Success "  Packet Loss: 0% (Excellent)"
-            } elseif ($loss -lt 5) {
+            }
+            elseif ($loss -lt 5) {
                 Write-Info "  Packet Loss: $loss% (Acceptable)"
-            } elseif ($loss -lt 10) {
+            }
+            elseif ($loss -lt 10) {
                 Write-Warning "  Packet Loss: $loss% (Concerning)"
-            } else {
+            }
+            else {
                 Write-Error "  Packet Loss: $loss% (CRITICAL)"
             }
-        } else {
+        }
+        else {
             Write-Error "  Could not complete packet loss test"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Packet loss test failed: $($_.Exception.Message)"
     }
 }
@@ -696,7 +735,8 @@ function Test-NICTeaming {
                 
                 if ($team.Status -ne "Up") {
                     Write-Error "    CRITICAL: Team is not fully operational!"
-                } else {
+                }
+                else {
                     Write-Success "    Team is operational"
                 }
                 
@@ -707,17 +747,20 @@ function Test-NICTeaming {
                     foreach ($member in $teamMembers) {
                         $status = if ($member.AdministrativeMode -eq "Active") {
                             "Active"
-                        } else {
+                        }
+                        else {
                             "Standby"
                         }
                         Write-Info "    $($member.Name): $status - $($member.OperationalStatus)"
                     }
                 }
             }
-        } else {
+        }
+        else {
             Write-Info "No NIC Teams configured"
         }
-    } catch {
+    }
+    catch {
         Write-Info "NIC Teaming is not available or not configured"
     }
 }
@@ -756,18 +799,19 @@ function Test-RoutingAndARP {
             }
         }
         
-    } catch {
+    }
+    catch {
         Write-Warning "Could not retrieve routing table: $($_.Exception.Message)"
     }
     
     # ARP Cache
     Write-Info "`nARP Cache:"
     try {
-        $arpCache = Get-NetNeighbor -AddressFamily IPv4 -ErrorAction Stop | Where-Object {$_.State -ne "Unreachable"}
+        $arpCache = Get-NetNeighbor -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.State -ne "Unreachable" }
         Write-Info "  Total ARP Entries: $($arpCache.Count)"
         
-        $reachable = $arpCache | Where-Object {$_.State -eq "Reachable"}
-        $stale = $arpCache | Where-Object {$_.State -eq "Stale"}
+        $reachable = $arpCache | Where-Object { $_.State -eq "Reachable" }
+        $stale = $arpCache | Where-Object { $_.State -eq "Stale" }
         
         Write-Info "  Reachable: $($reachable.Count)"
         Write-Info "  Stale: $($stale.Count)"
@@ -775,7 +819,8 @@ function Test-RoutingAndARP {
         if ($stale.Count -gt 100) {
             Write-Warning "    Large number of stale ARP entries - consider clearing cache"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not retrieve ARP cache: $($_.Exception.Message)"
     }
 }
@@ -787,7 +832,7 @@ function Test-MTUConfiguration {
     #>
     Write-Info "`n=== MTU and Jumbo Frames Configuration ==="
     try {
-        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object {$_.Status -eq "Up"}
+        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
         
         foreach ($adapter in $adapters) {
             Write-Info "`nAdapter: $($adapter.Name)"
@@ -800,11 +845,14 @@ function Test-MTUConfiguration {
                 
                 if ($mtu -eq 1500) {
                     Write-Success "    Standard Ethernet MTU"
-                } elseif ($mtu -ge 9000) {
+                }
+                elseif ($mtu -ge 9000) {
                     Write-Success "    Jumbo Frames Enabled ($mtu bytes)"
-                } elseif ($mtu -gt 1500) {
+                }
+                elseif ($mtu -gt 1500) {
                     Write-Info "    Custom MTU configured"
-                } else {
+                }
+                else {
                     Write-Warning "    MTU is below standard (may cause issues)"
                 }
             }
@@ -812,16 +860,18 @@ function Test-MTUConfiguration {
             # Check Jumbo Packet support
             try {
                 $advProps = Get-NetAdapterAdvancedProperty -Name $adapter.Name -ErrorAction SilentlyContinue
-                $jumboPacket = $advProps | Where-Object {$_.DisplayName -like "*Jumbo*" -or $_.RegistryKeyword -like "*JumboPacket*"}
+                $jumboPacket = $advProps | Where-Object { $_.DisplayName -like "*Jumbo*" -or $_.RegistryKeyword -like "*JumboPacket*" }
                 
                 if ($jumboPacket) {
                     Write-Info "  Jumbo Packet Setting: $($jumboPacket.DisplayValue)"
                 }
-            } catch {
+            }
+            catch {
                 # Jumbo packet setting not available
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check MTU configuration: $($_.Exception.Message)"
     }
 }
@@ -833,7 +883,7 @@ function Test-NetworkAdapterAdvancedSettings {
     #>
     Write-Info "`n=== Network Adapter Advanced Settings ==="
     try {
-        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object {$_.Status -eq "Up"}
+        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
         
         foreach ($adapter in $adapters) {
             Write-Info "`nAdapter: $($adapter.Name)"
@@ -844,14 +894,14 @@ function Test-NetworkAdapterAdvancedSettings {
                 # Key settings to check
                 $keySettings = @{
                     "*InterruptModeration" = "Interrupt Moderation"
-                    "*FlowControl" = "Flow Control"
-                    "*SpeedDuplex" = "Speed & Duplex"
-                    "*EEE" = "Energy Efficient Ethernet"
-                    "*PriorityVLANTag" = "Priority & VLAN"
+                    "*FlowControl"         = "Flow Control"
+                    "*SpeedDuplex"         = "Speed & Duplex"
+                    "*EEE"                 = "Energy Efficient Ethernet"
+                    "*PriorityVLANTag"     = "Priority & VLAN"
                 }
                 
                 foreach ($setting in $keySettings.GetEnumerator()) {
-                    $prop = $advProps | Where-Object {$_.RegistryKeyword -eq $setting.Key}
+                    $prop = $advProps | Where-Object { $_.RegistryKeyword -eq $setting.Key }
                     if ($prop) {
                         Write-Info "  $($setting.Value): $($prop.DisplayValue)"
                     }
@@ -866,11 +916,13 @@ function Test-NetworkAdapterAdvancedSettings {
                     }
                 }
                 
-            } catch {
+            }
+            catch {
                 Write-Warning "  Could not retrieve advanced settings: $($_.Exception.Message)"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check adapter settings: $($_.Exception.Message)"
     }
 }
@@ -883,7 +935,7 @@ function Test-TCPIPPerformanceTuning {
     Write-Info "`n=== TCP/IP Performance Tuning ==="
     try {
         # Get TCP Global Settings
-        $tcpSettings = Get-NetTCPSetting -ErrorAction Stop | Where-Object {$_.SettingName -eq "Internet"}
+        $tcpSettings = Get-NetTCPSetting -ErrorAction Stop | Where-Object { $_.SettingName -eq "Internet" }
         
         if ($tcpSettings) {
             Write-Info "TCP Configuration (Internet Profile):"
@@ -908,9 +960,9 @@ function Test-TCPIPPerformanceTuning {
         # TCP Connection Statistics
         Write-Info "`nTCP Connection Statistics:"
         $tcpConnections = Get-NetTCPConnection -ErrorAction Stop
-        $established = ($tcpConnections | Where-Object {$_.State -eq "Established"}).Count
-        $timeWait = ($tcpConnections | Where-Object {$_.State -eq "TimeWait"}).Count
-        $closeWait = ($tcpConnections | Where-Object {$_.State -eq "CloseWait"}).Count
+        $established = ($tcpConnections | Where-Object { $_.State -eq "Established" }).Count
+        $timeWait = ($tcpConnections | Where-Object { $_.State -eq "TimeWait" }).Count
+        $closeWait = ($tcpConnections | Where-Object { $_.State -eq "CloseWait" }).Count
         
         Write-Info "  Established Connections: $established"
         Write-Info "  Time-Wait Connections: $timeWait"
@@ -924,7 +976,8 @@ function Test-TCPIPPerformanceTuning {
             Write-Warning "    High number of CLOSE_WAIT connections - possible application issue"
         }
         
-    } catch {
+    }
+    catch {
         Write-Warning "Could not retrieve TCP/IP tuning parameters: $($_.Exception.Message)"
     }
 }
@@ -936,13 +989,13 @@ function Test-NetBIOSAndWINS {
     #>
     Write-Info "`n=== NetBIOS and WINS Configuration ==="
     try {
-        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object {$_.Status -eq "Up"}
+        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
         
         foreach ($adapter in $adapters) {
             Write-Info "`nAdapter: $($adapter.Name)"
             
             # Check NetBIOS over TCP/IP setting
-            $adapterConfig = Get-WmiObject -Class Win32_NetworkAdapterConfiguration -Filter "Index='$($adapter.ifIndex)'" -ErrorAction SilentlyContinue
+            $adapterConfig = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter "InterfaceIndex='$($adapter.ifIndex)'" -ErrorAction SilentlyContinue
             
             if ($adapterConfig) {
                 $netbiosOption = $adapterConfig.TcpipNetbiosOptions
@@ -958,7 +1011,8 @@ function Test-NetBIOSAndWINS {
                 
                 if ($netbiosOption -ne 2) {
                     Write-Warning "    Consider disabling NetBIOS if not needed for security"
-                } else {
+                }
+                else {
                     Write-Success "    NetBIOS is disabled (Secure)"
                 }
                 
@@ -968,7 +1022,8 @@ function Test-NetBIOSAndWINS {
                     if ($adapterConfig.WINSSecondaryServer) {
                         Write-Info "  Secondary WINS Server: $($adapterConfig.WINSSecondaryServer)"
                     }
-                } else {
+                }
+                else {
                     Write-Info "  WINS: Not configured"
                 }
             }
@@ -983,11 +1038,13 @@ function Test-NetBIOSAndWINS {
                     Write-Info "`nNetBIOS Name Cache: $cacheEntries"
                 }
             }
-        } catch {
+        }
+        catch {
             # nbtstat not available or failed
         }
         
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check NetBIOS/WINS configuration: $($_.Exception.Message)"
     }
 }
@@ -1009,12 +1066,14 @@ function Test-RSSStatus {
                 Write-Info "  Max Processors: $($adapter.MaxProcessors)"
                 Write-Info "  Max Processor Number: $($adapter.MaxProcessorNumber)"
                 Write-Info "  Number of Receive Queues: $($adapter.NumberOfReceiveQueues)"
-            } else {
+            }
+            else {
                 Write-Warning "  RSS: DISABLED"
                 Write-Info "  To enable: Set-NetAdapterRss -Name '$($adapter.Name)' -Enabled `$true"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check RSS status: $($_.Exception.Message)"
     }
 }
@@ -1036,14 +1095,17 @@ function Test-VMQStatus {
                     Write-Info "  Base Processor: $($v.BaseProcessorNumber)"
                     Write-Info "  Max Processors: $($v.MaxProcessors)"
                     Write-Warning "    Note: If this is a 1Gbps Broadcom adapter, consider disabling VMQ to prevent packet drops"
-                } else {
+                }
+                else {
                     Write-Info "  VMQ is disabled"
                 }
             }
-        } else {
+        }
+        else {
             Write-Info "No VMQ-capable adapters found or VMQ not available"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not retrieve VMQ information: $($_.Exception.Message)"
     }
 }
@@ -1070,12 +1132,15 @@ function Test-EphemeralPorts {
             Write-Error "CRITICAL: Potential Port Exhaustion (Using >$($PORT_EXHAUSTION_THRESHOLD * 100)% of available ports)"
             Write-Info "  Consider increasing dynamic port range:"
             Write-Info "  netsh int ipv4 set dynamicport tcp start=10000 num=55536"
-        } elseif ($usagePercent -gt 50) {
+        }
+        elseif ($usagePercent -gt 50) {
             Write-Warning "Port usage is above 50% - monitor for exhaustion"
-        } else {
+        }
+        else {
             Write-Success "Port usage is within acceptable range"
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check ephemeral ports: $($_.Exception.Message)"
     }
 }
@@ -1090,16 +1155,19 @@ function Test-PowerPlan {
         $powerPlan = powercfg /getactivescheme
         if ($powerPlan -like "*High performance*") {
             Write-Success "Power Plan: High Performance (Optimal for servers)"
-        } elseif ($powerPlan -like "*Balanced*") {
+        }
+        elseif ($powerPlan -like "*Balanced*") {
             Write-Warning "Power Plan: Balanced"
             Write-Info "  Recommendation: Switch to High Performance for consistent network performance"
             Write-Info "  Command: powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
-        } else {
+        }
+        else {
             Write-Warning "Power Plan: $($powerPlan)"
             Write-Info "  Recommendation: Switch to High Performance"
             Write-Info "  Command: powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check power plan: $($_.Exception.Message)"
     }
 }
@@ -1139,17 +1207,17 @@ function Test-NetworkConfiguration {
     Test-PowerPlan
     
     # Summary
-    Write-Info "`n========================================
-"
+    Write-Info "`n========================================"
     Write-Success "Network diagnostic check completed!"
     Write-Info "Review warnings and errors above for issues requiring attention."
 }
 #endregion
 
+#region Network Log Collection
 function Start-NetworkLogCollection {
     Write-Header "Network Issue Log Collection"
     
-    $tssAvailable = Test-TSSAvailable
+    $null = Test-TSSAvailable
     
     Write-Info "Select Network Issue Type:"
     Write-Host "1. Packet Drop / Network Bottleneck (happening NOW)" -ForegroundColor Yellow
@@ -1226,9 +1294,11 @@ function Test-PageFileConfiguration {
             
             if ($usagePercent -gt 90) {
                 Write-Error "    CRITICAL: Page file usage above 90%! System may run out of virtual memory"
-            } elseif ($usagePercent -gt 80) {
+            }
+            elseif ($usagePercent -gt 80) {
                 Write-Warning "    WARNING: Page file usage above 80%"
-            } else {
+            }
+            else {
                 Write-Success "    Page file usage is acceptable"
             }
             
@@ -1247,7 +1317,8 @@ function Test-PageFileConfiguration {
                 Write-Info "`nPage File Settings: $($setting.Name)"
                 if ($setting.InitialSize -eq 0 -and $setting.MaximumSize -eq 0) {
                     Write-Info "  Type: System-managed"
-                } else {
+                }
+                else {
                     Write-Info "  Initial Size: $initialSize_GB GB"
                     Write-Info "  Maximum Size: $maxSize_GB GB"
                     
@@ -1273,9 +1344,11 @@ function Test-PageFileConfiguration {
         
         if ($commitPercent -gt 90) {
             Write-Error "    CRITICAL: System near commit limit - may crash!"
-        } elseif ($commitPercent -gt 80) {
+        }
+        elseif ($commitPercent -gt 80) {
             Write-Warning "    WARNING: High commit charge - monitor closely"
-        } else {
+        }
+        else {
             Write-Success "    Commit charge is healthy"
         }
         
@@ -1288,7 +1361,8 @@ function Test-PageFileConfiguration {
         Write-Info "  Set initial = maximum size to prevent fragmentation"
         Write-Info "  Consider page files on multiple physical disks for performance"
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to analyze page file: $($_.Exception.Message)"
     }
 }
@@ -1323,9 +1397,11 @@ function Test-MemoryPools {
         # Rough estimates for non-paged pool limits
         if ($totalRAM_GB -le 4) {
             $nonPagedLimit_GB = 2
-        } elseif ($totalRAM_GB -le 8) {
+        }
+        elseif ($totalRAM_GB -le 8) {
             $nonPagedLimit_GB = 3
-        } else {
+        }
+        else {
             $nonPagedLimit_GB = [math]::Min($totalRAM_GB * 0.75, 128)
         }
         
@@ -1334,9 +1410,11 @@ function Test-MemoryPools {
         
         if ($nonPagedPercent -gt 85) {
             Write-Error "    CRITICAL: Non-Paged Pool near limit - kernel may run out of memory!"
-        } elseif ($nonPagedPercent -gt 75) {
+        }
+        elseif ($nonPagedPercent -gt 75) {
             Write-Warning "    WARNING: Non-Paged Pool usage high"
-        } else {
+        }
+        else {
             Write-Success "    Non-Paged Pool usage is acceptable"
         }
         
@@ -1348,7 +1426,8 @@ function Test-MemoryPools {
                 Write-Error "`nPool Allocation Failures: $failures"
                 Write-Info "  System has failed to allocate pool memory!"
             }
-        } catch {
+        }
+        catch {
             # Counter not available
         }
         
@@ -1359,11 +1438,13 @@ function Test-MemoryPools {
                 $sessionPool_MB = [math]::Round($sessionPool.CounterSamples.CookedValue / 1MB, 0)
                 Write-Info "`nSystem Cache Resident: $sessionPool_MB MB"
             }
-        } catch {
+        }
+        catch {
             # Not available
         }
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to analyze memory pools: $($_.Exception.Message)"
     }
 }
@@ -1395,9 +1476,11 @@ function Test-ProcessWorkingSetAnalysis {
             
             if ($ws_MB -gt 4096) {
                 Write-Host $line -ForegroundColor Red
-            } elseif ($ws_MB -gt 2048) {
+            }
+            elseif ($ws_MB -gt 2048) {
                 Write-Host $line -ForegroundColor Yellow
-            } else {
+            }
+            else {
                 Write-Host $line -ForegroundColor White
             }
         }
@@ -1425,7 +1508,8 @@ function Test-ProcessWorkingSetAnalysis {
             }
         }
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to analyze process working sets: $($_.Exception.Message)"
     }
 }
@@ -1448,10 +1532,10 @@ function Test-MemoryLeakDetection {
     try {
         Write-Info "`nTaking first snapshot..."
         $snapshot1 = Get-Process | Select-Object Id, Name, 
-            @{Name='WS_MB';Expression={[math]::Round($_.WS/1MB,2)}},
-            @{Name='Private_MB';Expression={[math]::Round($_.PrivateMemorySize/1MB,2)}},
-            @{Name='Virtual_MB';Expression={[math]::Round($_.VirtualMemorySize/1MB,2)}},
-            HandleCount
+        @{Name = 'WS_MB'; Expression = { [math]::Round($_.WS / 1MB, 2) } },
+        @{Name = 'Private_MB'; Expression = { [math]::Round($_.PrivateMemorySize / 1MB, 2) } },
+        @{Name = 'Virtual_MB'; Expression = { [math]::Round($_.VirtualMemorySize / 1MB, 2) } },
+        HandleCount
         
         $snapshot1Time = Get-Date
         
@@ -1464,28 +1548,27 @@ function Test-MemoryLeakDetection {
         
         Write-Info "Taking second snapshot..."
         $snapshot2 = Get-Process | Select-Object Id, Name,
-            @{Name='WS_MB';Expression={[math]::Round($_.WS/1MB,2)}},
-            @{Name='Private_MB';Expression={[math]::Round($_.PrivateMemorySize/1MB,2)}},
-            @{Name='Virtual_MB';Expression={[math]::Round($_.VirtualMemorySize/1MB,2)}},
-            HandleCount
+        @{Name = 'WS_MB'; Expression = { [math]::Round($_.WS / 1MB, 2) } },
+        @{Name = 'Private_MB'; Expression = { [math]::Round($_.PrivateMemorySize / 1MB, 2) } },
+        @{Name = 'Virtual_MB'; Expression = { [math]::Round($_.VirtualMemorySize / 1MB, 2) } },
+        HandleCount
         
         $snapshot2Time = Get-Date
         $durationMinutes = ($snapshot2Time - $snapshot1Time).TotalMinutes
         
         Write-Info "`nAnalyzing memory growth..."
         Write-Info ("=" * 110)
-        Write-Info ("{0,-25} {1,10} {2,12} {3,12} {4,15} {5,15}" -f "Process", "PID", "Private Δ", "Handle Δ", "Growth Rate", "Leak Severity")
+        Write-Info ("{0,-25} {1,10} {2,12} {3,12} {4,15} {5,15}" -f "Process", "PID", "Private Chg", "Handle Chg", "Growth Rate", "Leak Severity")
         Write-Info ("-" * 110)
         
-        $leaksFound = $false
         $leakData = @()
         
         foreach ($proc1 in $snapshot1) {
-            $proc2 = $snapshot2 | Where-Object {$_.Id -eq $proc1.Id}
+            $proc2 = $snapshot2 | Where-Object { $_.Id -eq $proc1.Id }
             if ($proc2) {
                 $privateGrowth = $proc2.Private_MB - $proc1.Private_MB
                 $handleGrowth = $proc2.HandleCount - $proc1.HandleCount
-                $virtualGrowth = $proc2.Virtual_MB - $proc1.Virtual_MB
+                # Virtual growth tracked via $leakData if needed
                 
                 # Calculate growth rate per hour
                 $privateGrowthRate = [math]::Round(($privateGrowth / $durationMinutes) * 60, 2)
@@ -1495,23 +1578,22 @@ function Test-MemoryLeakDetection {
                 $severity = "None"
                 if ($privateGrowthRate -gt 500 -or $handleGrowthRate -gt 2000) {
                     $severity = "CRITICAL"
-                    $leaksFound = $true
-                } elseif ($privateGrowthRate -gt 200 -or $handleGrowthRate -gt 1000) {
+                }
+                elseif ($privateGrowthRate -gt 200 -or $handleGrowthRate -gt 1000) {
                     $severity = "HIGH"
-                    $leaksFound = $true
-                } elseif ($privateGrowthRate -gt 50 -or $handleGrowthRate -gt 500) {
+                }
+                elseif ($privateGrowthRate -gt 50 -or $handleGrowthRate -gt 500) {
                     $severity = "MEDIUM"
-                    $leaksFound = $true
                 }
                 
                 if ($severity -ne "None") {
                     $leakData += [PSCustomObject]@{
-                        Name = $proc2.Name
-                        PID = $proc2.Id
+                        Name          = $proc2.Name
+                        PID           = $proc2.Id
                         PrivateGrowth = $privateGrowth
-                        HandleGrowth = $handleGrowth
-                        GrowthRate = "$($privateGrowthRate) MB/hr"
-                        Severity = $severity
+                        HandleGrowth  = $handleGrowth
+                        GrowthRate    = "$($privateGrowthRate) MB/hr"
+                        Severity      = $severity
                     }
                 }
             }
@@ -1540,11 +1622,13 @@ function Test-MemoryLeakDetection {
             Write-Info "  CRITICAL: >500 MB/hr or >2000 handles/hr"
             Write-Info "  HIGH: >200 MB/hr or >1000 handles/hr"
             Write-Info "  MEDIUM: >50 MB/hr or >500 handles/hr"
-        } else {
+        }
+        else {
             Write-Success "`nNo significant memory leaks detected during this period"
         }
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to detect memory leaks: $($_.Exception.Message)"
     }
 }
@@ -1563,7 +1647,8 @@ function Test-HandleCountAnalysis {
         
         if ($totalHandles -gt 50000) {
             Write-Warning "  High total handle count - monitor for leaks"
-        } else {
+        }
+        else {
             Write-Success "  System handle count is acceptable"
         }
         
@@ -1574,9 +1659,11 @@ function Test-HandleCountAnalysis {
             $handleCount = $proc.HandleCount
             $status = if ($handleCount -gt 20000) {
                 "CRITICAL"
-            } elseif ($handleCount -gt 10000) {
+            }
+            elseif ($handleCount -gt 10000) {
                 "WARNING"
-            } else {
+            }
+            else {
                 "OK"
             }
             
@@ -1584,24 +1671,28 @@ function Test-HandleCountAnalysis {
             
             if ($status -eq "CRITICAL") {
                 Write-Host $line -ForegroundColor Red
-            } elseif ($status -eq "WARNING") {
+            }
+            elseif ($status -eq "WARNING") {
                 Write-Host $line -ForegroundColor Yellow
-            } else {
+            }
+            else {
                 Write-Info $line
             }
         }
         
         # Check GDI/USER objects (requires additional tools or WMI, simplified here)
         Write-Info "`nHandle Leak Indicators:"
-        $suspiciousProcs = $processes | Where-Object {$_.HandleCount -gt 10000}
+        $suspiciousProcs = $processes | Where-Object { $_.HandleCount -gt 10000 }
         if ($suspiciousProcs) {
             Write-Warning "  $($suspiciousProcs.Count) processes with >10,000 handles"
             Write-Info "  These processes should be monitored for handle leaks"
-        } else {
+        }
+        else {
             Write-Success "  No processes with excessive handle counts"
         }
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to analyze handles: $($_.Exception.Message)"
     }
 }
@@ -1629,9 +1720,11 @@ function Test-SystemCacheAnalysis {
         if ($cachePercent -gt 50) {
             Write-Warning "    Cache is consuming >50% of RAM"
             Write-Info "    This is normal for file servers but may indicate memory pressure on app servers"
-        } elseif ($cachePercent -gt 30) {
+        }
+        elseif ($cachePercent -gt 30) {
             Write-Info "    Cache usage is moderate"
-        } else {
+        }
+        else {
             Write-Success "    Cache usage is low"
         }
         
@@ -1660,7 +1753,8 @@ function Test-SystemCacheAnalysis {
             Write-Info "Peak Cache: $peak_GB GB"
         }
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to analyze system cache: $($_.Exception.Message)"
     }
 }
@@ -1719,15 +1813,17 @@ function Test-AvailableMemoryBreakdown {
                 $reserve_GB = [math]::Round($standbyReserve.CounterSamples.CookedValue / 1GB, 2)
                 Write-Info "  Standby (Reserve): $reserve_GB GB"
             }
-        } catch {
+        }
+        catch {
             # These counters may not be available on all systems
         }
         
         Write-Info "`nMemory State Flow:"
-        Write-Info "  Free → Zeroed → Standby → Modified → Active"
+        Write-Info "  Free > Zeroed > Standby > Modified > Active"
         Write-Info "  Available = Free + Standby (can be immediately allocated)"
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to analyze available memory: $($_.Exception.Message)"
     }
 }
@@ -1762,24 +1858,26 @@ function Test-NUMAMemoryAnalysis {
             try {
                 $nodeCounter = Get-Counter "\NUMA Node Memory(*)\Total MBytes" -ErrorAction SilentlyContinue
                 if ($nodeCounter) {
-                    $nodeSamples = $nodeCounter.CounterSamples | Where-Object {$_.InstanceName -eq $node.NodeId}
+                    $nodeSamples = $nodeCounter.CounterSamples | Where-Object { $_.InstanceName -eq $node.NodeId }
                     if ($nodeSamples) {
                         $nodeMB = $nodeSamples.CookedValue
                         Write-Info "  Memory: $nodeMB MB"
                     }
                 }
-            } catch {
+            }
+            catch {
                 Write-Info "  Detailed per-node memory counters not available"
             }
         }
         
         Write-Info "`nNUMA Recommendations:"
-        Write-Info "  • Ensure applications are NUMA-aware"
-        Write-Info "  • SQL Server: Configure max server memory per NUMA node"
-        Write-Info "  • Monitor for NUMA node memory imbalance"
-        Write-Info "  • Check process NUMA affinity with Task Manager"
+        Write-Info "  * Ensure applications are NUMA-aware"
+        Write-Info "  * SQL Server: Configure max server memory per NUMA node"
+        Write-Info "  * Monitor for NUMA node memory imbalance"
+        Write-Info "  * Check process NUMA affinity with Task Manager"
         
-    } catch {
+    }
+    catch {
         Write-Info "NUMA information not available on this system"
     }
 }
@@ -1816,16 +1914,14 @@ function Test-MemoryCompression {
                     Write-Info "  $name`: $value"
                 }
             }
-        } catch {
+        }
+        catch {
             # Compression counters not available
         }
         
         # Estimate compression ratio
-        $os = Get-CimInstance Win32_OperatingSystem
-        $totalRAM_GB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
         
         # Rough estimate: compressed size shown in WS represents expanded memory
-        $estimatedRatio = [math]::Round($compWS_MB / [math]::Max($compWS_MB / 3, 1), 1)
         
         Write-Info "`nEstimated Benefits:"
         Write-Info "  Compressed data in RAM: ~$compWS_MB MB"
@@ -1833,7 +1929,8 @@ function Test-MemoryCompression {
         Write-Info "  Approximate savings: ~$([math]::Round($compWS_MB * 2, 0)) MB"
         Write-Success "  Memory compression is helping reduce physical RAM usage"
         
-    } catch {
+    }
+    catch {
         Write-Warning "Could not analyze memory compression: $($_.Exception.Message)"
     }
 }
@@ -1856,10 +1953,12 @@ function Test-ModifiedPageList {
             Write-Error "    CRITICAL: Modified page list >4GB - severe I/O bottleneck!"
             Write-Info "    Pages cannot be written to disk fast enough"
             Write-Info "    Check disk performance and storage subsystem"
-        } elseif ($modified_GB -gt 2) {
+        }
+        elseif ($modified_GB -gt 2) {
             Write-Warning "    WARNING: Modified page list >2GB - possible I/O bottleneck"
             Write-Info "    Monitor disk write performance"
-        } else {
+        }
+        else {
             Write-Success "    Modified page list is acceptable"
         }
         
@@ -1877,11 +1976,12 @@ function Test-ModifiedPageList {
         # Dirty page threshold (when modified writer kicks in)
         Write-Info "`nModified Page Writer:"
         Write-Info "  The system writes dirty pages to disk when:"
-        Write-Info "  • Modified list gets too large"
-        Write-Info "  • Available memory drops below threshold"
-        Write-Info "  • Pages have been modified for too long"
+        Write-Info "  * Modified list gets too large"
+        Write-Info "  * Available memory drops below threshold"
+        Write-Info "  * Pages have been modified for too long"
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to analyze modified pages: $($_.Exception.Message)"
     }
 }
@@ -1928,16 +2028,15 @@ function Test-StandbyMemoryAnalysis {
             Write-Info "  Can be immediately repurposed for applications"
         }
         
-        # Repurposed standby pages
-        $repurposed = Get-Counter '\Memory\Standby Cache Reserve Bytes' -ErrorAction SilentlyContinue
-        if ($repurposed) {
+        if ($totalStandby -gt 0) {
             Write-Info "`nStandby memory is frequently repurposed when:"
-            Write-Info "  • Applications need more memory"
-            Write-Info "  • Memory pressure increases"
-            Write-Info "  • Priority system processes need memory"
+            Write-Info "  * Applications need more memory"
+            Write-Info "  * Memory pressure increases"
+            Write-Info "  * Priority system processes need memory"
         }
         
-    } catch {
+    }
+    catch {
         Write-Warning "Could not analyze standby memory: $($_.Exception.Message)"
     }
 }
@@ -1981,7 +2080,8 @@ function Test-KernelMemoryAnalysis {
         if ($totalKernel_MB -gt 2048) {
             Write-Warning "  Kernel memory usage is high (>2GB)"
             Write-Info "  Check for driver memory leaks or excessive filter drivers"
-        } else {
+        }
+        else {
             Write-Success "  Kernel memory usage is normal"
         }
         
@@ -1994,15 +2094,18 @@ function Test-KernelMemoryAnalysis {
                 
                 if ($pteCount -lt 5000) {
                     Write-Error "    CRITICAL: Low system PTEs! System may become unstable"
-                } elseif ($pteCount -lt 10000) {
+                }
+                elseif ($pteCount -lt 10000) {
                     Write-Warning "    WARNING: System PTEs are low"
                 }
             }
-        } catch {
+        }
+        catch {
             # PTE counter not available
         }
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to analyze kernel memory: $($_.Exception.Message)"
     }
 }
@@ -2015,7 +2118,7 @@ function Test-DriverMemoryUsage {
     Write-Info "`n=== Driver Memory Usage ==="
     try {
         # Get loaded drivers
-        $drivers = Get-CimInstance Win32_SystemDriver -ErrorAction Stop | Where-Object {$_.State -eq "Running"}
+        $drivers = Get-CimInstance Win32_SystemDriver -ErrorAction Stop | Where-Object { $_.State -eq "Running" }
         
         Write-Info "Total Loaded Drivers: $($drivers.Count)"
         
@@ -2043,11 +2146,12 @@ function Test-DriverMemoryUsage {
         }
         
         Write-Info "`nNote: Detailed per-driver memory usage requires:"
-        Write-Info "  • PoolMon utility (from WDK)"
-        Write-Info "  • Kernel debugger"
-        Write-Info "  • Driver Verifier with pool tracking"
+        Write-Info "  * PoolMon utility (from WDK)"
+        Write-Info "  * Kernel debugger"
+        Write-Info "  * Driver Verifier with pool tracking"
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to analyze driver memory: $($_.Exception.Message)"
     }
 }
@@ -2079,7 +2183,8 @@ function Test-PrivateVsVirtualBytes {
             # Highlight processes with large virtual vs private difference (lots of reserved space)
             if ($reserved_MB -gt 2048) {
                 Write-Host $line -ForegroundColor Yellow
-            } else {
+            }
+            else {
                 Write-Host $line -ForegroundColor White
             }
         }
@@ -2090,7 +2195,7 @@ function Test-PrivateVsVirtualBytes {
         Write-Info "  Reserved: Virtual - Private (address space not yet committed)"
         
         # Check for address space exhaustion (32-bit processes)
-        $largeVirtual = $processes | Where-Object {$_.VirtualMemorySize -gt 2GB}
+        $largeVirtual = $processes | Where-Object { $_.VirtualMemorySize -gt 2GB }
         if ($largeVirtual) {
             Write-Info "`nProcesses with >2GB Virtual Memory:"
             $largeVirtual | Select-Object -First 5 | ForEach-Object {
@@ -2099,7 +2204,8 @@ function Test-PrivateVsVirtualBytes {
             }
         }
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to analyze private vs virtual bytes: $($_.Exception.Message)"
     }
 }
@@ -2138,17 +2244,19 @@ function Test-MemoryMappedFiles {
                 Write-Info "  $($proc.Name):"
                 Write-Info "    WS: $ws_GB GB, Private: $private_GB GB, Shared/Mapped: ~$shared_GB GB"
             }
-        } else {
+        }
+        else {
             Write-Info "  No processes with significant mapped file usage detected"
         }
         
         Write-Info "`nCommon Uses of Memory-Mapped Files:"
-        Write-Info "  • Database files (SQL Server, Oracle)"
-        Write-Info "  • IIS static content caching"
-        Write-Info "  • Application file caching"
-        Write-Info "  • Shared DLLs and executables"
+        Write-Info "  * Database files (SQL Server, Oracle)"
+        Write-Info "  * IIS static content caching"
+        Write-Info "  * Application file caching"
+        Write-Info "  * Shared DLLs and executables"
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to analyze memory-mapped files: $($_.Exception.Message)"
     }
 }
@@ -2175,10 +2283,12 @@ function Test-SystemCommitCharge {
         if ($usage_Percent -gt 90) {
             Write-Error "  CRITICAL: Commit charge above 90% - system may crash!"
             Write-Info "  Add more RAM or increase page file size immediately"
-        } elseif ($usage_Percent -gt 80) {
+        }
+        elseif ($usage_Percent -gt 80) {
             Write-Warning "  WARNING: Commit charge above 80%"
             Write-Info "  Consider adding RAM or increasing page file"
-        } else {
+        }
+        else {
             Write-Success "  Commit charge is healthy"
         }
         
@@ -2201,11 +2311,13 @@ function Test-SystemCommitCharge {
         
         if ($available_GB -lt 2) {
             Write-Error "    Less than 2GB commit space available!"
-        } elseif ($available_GB -lt 4) {
+        }
+        elseif ($available_GB -lt 4) {
             Write-Warning "    Less than 4GB commit space available"
         }
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to analyze commit charge: $($_.Exception.Message)"
     }
 }
@@ -2226,11 +2338,14 @@ function Test-PageFaultAnalysis {
         
         if ($hardFaultsRate -gt 1000) {
             Write-Error "    CRITICAL: Very high hard page fault rate - severe memory pressure!"
-        } elseif ($hardFaultsRate -gt 100) {
+        }
+        elseif ($hardFaultsRate -gt 100) {
             Write-Warning "    WARNING: High hard page fault rate - memory pressure detected"
-        } elseif ($hardFaultsRate -gt 10) {
+        }
+        elseif ($hardFaultsRate -gt 10) {
             Write-Info "    Moderate page fault activity"
-        } else {
+        }
+        else {
             Write-Success "    Low page fault rate - good"
         }
         
@@ -2262,7 +2377,8 @@ function Test-PageFaultAnalysis {
         Write-Info "  Hard Faults 100-1000/sec: Memory pressure"
         Write-Info "  Hard Faults >1000/sec: Critical memory shortage"
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to analyze page faults: $($_.Exception.Message)"
     }
 }
@@ -2287,9 +2403,11 @@ function Test-BasicMemoryUsage {
         
         if ($memUsagePercent -gt $MEMORY_CRITICAL_THRESHOLD) {
             Write-Error "CRITICAL: Memory usage above $MEMORY_CRITICAL_THRESHOLD%!"
-        } elseif ($memUsagePercent -gt $MEMORY_WARNING_THRESHOLD) {
+        }
+        elseif ($memUsagePercent -gt $MEMORY_WARNING_THRESHOLD) {
             Write-Warning "WARNING: Memory usage above $MEMORY_WARNING_THRESHOLD%"
-        } else {
+        }
+        else {
             Write-Success "Memory usage is within normal range"
         }
         
@@ -2299,9 +2417,9 @@ function Test-BasicMemoryUsage {
         
         if ($processAnalysis) {
             $processAnalysis.ByMemory | Format-Table Name, 
-                @{Label="Memory(MB)"; Expression={[math]::Round($_.WS / 1MB, 2)}},
-                @{Label="CPU(s)"; Expression={[math]::Round($_.CPU, 2)}},
-                Id -AutoSize
+            @{Label = "Memory(MB)"; Expression = { [math]::Round($_.WS / 1MB, 2) } },
+            @{Label = "CPU(s)"; Expression = { [math]::Round($_.CPU, 2) } },
+            Id -AutoSize
         }
         
         # Committed bytes
@@ -2313,7 +2431,8 @@ function Test-BasicMemoryUsage {
                 Write-Error "CRITICAL: Committed bytes above $MEMORY_CRITICAL_THRESHOLD%!"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to retrieve memory information: $($_.Exception.Message)"
     }
 }
@@ -2356,20 +2475,27 @@ function Test-MemoryUsage {
     Test-NUMAMemoryAnalysis
     
     # Optional: Memory leak detection (time-consuming, ask user)
-    Test-MemoryLeakDetection
+    Write-Info "`nMemory Leak Detection takes ~5 minutes (two snapshots with comparison)."
+    $runLeakCheck = Get-ValidatedChoice -Prompt "Run memory leak detection? (Y/N)" -ValidChoices @("Y", "N")
+    if ($runLeakCheck -eq "Y") {
+        Test-MemoryLeakDetection
+    }
+    else {
+        Write-Info "Skipping memory leak detection."
+    }
     
     # Summary
-    Write-Info "`n========================================
-"
+    Write-Info "`n========================================"
     Write-Success "Memory diagnostic check completed!"
     Write-Info "Review warnings and errors above for issues requiring attention."
     Write-Info "`nKey Actions to Take:"
-    Write-Info "  • Red (ERROR): Immediate action required"
-    Write-Info "  • Yellow (WARNING): Monitor and plan remediation"
-    Write-Info "  • Green (SUCCESS): No action needed"
+    Write-Info "  * Red (ERROR): Immediate action required"
+    Write-Info "  * Yellow (WARNING): Monitor and plan remediation"
+    Write-Info "  * Green (SUCCESS): No action needed"
 }
 #endregion
 
+#region Memory Log Collection
 function Start-MemoryLogCollection {
     Write-Header "Memory Issue Log Collection"
     
@@ -2441,13 +2567,16 @@ function Test-CPUUsage {
             
             if ($cpuPercent -gt $CPU_CRITICAL_THRESHOLD) {
                 Write-Error "CRITICAL: CPU usage above $($CPU_CRITICAL_THRESHOLD)%!"
-            } elseif ($cpuPercent -gt $CPU_WARNING_THRESHOLD) {
+            }
+            elseif ($cpuPercent -gt $CPU_WARNING_THRESHOLD) {
                 Write-Warning "WARNING: CPU usage above $($CPU_WARNING_THRESHOLD)%"
-            } else {
+            }
+            else {
                 Write-Success "CPU usage is within normal range"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to retrieve CPU usage: $($_.Exception.Message)"
     }
     
@@ -2457,7 +2586,8 @@ function Test-CPUUsage {
         Write-Info "  Name: $($cpu.Name)"
         Write-Info "  Cores: $($cpu.NumberOfCores)"
         Write-Info "  Logical Processors: $($cpu.NumberOfLogicalProcessors)"
-    } catch {
+    }
+    catch {
         Write-Error "Failed to retrieve processor information: $($_.Exception.Message)"
     }
     
@@ -2466,9 +2596,9 @@ function Test-CPUUsage {
     
     if ($processAnalysis) {
         $processAnalysis.ByCPU | Format-Table Name, 
-            @{Label="CPU(s)"; Expression={[math]::Round($_.CPU, 2)}},
-            @{Label="Memory(MB)"; Expression={[math]::Round($_.WS / 1MB, 2)}},
-            Id -AutoSize
+        @{Label = "CPU(s)"; Expression = { [math]::Round($_.CPU, 2) } },
+        @{Label = "Memory(MB)"; Expression = { [math]::Round($_.WS / 1MB, 2) } },
+        Id -AutoSize
     }
     
     try {
@@ -2481,7 +2611,8 @@ function Test-CPUUsage {
                 Write-Info "Consider using WMI-specific trace: .\TSS.ps1 -UEX_WMIBase -WIN_Kernel -ETWflags 1 -WPR CPU -Perfmon UEX_WMIPrvSE -PerfIntervalSec 1 -noBasicLog"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check WMI process: $($_.Exception.Message)"
     }
 }
@@ -2549,13 +2680,14 @@ function Test-DiskPerformance {
         foreach ($disk in $disks) {
             Write-Info "  $($disk.FriendlyName) - Size: $([math]::Round($disk.Size / 1GB, 2)) GB - Health: $($disk.HealthStatus)"
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to retrieve physical disk information: $($_.Exception.Message)"
     }
     
     Write-Info "`nLogical Disk Space:"
     try {
-        $volumes = Get-Volume -ErrorAction Stop | Where-Object {$_.DriveLetter -ne $null}
+        $volumes = Get-Volume -ErrorAction Stop | Where-Object { $null -ne $_.DriveLetter -and $_.Size -gt 0 }
         foreach ($vol in $volumes) {
             $usedSpace = $vol.Size - $vol.SizeRemaining
             $usedPercent = [math]::Round(($usedSpace / $vol.Size) * 100, 2)
@@ -2564,11 +2696,13 @@ function Test-DiskPerformance {
             Write-Info "  Drive $($vol.DriveLetter): - $($usedPercent)% used - $($freeGB) GB free"
             if ($usedPercent -gt $DISK_CRITICAL_THRESHOLD) {
                 Write-Error "    CRITICAL: Less than 10% free space!"
-            } elseif ($usedPercent -gt $DISK_WARNING_THRESHOLD) {
+            }
+            elseif ($usedPercent -gt $DISK_WARNING_THRESHOLD) {
                 Write-Warning "    WARNING: Less than 20% free space"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to retrieve volume information: $($_.Exception.Message)"
     }
     
@@ -2584,23 +2718,27 @@ function Test-DiskPerformance {
                     
                     if ($latencyMs -gt $DISK_LATENCY_CRITICAL_MS) {
                         Write-Error "    CRITICAL: Serious I/O bottleneck (>$($DISK_LATENCY_CRITICAL_MS)ms)"
-                    } elseif ($latencyMs -gt $DISK_LATENCY_WARNING_MS) {
+                    }
+                    elseif ($latencyMs -gt $DISK_LATENCY_WARNING_MS) {
                         Write-Warning "    WARNING: Slow, needs attention ($($DISK_LATENCY_WARNING_MS)-$($DISK_LATENCY_CRITICAL_MS)ms)"
-                    } elseif ($latencyMs -gt $DISK_LATENCY_ACCEPTABLE_MS) {
+                    }
+                    elseif ($latencyMs -gt $DISK_LATENCY_ACCEPTABLE_MS) {
                         Write-Info "    INFO: Acceptable ($($DISK_LATENCY_ACCEPTABLE_MS)-$($DISK_LATENCY_WARNING_MS)ms)"
-                    } else {
+                    }
+                    else {
                         Write-Success "    GOOD: Very good (<$($DISK_LATENCY_ACCEPTABLE_MS)ms)"
                     }
                 }
             }
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not retrieve disk latency metrics: $($_.Exception.Message)"
     }
     
     Write-Info "`nChecking Cluster Size (should be 64KB for databases):"
     try {
-        $volumes = Get-Volume -ErrorAction Stop | Where-Object {$_.DriveLetter -ne $null}
+        $volumes = Get-Volume -ErrorAction Stop | Where-Object { $null -ne $_.DriveLetter -and $_.Size -gt 0 }
         foreach ($vol in $volumes) {
             $drive = $vol.DriveLetter + ":"
             try {
@@ -2612,11 +2750,13 @@ function Test-DiskPerformance {
                         Write-Warning "    Recommended cluster size for SQL/Database servers is 64KB"
                     }
                 }
-            } catch {
+            }
+            catch {
                 Write-Warning "  Could not retrieve cluster size for drive $($vol.DriveLetter)"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check cluster sizes: $($_.Exception.Message)"
     }
 }
@@ -2624,7 +2764,7 @@ function Test-DiskPerformance {
 function Start-DiskLogCollection {
     Write-Header "Disk/Storage Issue Log Collection"
     
-    $tssAvailable = Test-TSSAvailable
+    $null = Test-TSSAvailable
     
     Write-Info "Disk/Storage Log Collection Options:"
     Write-Host "1. StorPort trace (10-15 minutes)" -ForegroundColor Yellow
@@ -2663,10 +2803,10 @@ function Start-DiskLogCollection {
     Write-Info "  5. Place database files and transaction logs on separate disks"
     Write-Info "  6. Consider using SSDs for better I/O performance"
     Write-Info "`nLatency Guidelines:"
-    Write-Info "  • <$($DISK_LATENCY_ACCEPTABLE_MS)ms: Very good"
-    Write-Info "  • $($DISK_LATENCY_ACCEPTABLE_MS)-$($DISK_LATENCY_WARNING_MS)ms: Okay"
-    Write-Info "  • $($DISK_LATENCY_WARNING_MS)-$($DISK_LATENCY_CRITICAL_MS)ms: Slow, needs attention"
-    Write-Info "  • >$($DISK_LATENCY_CRITICAL_MS)ms: Serious I/O bottleneck"
+    Write-Info "  * <$($DISK_LATENCY_ACCEPTABLE_MS)ms: Very good"
+    Write-Info "  * $($DISK_LATENCY_ACCEPTABLE_MS)-$($DISK_LATENCY_WARNING_MS)ms: Okay"
+    Write-Info "  * $($DISK_LATENCY_WARNING_MS)-$($DISK_LATENCY_CRITICAL_MS)ms: Slow, needs attention"
+    Write-Info "  * >$($DISK_LATENCY_CRITICAL_MS)ms: Serious I/O bottleneck"
 }
 
 function Show-StorPortCommands {
@@ -2706,9 +2846,9 @@ STOP COLLECTION:
 logman stop PerfLog-$($env:COMPUTERNAME)
 
 INTERVAL GUIDANCE:
-  • 24 hours: -si 00:01:16 (1 min 16 sec)
-  • 4 hours: -si 00:00:14 (14 seconds)
-  • 2 hours: -si 00:00:07 (7 seconds)
+  * 24 hours: -si 00:01:16 (1 min 16 sec)
+  * 4 hours: -si 00:00:14 (14 seconds)
+  * 2 hours: -si 00:00:07 (7 seconds)
 
 You can also use -b MM/DD/YYYY HH:MM:SS AM/PM for begin time
 and -e MM/DD/YYYY HH:MM:SS AM/PM for end time
@@ -2741,10 +2881,12 @@ function Test-ServicesHealth {
             $stoppedAutoServices | ForEach-Object {
                 Write-Warning "  - $($_.DisplayName) ($($_.Name)): $($_.Status)"
             }
-        } else {
+        }
+        else {
             Write-Success "All automatic services are running"
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check automatic services: $($_.Exception.Message)"
     }
     
@@ -2758,11 +2900,13 @@ function Test-ServicesHealth {
                 $criticalServicesFound++
                 if ($svc.Status -eq "Running") {
                     Write-Success "  $($svc.DisplayName): Running"
-                } else {
+                }
+                else {
                     Write-Error "  $($svc.DisplayName): $($svc.Status)"
                 }
             }
-        } catch {
+        }
+        catch {
             # Service doesn't exist (not installed)
         }
     }
@@ -2776,8 +2920,8 @@ function Test-ServicesHealth {
     try {
         $yesterday = (Get-Date).AddHours(-24)
         $serviceErrors = Get-WinEvent -FilterHashtable @{
-            LogName = 'System'
-            ID = 7000,7001,7031,7034
+            LogName   = 'System'
+            ID        = 7000, 7001, 7031, 7034
             StartTime = $yesterday
         } -ErrorAction SilentlyContinue
         
@@ -2807,17 +2951,19 @@ function Test-ServicesHealth {
                 if ($_.Message -match 'service (.+?) ') {
                     [PSCustomObject]@{
                         Service = $matches[1]
-                        Time = $_.TimeCreated
+                        Time    = $_.TimeCreated
                         EventID = $_.Id
                     }
                 }
             } | Group-Object Service | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object {
                 Write-Warning "    - $($_.Name): $($_.Count) failures"
             }
-        } else {
+        }
+        else {
             Write-Success "No service failures in the last 24 hours"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not retrieve service failure events: $($_.Exception.Message)"
     }
     
@@ -2827,7 +2973,7 @@ function Test-ServicesHealth {
         $services = Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object {
             $_.StartName -notlike "LocalSystem" -and 
             $_.StartName -notlike "NT AUTHORITY\*" -and 
-            $_.StartName -ne $null
+            $null -ne $_.StartName
         }
         
         if ($services) {
@@ -2838,10 +2984,12 @@ function Test-ServicesHealth {
             if ($services.Count -gt 10) {
                 Write-Info "  ... and $($services.Count - 10) more"
             }
-        } else {
+        }
+        else {
             Write-Success "All services running under standard accounts"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check service accounts: $($_.Exception.Message)"
     }
     
@@ -2855,7 +3003,7 @@ function Test-ServicesHealth {
         
         foreach ($svc in $criticalServicesToCheck) {
             $recoveryActions = sc.exe qfailure $svc.Name 2>&1
-            if ($recoveryActions -match "RESTART_NO_ACTIONS") {
+            if ($recoveryActions -match "RESET_PERIOD.*0" -or -not ($recoveryActions -match "RESTART|RUN PROCESS|REBOOT")) {
                 $servicesNoRecovery += $svc.DisplayName
             }
         }
@@ -2866,10 +3014,12 @@ function Test-ServicesHealth {
                 Write-Info "  - $_"
             }
             Write-Info "`nTo configure recovery actions, use: sc.exe failure <ServiceName> reset= 86400 actions= restart/60000/restart/60000/restart/60000"
-        } else {
+        }
+        else {
             Write-Success "All critical services have recovery actions configured"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check service recovery actions: $($_.Exception.Message)"
     }
     
@@ -2886,7 +3036,8 @@ function Test-ServicesHealth {
                 Write-Info "  - $($_.DisplayName) ($($_.Name))"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check disabled services: $($_.Exception.Message)"
     }
 }
@@ -2900,7 +3051,7 @@ function Start-ServicesLogCollection {
     #>
     Write-Header "Services Issue Log Collection"
     
-    $tssAvailable = Test-TSSAvailable
+    $null = Test-TSSAvailable
     
     Write-Info "Select Service Issue Type:"
     Write-Host "1. Service Start Failure / Service Crash" -ForegroundColor Yellow
@@ -2928,13 +3079,14 @@ function Start-ServicesLogCollection {
                     Write-Info "Exporting service failure events (last 7 days)..."
                     $sevenDaysAgo = (Get-Date).AddDays(-7)
                     Get-WinEvent -FilterHashtable @{
-                        LogName = 'System'
-                        ID = 7000,7001,7031,7034,7022,7023,7024
+                        LogName   = 'System'
+                        ID        = 7000, 7001, 7031, 7034, 7022, 7023, 7024
                         StartTime = $sevenDaysAgo
                     } -ErrorAction SilentlyContinue | Export-Csv -Path (Join-Path $exportPath "ServiceErrors.csv") -NoTypeInformation
                     
                     Write-Success "Service failure information exported to: $exportPath"
-                } catch {
+                }
+                catch {
                     Write-Error "Failed to export service information: $($_.Exception.Message)"
                 }
             }
@@ -2958,16 +3110,16 @@ function Start-ServicesLogCollection {
                 try {
                     # Export all services with details
                     Get-CimInstance Win32_Service | Select-Object Name, DisplayName, State, StartMode, StartName, PathName |
-                        Export-Csv -Path (Join-Path $exportPath "ServiceDetails.csv") -NoTypeInformation
+                    Export-Csv -Path (Join-Path $exportPath "ServiceDetails.csv") -NoTypeInformation
                     
                     # Export service dependencies
                     $dependencyReport = @()
                     Get-Service | ForEach-Object {
                         if ($_.DependentServices.Count -gt 0 -or $_.ServicesDependedOn.Count -gt 0) {
                             $dependencyReport += [PSCustomObject]@{
-                                Service = $_.Name
-                                DisplayName = $_.DisplayName
-                                DependsOn = ($_.ServicesDependedOn.Name -join ', ')
+                                Service           = $_.Name
+                                DisplayName       = $_.DisplayName
+                                DependsOn         = ($_.ServicesDependedOn.Name -join ', ')
                                 DependentServices = ($_.DependentServices.Name -join ', ')
                             }
                         }
@@ -2975,7 +3127,8 @@ function Start-ServicesLogCollection {
                     $dependencyReport | Export-Csv -Path (Join-Path $exportPath "ServiceDependencies.csv") -NoTypeInformation
                     
                     Write-Success "Service configuration exported to: $exportPath"
-                } catch {
+                }
+                catch {
                     Write-Error "Failed to export service configuration: $($_.Exception.Message)"
                 }
             }
@@ -3021,7 +3174,8 @@ function Test-EventLogHealth {
                 Write-Warning "    WARNING: Log is over 90% full!"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to retrieve event log information: $($_.Exception.Message)"
     }
     
@@ -3030,8 +3184,8 @@ function Test-EventLogHealth {
     try {
         $yesterday = (Get-Date).AddHours(-24)
         $criticalErrors = Get-WinEvent -FilterHashtable @{
-            LogName = 'System', 'Application'
-            Level = 1,2  # Critical and Error
+            LogName   = 'System', 'Application'
+            Level     = 1, 2  # Critical and Error
             StartTime = $yesterday
         } -ErrorAction SilentlyContinue
         
@@ -3042,16 +3196,19 @@ function Test-EventLogHealth {
             $topErrors = $criticalErrors | Group-Object Id | Sort-Object Count -Descending | Select-Object -First 10
             
             Write-Info "`n  Top 10 Error Event IDs:"
-            foreach ($error in $topErrors) {
-                $sample = $criticalErrors | Where-Object {$_.Id -eq $error.Name} | Select-Object -First 1
-                Write-Warning "    Event ID $($error.Name): $($error.Count) occurrences"
+            foreach ($errGroup in $topErrors) {
+                $sample = $criticalErrors | Where-Object { $_.Id -eq $errGroup.Name } | Select-Object -First 1
+                Write-Warning "    Event ID $($errGroup.Name): $($errGroup.Count) occurrences"
                 Write-Info "      Source: $($sample.ProviderName)"
-                Write-Info "      Message: $($sample.Message.Substring(0, [Math]::Min(100, $sample.Message.Length)))..."
+                $msgText = if ($sample.Message) { $sample.Message.Substring(0, [Math]::Min(100, $sample.Message.Length)) } else { '(no message)' }
+                Write-Info "      Message: $msgText..."
             }
-        } else {
+        }
+        else {
             Write-Success "No critical errors in the last 24 hours"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not retrieve critical errors: $($_.Exception.Message)"
     }
     
@@ -3062,38 +3219,41 @@ function Test-EventLogHealth {
         
         # Event ID 15: Disk - The device is not ready
         $diskNotReady = Get-WinEvent -FilterHashtable @{
-            LogName = 'System'
-            ID = 15
+            LogName   = 'System'
+            ID        = 15
             StartTime = $twoDaysAgo
         } -ErrorAction SilentlyContinue
         
         if ($diskNotReady) {
             Write-Error "  Event ID 15 (Disk not ready): $($diskNotReady.Count) occurrences - Check disk health!"
-        } else {
+        }
+        else {
             Write-Success "  No disk 'not ready' errors"
         }
         
         # Event ID 4625: Failed login attempts
         $failedLogins = Get-WinEvent -FilterHashtable @{
-            LogName = 'Security'
-            ID = 4625
+            LogName   = 'Security'
+            ID        = 4625
             StartTime = $twoDaysAgo
         } -ErrorAction SilentlyContinue
         
         if ($failedLogins) {
             if ($failedLogins.Count -gt 50) {
                 Write-Error "  Event ID 4625 (Failed logins): $($failedLogins.Count) occurrences - Possible brute force attack!"
-            } else {
+            }
+            else {
                 Write-Warning "  Event ID 4625 (Failed logins): $($failedLogins.Count) occurrences"
             }
-        } else {
+        }
+        else {
             Write-Success "  No failed login attempts"
         }
         
         # Event ID 1000: Application crashes
         $appCrashes = Get-WinEvent -FilterHashtable @{
-            LogName = 'Application'
-            ID = 1000
+            LogName   = 'Application'
+            ID        = 1000
             StartTime = $twoDaysAgo
         } -ErrorAction SilentlyContinue
         
@@ -3109,27 +3269,29 @@ function Test-EventLogHealth {
             $crashedApps | ForEach-Object {
                 Write-Info "      - $($_.Name): $($_.Count) crashes"
             }
-        } else {
+        }
+        else {
             Write-Success "  No application crashes"
         }
         
         # Event ID 7031/7034: Service crashes
         $serviceCrashes = Get-WinEvent -FilterHashtable @{
-            LogName = 'System'
-            ID = 7031,7034
+            LogName   = 'System'
+            ID        = 7031, 7034
             StartTime = $twoDaysAgo
         } -ErrorAction SilentlyContinue
         
         if ($serviceCrashes) {
             Write-Warning "  Event ID 7031/7034 (Service crashes): $($serviceCrashes.Count) occurrences"
-        } else {
+        }
+        else {
             Write-Success "  No service crashes"
         }
         
         # Event ID 1074: System restart/shutdown
         $systemRestart = Get-WinEvent -FilterHashtable @{
-            LogName = 'System'
-            ID = 1074
+            LogName   = 'System'
+            ID        = 1074
             StartTime = $twoDaysAgo
         } -ErrorAction SilentlyContinue
         
@@ -3139,7 +3301,8 @@ function Test-EventLogHealth {
             Write-Info "    Last restart: $($lastRestart.TimeCreated)"
         }
         
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check for problematic events: $($_.Exception.Message)"
     }
     
@@ -3149,10 +3312,12 @@ function Test-EventLogHealth {
         $eventLogSvc = Get-Service -Name "EventLog" -ErrorAction Stop
         if ($eventLogSvc.Status -eq "Running") {
             Write-Success "Event Log service is running"
-        } else {
+        }
+        else {
             Write-Error "Event Log service is NOT running: $($eventLogSvc.Status)"
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check Event Log service: $($_.Exception.Message)"
     }
 }
@@ -3192,18 +3357,18 @@ function Start-EventLogCollection {
                 
                 # Export System log
                 Write-Info "Exporting System log..."
-                Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=$sevenDaysAgo} -ErrorAction SilentlyContinue |
-                    Export-Csv -Path (Join-Path $exportPath "System_$timestamp.csv") -NoTypeInformation
+                Get-WinEvent -FilterHashtable @{LogName = 'System'; StartTime = $sevenDaysAgo } -ErrorAction SilentlyContinue |
+                Export-Csv -Path (Join-Path $exportPath "System_$timestamp.csv") -NoTypeInformation
                 
                 # Export Application log
                 Write-Info "Exporting Application log..."
-                Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=$sevenDaysAgo} -ErrorAction SilentlyContinue |
-                    Export-Csv -Path (Join-Path $exportPath "Application_$timestamp.csv") -NoTypeInformation
+                Get-WinEvent -FilterHashtable @{LogName = 'Application'; StartTime = $sevenDaysAgo } -ErrorAction SilentlyContinue |
+                Export-Csv -Path (Join-Path $exportPath "Application_$timestamp.csv") -NoTypeInformation
                 
                 # Export Security log
                 Write-Info "Exporting Security log..."
-                Get-WinEvent -FilterHashtable @{LogName='Security'; StartTime=$sevenDaysAgo} -ErrorAction SilentlyContinue |
-                    Export-Csv -Path (Join-Path $exportPath "Security_$timestamp.csv") -NoTypeInformation
+                Get-WinEvent -FilterHashtable @{LogName = 'Security'; StartTime = $sevenDaysAgo } -ErrorAction SilentlyContinue |
+                Export-Csv -Path (Join-Path $exportPath "Security_$timestamp.csv") -NoTypeInformation
                 
                 # Also export as .evtx for Event Viewer
                 Write-Info "Exporting native .evtx files..."
@@ -3211,7 +3376,8 @@ function Start-EventLogCollection {
                 wevtutil epl Application (Join-Path $exportPath "Application_$timestamp.evtx") "/q:*[System[TimeCreated[timediff(@SystemTime) <= 604800000]]]"
                 
                 Write-Success "Event logs exported to: $exportPath"
-            } catch {
+            }
+            catch {
                 Write-Error "Failed to export event logs: $($_.Exception.Message)"
             }
         }
@@ -3222,7 +3388,7 @@ function Start-EventLogCollection {
                 $allLogsPath = Join-Path $exportPath "AllLogs_$timestamp"
                 New-Item -Path $allLogsPath -ItemType Directory -Force | Out-Null
                 
-                $logs = Get-WinEvent -ListLog * -ErrorAction SilentlyContinue | Where-Object {$_.RecordCount -gt 0}
+                $logs = Get-WinEvent -ListLog * -ErrorAction SilentlyContinue | Where-Object { $_.RecordCount -gt 0 }
                 $totalLogs = $logs.Count
                 $current = 0
                 
@@ -3235,14 +3401,16 @@ function Start-EventLogCollection {
                     
                     try {
                         wevtutil epl $log.LogName $outputFile 2>$null
-                    } catch {
+                    }
+                    catch {
                         # Skip logs that can't be exported
                     }
                 }
                 
                 Write-Progress -Activity "Exporting Event Logs" -Completed
                 Write-Success "All event logs exported to: $allLogsPath"
-            } catch {
+            }
+            catch {
                 Write-Error "Failed to export all logs: $($_.Exception.Message)"
             }
         }
@@ -3266,8 +3434,8 @@ Period: Last 7 days
                 
                 # Critical and Error events
                 $criticalErrors = Get-WinEvent -FilterHashtable @{
-                    LogName = 'System', 'Application'
-                    Level = 1,2
+                    LogName   = 'System', 'Application'
+                    Level     = 1, 2
                     StartTime = $sevenDaysAgo
                 } -ErrorAction SilentlyContinue
                 
@@ -3277,9 +3445,9 @@ Period: Last 7 days
                 if ($criticalErrors) {
                     $topErrors = $criticalErrors | Group-Object Id | Sort-Object Count -Descending | Select-Object -First 20
                     $report += "Top 20 Event IDs:`n"
-                    foreach ($error in $topErrors) {
-                        $sample = $criticalErrors | Where-Object {$_.Id -eq $error.Name} | Select-Object -First 1
-                        $report += "  Event ID $($error.Name): $($error.Count) occurrences`n"
+                    foreach ($errGroup in $topErrors) {
+                        $sample = $criticalErrors | Where-Object { $_.Id -eq $errGroup.Name } | Select-Object -First 1
+                        $report += "  Event ID $($errGroup.Name): $($errGroup.Count) occurrences`n"
                         $report += "    Source: $($sample.ProviderName)`n"
                         $report += "    Level: $($sample.LevelDisplayName)`n"
                         $report += "`n"
@@ -3288,8 +3456,8 @@ Period: Last 7 days
                 
                 # Warning events
                 $warnings = Get-WinEvent -FilterHashtable @{
-                    LogName = 'System', 'Application'
-                    Level = 3
+                    LogName   = 'System', 'Application'
+                    Level     = 3
                     StartTime = $sevenDaysAgo
                 } -ErrorAction SilentlyContinue
                 
@@ -3303,7 +3471,8 @@ Period: Last 7 days
                 if ($open -eq "Y") {
                     notepad $reportPath
                 }
-            } catch {
+            }
+            catch {
                 Write-Error "Failed to generate report: $($_.Exception.Message)"
             }
         }
@@ -3318,8 +3487,8 @@ Period: Last 7 days
                     
                     $sevenDaysAgo = (Get-Date).AddDays(-7)
                     $events = Get-WinEvent -FilterHashtable @{
-                        LogName = 'System', 'Application', 'Security'
-                        ID = $idArray
+                        LogName   = 'System', 'Application', 'Security'
+                        ID        = $idArray
                         StartTime = $sevenDaysAgo
                     } -ErrorAction SilentlyContinue
                     
@@ -3327,10 +3496,12 @@ Period: Last 7 days
                         $outputFile = Join-Path $exportPath "EventIDs_$($eventIds -replace ',', '_')_$timestamp.csv"
                         $events | Export-Csv -Path $outputFile -NoTypeInformation
                         Write-Success "Exported $($events.Count) events to: $outputFile"
-                    } else {
+                    }
+                    else {
                         Write-Warning "No events found with the specified Event IDs"
                     }
-                } catch {
+                }
+                catch {
                     Write-Error "Failed to export specific Event IDs: $($_.Exception.Message)"
                 }
             }
@@ -3365,9 +3536,11 @@ function Test-SecurityAuthentication {
         foreach ($cert in $certStore) {
             if ($cert.NotAfter -lt $now) {
                 $expiredCerts += $cert
-            } elseif ($cert.NotAfter -lt $thirtyDaysFromNow) {
+            }
+            elseif ($cert.NotAfter -lt $thirtyDaysFromNow) {
                 $expiringCerts += $cert
-            } else {
+            }
+            else {
                 $validCerts += $cert
             }
         }
@@ -3379,7 +3552,8 @@ function Test-SecurityAuthentication {
             $expiredCerts | ForEach-Object {
                 Write-Warning "    - $($_.Subject) (Expired: $($_.NotAfter))"
             }
-        } else {
+        }
+        else {
             Write-Success "  No expired certificates"
         }
         
@@ -3388,22 +3562,28 @@ function Test-SecurityAuthentication {
             $expiringCerts | ForEach-Object {
                 Write-Warning "    - $($_.Subject) (Expires: $($_.NotAfter))"
             }
-        } else {
+        }
+        else {
             Write-Success "  No certificates expiring in next 30 days"
         }
         
         Write-Info "  Valid Certificates: $($validCerts.Count)"
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check certificates: $($_.Exception.Message)"
     }
     
     # Check for certificate trust chain issues
     Write-Info "`nChecking Certificate Trust Chains..."
     try {
-        $invalidChainCerts = $certStore | Where-Object {
-            $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
-            $chain.ChainPolicy.RevocationMode = "NoCheck"
-            -not $chain.Build($_)
+        $invalidChainCerts = @()
+        $certsToCheck = Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction SilentlyContinue
+        if ($certsToCheck) {
+            $invalidChainCerts = $certsToCheck | Where-Object {
+                $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+                $chain.ChainPolicy.RevocationMode = "NoCheck"
+                -not $chain.Build($_)
+            }
         }
         
         if ($invalidChainCerts) {
@@ -3411,10 +3591,12 @@ function Test-SecurityAuthentication {
             $invalidChainCerts | Select-Object -First 5 | ForEach-Object {
                 Write-Warning "    - $($_.Subject)"
             }
-        } else {
+        }
+        else {
             Write-Success "  All certificates have valid trust chains"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not validate certificate trust chains: $($_.Exception.Message)"
     }
     
@@ -3434,10 +3616,12 @@ function Test-SecurityAuthentication {
             if ($klistOutput -match "A ticket to .* is not available") {
                 Write-Warning "    Some Kerberos tickets are unavailable"
             }
-        } else {
+        }
+        else {
             Write-Warning "  Could not retrieve Kerberos ticket information"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check Kerberos tickets: $($_.Exception.Message)"
     }
     
@@ -3446,8 +3630,8 @@ function Test-SecurityAuthentication {
     try {
         $yesterday = (Get-Date).AddHours(-24)
         $lockoutEvents = Get-WinEvent -FilterHashtable @{
-            LogName = 'Security'
-            ID = 4740  # Account lockout
+            LogName   = 'Security'
+            ID        = 4740  # Account lockout
             StartTime = $yesterday
         } -ErrorAction SilentlyContinue
         
@@ -3456,10 +3640,9 @@ function Test-SecurityAuthentication {
             
             # Parse and group by account
             $lockedAccounts = @{}
-            foreach ($event in $lockoutEvents) {
-                $xml = [xml]$event.ToXml()
-                $targetAccount = $xml.Event.EventData.Data | Where-Object {$_.Name -eq 'TargetUserName'} | Select-Object -ExpandProperty '#text'
-                $callerComputer = $xml.Event.EventData.Data | Where-Object {$_.Name -eq 'TargetDomainName'} | Select-Object -ExpandProperty '#text'
+            foreach ($evt in $lockoutEvents) {
+                $xml = [xml]$evt.ToXml()
+                $targetAccount = $xml.Event.EventData.Data | Where-Object { $_.Name -eq 'TargetUserName' } | Select-Object -ExpandProperty '#text'
                 
                 if (-not $lockedAccounts.ContainsKey($targetAccount)) {
                     $lockedAccounts[$targetAccount] = 0
@@ -3471,10 +3654,12 @@ function Test-SecurityAuthentication {
             $lockedAccounts.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
                 Write-Warning "      - $($_.Key): $($_.Value) lockouts"
             }
-        } else {
+        }
+        else {
             Write-Success "  No account lockouts in the last 24 hours"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check for account lockouts: $($_.Exception.Message)"
     }
     
@@ -3483,8 +3668,8 @@ function Test-SecurityAuthentication {
     try {
         $yesterday = (Get-Date).AddHours(-24)
         $failedLogins = Get-WinEvent -FilterHashtable @{
-            LogName = 'Security'
-            ID = 4625  # Failed logon
+            LogName   = 'Security'
+            ID        = 4625  # Failed logon
             StartTime = $yesterday
         } -ErrorAction SilentlyContinue
         
@@ -3494,15 +3679,16 @@ function Test-SecurityAuthentication {
             
             if ($failedCount -gt 100) {
                 Write-Error "    CRITICAL: Possible brute force attack! ($failedCount attempts)"
-            } elseif ($failedCount -gt 50) {
+            }
+            elseif ($failedCount -gt 50) {
                 Write-Warning "    WARNING: High number of failed logins"
             }
             
             # Group by username
             $failedByUser = @{}
-            foreach ($event in $failedLogins) {
-                $xml = [xml]$event.ToXml()
-                $targetUser = $xml.Event.EventData.Data | Where-Object {$_.Name -eq 'TargetUserName'} | Select-Object -ExpandProperty '#text'
+            foreach ($evt in $failedLogins) {
+                $xml = [xml]$evt.ToXml()
+                $targetUser = $xml.Event.EventData.Data | Where-Object { $_.Name -eq 'TargetUserName' } | Select-Object -ExpandProperty '#text'
                 
                 if (-not $failedByUser.ContainsKey($targetUser)) {
                     $failedByUser[$targetUser] = 0
@@ -3514,10 +3700,12 @@ function Test-SecurityAuthentication {
             $failedByUser.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 5 | ForEach-Object {
                 Write-Warning "      - $($_.Key): $($_.Value) failures"
             }
-        } else {
+        }
+        else {
             Write-Success "  No failed login attempts in the last 24 hours"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not analyze failed logins: $($_.Exception.Message)"
     }
     
@@ -3526,23 +3714,25 @@ function Test-SecurityAuthentication {
     try {
         $firewallProfiles = Get-NetFirewallProfile -ErrorAction Stop
         
-        foreach ($profile in $firewallProfiles) {
-            Write-Info "  $($profile.Name) Profile:"
-            if ($profile.Enabled) {
+        foreach ($fwProfile in $firewallProfiles) {
+            Write-Info "  $($fwProfile.Name) Profile:"
+            if ($fwProfile.Enabled) {
                 Write-Success "    Status: Enabled"
-                Write-Info "    Default Inbound Action: $($profile.DefaultInboundAction)"
-                Write-Info "    Default Outbound Action: $($profile.DefaultOutboundAction)"
-            } else {
+                Write-Info "    Default Inbound Action: $($fwProfile.DefaultInboundAction)"
+                Write-Info "    Default Outbound Action: $($fwProfile.DefaultOutboundAction)"
+            }
+            else {
                 Write-Warning "    Status: DISABLED"
             }
         }
         
         # Count firewall rules
         $firewallRules = Get-NetFirewallRule -ErrorAction Stop
-        $enabledRules = $firewallRules | Where-Object {$_.Enabled -eq $true}
+        $enabledRules = $firewallRules | Where-Object { $_.Enabled -eq $true }
         Write-Info "`n  Firewall Rules: $($firewallRules.Count) total, $($enabledRules.Count) enabled"
         
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check firewall status: $($_.Exception.Message)"
     }
     
@@ -3557,7 +3747,8 @@ function Test-SecurityAuthentication {
             Write-Info "    Behavior Monitor: $($defenderStatus.BehaviorMonitorEnabled)"
             Write-Info "    IoavProtection: $($defenderStatus.IoavProtectionEnabled)"
             Write-Info "    OnAccessProtection: $($defenderStatus.OnAccessProtectionEnabled)"
-        } else {
+        }
+        else {
             Write-Error "  Antivirus: DISABLED"
         }
         
@@ -3567,9 +3758,11 @@ function Test-SecurityAuthentication {
         
         if ($signatureAge.TotalDays -gt 7) {
             Write-Error "    CRITICAL: Signatures are outdated (>7 days old)"
-        } elseif ($signatureAge.TotalDays -gt 3) {
+        }
+        elseif ($signatureAge.TotalDays -gt 3) {
             Write-Warning "    WARNING: Signatures should be updated (>3 days old)"
-        } else {
+        }
+        else {
             Write-Success "    Signatures are up to date"
         }
         
@@ -3577,11 +3770,13 @@ function Test-SecurityAuthentication {
         $recentThreats = Get-MpThreatDetection -ErrorAction SilentlyContinue
         if ($recentThreats) {
             Write-Warning "  Recent Threat Detections: $($recentThreats.Count)"
-        } else {
+        }
+        else {
             Write-Success "  No recent threat detections"
         }
         
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check Windows Defender status: $($_.Exception.Message)"
         Write-Info "  Windows Defender may not be installed or managed by third-party AV"
     }
@@ -3593,8 +3788,8 @@ function Test-SecurityAuthentication {
         
         # Event 4720: User account created
         $accountCreated = Get-WinEvent -FilterHashtable @{
-            LogName = 'Security'
-            ID = 4720
+            LogName   = 'Security'
+            ID        = 4720
             StartTime = $sevenDaysAgo
         } -ErrorAction SilentlyContinue
         
@@ -3604,8 +3799,8 @@ function Test-SecurityAuthentication {
         
         # Event 4732: Member added to security-enabled local group
         $groupChanges = Get-WinEvent -FilterHashtable @{
-            LogName = 'Security'
-            ID = 4732,4733
+            LogName   = 'Security'
+            ID        = 4732, 4733
             StartTime = $sevenDaysAgo
         } -ErrorAction SilentlyContinue
         
@@ -3615,18 +3810,20 @@ function Test-SecurityAuthentication {
         
         # Event 1102: Audit log was cleared
         $logCleared = Get-WinEvent -FilterHashtable @{
-            LogName = 'Security'
-            ID = 1102
+            LogName   = 'Security'
+            ID        = 1102
             StartTime = $sevenDaysAgo
         } -ErrorAction SilentlyContinue
         
         if ($logCleared) {
             Write-Error "  CRITICAL: Audit log was cleared $($logCleared.Count) time(s)!"
-        } else {
+        }
+        else {
             Write-Success "  Audit log has not been cleared"
         }
         
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check security events: $($_.Exception.Message)"
     }
 }
@@ -3667,37 +3864,38 @@ function Start-SecurityLogCollection {
                 # Failed logins (4625)
                 Write-Info "Exporting failed login attempts..."
                 Get-WinEvent -FilterHashtable @{
-                    LogName = 'Security'
-                    ID = 4625
+                    LogName   = 'Security'
+                    ID        = 4625
                     StartTime = $sevenDaysAgo
                 } -ErrorAction SilentlyContinue | Export-Csv -Path (Join-Path $exportPath "FailedLogins_$timestamp.csv") -NoTypeInformation
                 
                 # Account lockouts (4740)
                 Write-Info "Exporting account lockouts..."
                 Get-WinEvent -FilterHashtable @{
-                    LogName = 'Security'
-                    ID = 4740
+                    LogName   = 'Security'
+                    ID        = 4740
                     StartTime = $sevenDaysAgo
                 } -ErrorAction SilentlyContinue | Export-Csv -Path (Join-Path $exportPath "AccountLockouts_$timestamp.csv") -NoTypeInformation
                 
                 # Successful logins (4624)
                 Write-Info "Exporting successful logins..."
                 Get-WinEvent -FilterHashtable @{
-                    LogName = 'Security'
-                    ID = 4624
+                    LogName   = 'Security'
+                    ID        = 4624
                     StartTime = $sevenDaysAgo
                 } -ErrorAction SilentlyContinue | Select-Object -First 1000 | Export-Csv -Path (Join-Path $exportPath "SuccessfulLogins_$timestamp.csv") -NoTypeInformation
                 
                 # Account changes (4720, 4722, 4723, 4724, 4725, 4726)
                 Write-Info "Exporting account changes..."
                 Get-WinEvent -FilterHashtable @{
-                    LogName = 'Security'
-                    ID = 4720,4722,4723,4724,4725,4726
+                    LogName   = 'Security'
+                    ID        = 4720, 4722, 4723, 4724, 4725, 4726
                     StartTime = $sevenDaysAgo
                 } -ErrorAction SilentlyContinue | Export-Csv -Path (Join-Path $exportPath "AccountChanges_$timestamp.csv") -NoTypeInformation
                 
                 Write-Success "Security logs exported to: $exportPath"
-            } catch {
+            }
+            catch {
                 Write-Error "Failed to export security logs: $($_.Exception.Message)"
             }
         }
@@ -3708,7 +3906,7 @@ function Start-SecurityLogCollection {
                 
                 # Export all certificates
                 $allCerts = Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction Stop
-                $certInfo = $allCerts | Select-Object Subject, Issuer, NotBefore, NotAfter, Thumbprint, @{Name='DaysUntilExpiry';Expression={(New-TimeSpan -End $_.NotAfter).Days}}
+                $certInfo = $allCerts | Select-Object Subject, Issuer, NotBefore, NotAfter, Thumbprint, @{Name = 'DaysUntilExpiry'; Expression = { (New-TimeSpan -End $_.NotAfter).Days } }
                 $certInfo | Export-Csv -Path (Join-Path $exportPath "Certificates_$timestamp.csv") -NoTypeInformation
                 
                 # Export certificate details
@@ -3734,7 +3932,8 @@ Total Certificates: $($allCerts.Count)
                 
                 $certReport | Out-File -FilePath (Join-Path $exportPath "CertificateDetails_$timestamp.txt") -Encoding UTF8
                 Write-Success "Certificate information exported to: $exportPath"
-            } catch {
+            }
+            catch {
                 Write-Error "Failed to export certificates: $($_.Exception.Message)"
             }
         }
@@ -3747,13 +3946,14 @@ Total Certificates: $($allCerts.Count)
                 Get-NetFirewallProfile | Export-Csv -Path (Join-Path $exportPath "FirewallProfiles_$timestamp.csv") -NoTypeInformation
                 
                 # Export enabled firewall rules
-                Get-NetFirewallRule | Where-Object {$_.Enabled -eq $true} | Export-Csv -Path (Join-Path $exportPath "FirewallRules_$timestamp.csv") -NoTypeInformation
+                Get-NetFirewallRule | Where-Object { $_.Enabled -eq $true } | Export-Csv -Path (Join-Path $exportPath "FirewallRules_$timestamp.csv") -NoTypeInformation
                 
                 # Export firewall settings using netsh
                 netsh advfirewall show allprofiles > (Join-Path $exportPath "FirewallSettings_$timestamp.txt")
                 
                 Write-Success "Firewall configuration exported to: $exportPath"
-            } catch {
+            }
+            catch {
                 Write-Error "Failed to export firewall configuration: $($_.Exception.Message)"
             }
         }
@@ -3775,8 +3975,8 @@ Computer: $($env:COMPUTERNAME)
                 # Certificates
                 $report += "`n--- CERTIFICATES ---`n"
                 $certs = Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction SilentlyContinue
-                $expiredCerts = $certs | Where-Object {$_.NotAfter -lt (Get-Date)}
-                $expiringCerts = $certs | Where-Object {$_.NotAfter -lt (Get-Date).AddDays(30) -and $_.NotAfter -gt (Get-Date)}
+                $expiredCerts = $certs | Where-Object { $_.NotAfter -lt (Get-Date) }
+                $expiringCerts = $certs | Where-Object { $_.NotAfter -lt (Get-Date).AddDays(30) -and $_.NotAfter -gt (Get-Date) }
                 
                 $report += "Total Certificates: $($certs.Count)`n"
                 $report += "Expired: $($expiredCerts.Count)`n"
@@ -3785,19 +3985,19 @@ Computer: $($env:COMPUTERNAME)
                 # Failed logins
                 $report += "`n--- FAILED LOGINS (Last 24 hours) ---`n"
                 $yesterday = (Get-Date).AddHours(-24)
-                $failedLogins = Get-WinEvent -FilterHashtable @{LogName='Security';ID=4625;StartTime=$yesterday} -ErrorAction SilentlyContinue
+                $failedLogins = Get-WinEvent -FilterHashtable @{LogName = 'Security'; ID = 4625; StartTime = $yesterday } -ErrorAction SilentlyContinue
                 $report += "Total: $($failedLogins.Count)`n"
                 
                 # Account lockouts
                 $report += "`n--- ACCOUNT LOCKOUTS (Last 24 hours) ---`n"
-                $lockouts = Get-WinEvent -FilterHashtable @{LogName='Security';ID=4740;StartTime=$yesterday} -ErrorAction SilentlyContinue
+                $lockouts = Get-WinEvent -FilterHashtable @{LogName = 'Security'; ID = 4740; StartTime = $yesterday } -ErrorAction SilentlyContinue
                 $report += "Total: $($lockouts.Count)`n"
                 
                 # Firewall status
                 $report += "`n--- FIREWALL STATUS ---`n"
                 $fwProfiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
-                foreach ($profile in $fwProfiles) {
-                    $report += "$($profile.Name): $($profile.Enabled)`n"
+                foreach ($fwProfile in $fwProfiles) {
+                    $report += "$($fwProfile.Name): $($fwProfile.Enabled)`n"
                 }
                 
                 # Windows Defender
@@ -3807,7 +4007,8 @@ Computer: $($env:COMPUTERNAME)
                     $report += "Antivirus Enabled: $($defender.AntivirusEnabled)`n"
                     $report += "Real-time Protection: $($defender.RealTimeProtectionEnabled)`n"
                     $report += "Last Signature Update: $($defender.AntivirusSignatureLastUpdated)`n"
-                } catch {
+                }
+                catch {
                     $report += "Windows Defender status unavailable`n"
                 }
                 
@@ -3818,7 +4019,8 @@ Computer: $($env:COMPUTERNAME)
                 if ($open -eq "Y") {
                     notepad $reportPath
                 }
-            } catch {
+            }
+            catch {
                 Write-Error "Failed to generate security report: $($_.Exception.Message)"
             }
         }
@@ -3844,11 +4046,13 @@ function Test-WindowsUpdateStatus {
         $wuService = Get-Service -Name "wuauserv" -ErrorAction Stop
         if ($wuService.Status -eq "Running") {
             Write-Success "  Service: Running"
-        } else {
+        }
+        else {
             Write-Warning "  Service: $($wuService.Status)"
         }
         Write-Info "  Startup Type: $($wuService.StartType)"
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check Windows Update service: $($_.Exception.Message)"
     }
     
@@ -3858,10 +4062,12 @@ function Test-WindowsUpdateStatus {
         $bitsService = Get-Service -Name "BITS" -ErrorAction Stop
         if ($bitsService.Status -eq "Running") {
             Write-Success "  Service: Running"
-        } else {
+        }
+        else {
             Write-Warning "  Service: $($bitsService.Status)"
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check BITS service: $($_.Exception.Message)"
     }
     
@@ -3878,7 +4084,7 @@ function Test-WindowsUpdateStatus {
             $updateHistory = $updateSearcher.QueryHistory(0, [Math]::Min(50, $historyCount))
             
             # Get last successful update
-            $successfulUpdates = $updateHistory | Where-Object {$_.ResultCode -eq 2} # 2 = Succeeded
+            $successfulUpdates = $updateHistory | Where-Object { $_.ResultCode -eq 2 } # 2 = Succeeded
             if ($successfulUpdates) {
                 $lastSuccessful = $successfulUpdates | Sort-Object Date -Descending | Select-Object -First 1
                 $daysSinceUpdate = (New-TimeSpan -Start $lastSuccessful.Date -End (Get-Date)).Days
@@ -3888,12 +4094,15 @@ function Test-WindowsUpdateStatus {
                 
                 if ($daysSinceUpdate -gt 60) {
                     Write-Error "    CRITICAL: Server has not been updated in over 60 days!"
-                } elseif ($daysSinceUpdate -gt 30) {
+                }
+                elseif ($daysSinceUpdate -gt 30) {
                     Write-Warning "    WARNING: Server has not been updated in over 30 days"
-                } else {
+                }
+                else {
                     Write-Success "    Update schedule is current"
                 }
-            } else {
+            }
+            else {
                 Write-Warning "  No successful updates found in recent history"
             }
             
@@ -3912,11 +4121,13 @@ function Test-WindowsUpdateStatus {
                 foreach ($group in $failedGroups) {
                     Write-Warning "      - $($group.Name): $($group.Count) failures"
                 }
-            } else {
+            }
+            else {
                 Write-Success "  No failed updates in last 30 days"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to retrieve update history: $($_.Exception.Message)"
     }
     
@@ -3931,9 +4142,9 @@ function Test-WindowsUpdateStatus {
         if ($pendingUpdates.Count -gt 0) {
             Write-Warning "  Pending Updates: $($pendingUpdates.Count)"
             
-            $securityUpdates = $pendingUpdates | Where-Object {$_.MsrcSeverity -ne $null}
-            $criticalUpdates = $pendingUpdates | Where-Object {$_.MsrcSeverity -eq "Critical"}
-            $importantUpdates = $pendingUpdates | Where-Object {$_.MsrcSeverity -eq "Important"}
+            $securityUpdates = $pendingUpdates | Where-Object { $null -ne $_.MsrcSeverity }
+            $criticalUpdates = $pendingUpdates | Where-Object { $_.MsrcSeverity -eq "Critical" }
+            $importantUpdates = $pendingUpdates | Where-Object { $_.MsrcSeverity -eq "Important" }
             
             Write-Info "    Critical: $($criticalUpdates.Count)"
             Write-Info "    Important: $($importantUpdates.Count)"
@@ -3943,10 +4154,12 @@ function Test-WindowsUpdateStatus {
             $pendingUpdates | Select-Object -First 5 | ForEach-Object {
                 Write-Info "      - $($_.Title)"
             }
-        } else {
+        }
+        else {
             Write-Success "  No pending updates"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check for pending updates: $($_.Exception.Message)"
     }
     
@@ -3978,10 +4191,12 @@ function Test-WindowsUpdateStatus {
         if ($rebootRequired) {
             Write-Warning "  Reboot Required: YES"
             Write-Info "    Reasons: $($rebootReasons -join ', ')"
-        } else {
+        }
+        else {
             Write-Success "  Reboot Required: NO"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not determine reboot status: $($_.Exception.Message)"
     }
     
@@ -4001,16 +4216,20 @@ function Test-WindowsUpdateStatus {
                 $wsusReachable = Test-NetConnection -ComputerName $uri.Host -Port $uri.Port -InformationLevel Quiet -ErrorAction SilentlyContinue
                 if ($wsusReachable) {
                     Write-Success "    WSUS Server: Reachable"
-                } else {
+                }
+                else {
                     Write-Error "    WSUS Server: NOT reachable"
                 }
-            } catch {
+            }
+            catch {
                 Write-Warning "    Could not test WSUS connectivity"
             }
-        } else {
+        }
+        else {
             Write-Info "  WSUS: Not configured (using Microsoft Update)"
         }
-    } catch {
+    }
+    catch {
         Write-Info "  WSUS: Not configured (using Microsoft Update)"
     }
     
@@ -4029,7 +4248,8 @@ function Test-WindowsUpdateStatus {
                 Write-Warning "    Cache is large (>10GB). Consider cleanup if disk space is limited."
             }
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check update cache: $($_.Exception.Message)"
     }
     
@@ -4039,10 +4259,12 @@ function Test-WindowsUpdateStatus {
         $updateInstaller = New-Object -ComObject Microsoft.Update.Installer
         if ($updateInstaller.IsBusy) {
             Write-Warning "  Update installation is currently IN PROGRESS"
-        } else {
+        }
+        else {
             Write-Success "  No update installation in progress"
         }
-    } catch {
+    }
+    catch {
         Write-Info "  Could not determine installation status"
     }
     
@@ -4051,10 +4273,10 @@ function Test-WindowsUpdateStatus {
     try {
         $sevenDaysAgo = (Get-Date).AddDays(-7)
         $updateErrors = Get-WinEvent -FilterHashtable @{
-            LogName = 'System'
+            LogName      = 'System'
             ProviderName = 'Microsoft-Windows-WindowsUpdateClient'
-            Level = 2  # Error
-            StartTime = $sevenDaysAgo
+            Level        = 2  # Error
+            StartTime    = $sevenDaysAgo
         } -ErrorAction SilentlyContinue
         
         if ($updateErrors) {
@@ -4066,10 +4288,12 @@ function Test-WindowsUpdateStatus {
             foreach ($group in $errorGroups) {
                 Write-Warning "      Event ID $($group.Name): $($group.Count) occurrences"
             }
-        } else {
+        }
+        else {
             Write-Success "  No Windows Update errors in last 7 days"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check Windows Update error events: $($_.Exception.Message)"
     }
 }
@@ -4114,39 +4338,42 @@ function Start-WindowsUpdateLogCollection {
                 if ($historyCount -gt 0) {
                     $updateHistory = $updateSearcher.QueryHistory(0, $historyCount)
                     
-                    $historyReport = $updateHistory | Select-Object @{Name='Date';Expression={$_.Date}}, 
-                                                                     @{Name='Title';Expression={$_.Title}},
-                                                                     @{Name='Result';Expression={
-                                                                         switch ($_.ResultCode) {
-                                                                             0 {"NotStarted"}
-                                                                             1 {"InProgress"}
-                                                                             2 {"Succeeded"}
-                                                                             3 {"SucceededWithErrors"}
-                                                                             4 {"Failed"}
-                                                                             5 {"Aborted"}
-                                                                             default {"Unknown"}
-                                                                         }
-                                                                     }},
-                                                                     @{Name='HResult';Expression={$_.HResult}}
+                    $historyReport = $updateHistory | Select-Object @{Name = 'Date'; Expression = { $_.Date } }, 
+                    @{Name = 'Title'; Expression = { $_.Title } },
+                    @{Name = 'Result'; Expression = {
+                            switch ($_.ResultCode) {
+                                0 { "NotStarted" }
+                                1 { "InProgress" }
+                                2 { "Succeeded" }
+                                3 { "SucceededWithErrors" }
+                                4 { "Failed" }
+                                5 { "Aborted" }
+                                default { "Unknown" }
+                            }
+                        }
+                    },
+                    @{Name = 'HResult'; Expression = { $_.HResult } }
                     
                     $historyReport | Export-Csv -Path (Join-Path $exportPath "UpdateHistory_$timestamp.csv") -NoTypeInformation
                     Write-Success "Update history exported to: $exportPath"
-                } else {
+                }
+                else {
                     Write-Warning "No update history available"
                 }
                 
                 # Export pending updates
                 $searchResult = $updateSearcher.Search("IsInstalled=0 and Type='Software'")
                 if ($searchResult.Updates.Count -gt 0) {
-                    $pendingReport = $searchResult.Updates | Select-Object @{Name='Title';Expression={$_.Title}},
-                                                                            @{Name='Severity';Expression={$_.MsrcSeverity}},
-                                                                            @{Name='IsDownloaded';Expression={$_.IsDownloaded}},
-                                                                            @{Name='Size(MB)';Expression={[math]::Round($_.MaxDownloadSize/1MB,2)}}
+                    $pendingReport = $searchResult.Updates | Select-Object @{Name = 'Title'; Expression = { $_.Title } },
+                    @{Name = 'Severity'; Expression = { $_.MsrcSeverity } },
+                    @{Name = 'IsDownloaded'; Expression = { $_.IsDownloaded } },
+                    @{Name = 'Size(MB)'; Expression = { [math]::Round($_.MaxDownloadSize / 1MB, 2) } }
                     
                     $pendingReport | Export-Csv -Path (Join-Path $exportPath "PendingUpdates_$timestamp.csv") -NoTypeInformation
                 }
                 
-            } catch {
+            }
+            catch {
                 Write-Error "Failed to export update history: $($_.Exception.Message)"
             }
         }
@@ -4157,7 +4384,8 @@ function Start-WindowsUpdateLogCollection {
                 $logPath = Join-Path $exportPath "WindowsUpdate.log"
                 Get-WindowsUpdateLog -LogPath $logPath -ErrorAction Stop
                 Write-Success "WindowsUpdate.log generated at: $logPath"
-            } catch {
+            }
+            catch {
                 Write-Error "Failed to generate WindowsUpdate.log: $($_.Exception.Message)"
                 Write-Info "Alternative: Check C:\Windows\Logs\WindowsUpdate\ for ETL files"
             }
@@ -4170,19 +4398,20 @@ function Start-WindowsUpdateLogCollection {
                 
                 # Export Windows Update Client events
                 Get-WinEvent -FilterHashtable @{
-                    LogName = 'System'
+                    LogName      = 'System'
                     ProviderName = 'Microsoft-Windows-WindowsUpdateClient'
-                    StartTime = $sevenDaysAgo
+                    StartTime    = $sevenDaysAgo
                 } -ErrorAction SilentlyContinue | Export-Csv -Path (Join-Path $exportPath "WindowsUpdateEvents_$timestamp.csv") -NoTypeInformation
                 
                 # Export Setup events
                 Get-WinEvent -FilterHashtable @{
-                    LogName = 'Setup'
+                    LogName   = 'Setup'
                     StartTime = $sevenDaysAgo
                 } -ErrorAction SilentlyContinue | Export-Csv -Path (Join-Path $exportPath "SetupEvents_$timestamp.csv") -NoTypeInformation
                 
                 Write-Success "Event logs exported to: $exportPath"
-            } catch {
+            }
+            catch {
                 Write-Error "Failed to export event logs: $($_.Exception.Message)"
             }
         }
@@ -4226,7 +4455,8 @@ function Start-WindowsUpdateLogCollection {
                     Write-Success "Windows Update components have been reset successfully"
                     Write-Info "Please try running Windows Update again"
                     
-                } catch {
+                }
+                catch {
                     Write-Error "Failed to reset Windows Update components: $($_.Exception.Message)"
                 }
             }
@@ -4263,13 +4493,14 @@ Computer: $($env:COMPUTERNAME)
                     
                     if ($historyCount -gt 0) {
                         $history = $updateSearcher.QueryHistory(0, [Math]::Min(10, $historyCount))
-                        $lastSuccessful = $history | Where-Object {$_.ResultCode -eq 2} | Select-Object -First 1
+                        $lastSuccessful = $history | Where-Object { $_.ResultCode -eq 2 } | Select-Object -First 1
                         if ($lastSuccessful) {
                             $report += "Last Successful Update: $($lastSuccessful.Date)`n"
                             $report += "  Title: $($lastSuccessful.Title)`n"
                         }
                     }
-                } catch {
+                }
+                catch {
                     $report += "Error retrieving update history`n"
                 }
                 
@@ -4280,12 +4511,13 @@ Computer: $($env:COMPUTERNAME)
                     $report += "Total Pending: $($searchResult.Updates.Count)`n"
                     
                     if ($searchResult.Updates.Count -gt 0) {
-                        $critical = ($searchResult.Updates | Where-Object {$_.MsrcSeverity -eq "Critical"}).Count
-                        $important = ($searchResult.Updates | Where-Object {$_.MsrcSeverity -eq "Important"}).Count
+                        $critical = ($searchResult.Updates | Where-Object { $_.MsrcSeverity -eq "Critical" }).Count
+                        $important = ($searchResult.Updates | Where-Object { $_.MsrcSeverity -eq "Important" }).Count
                         $report += "Critical: $critical`n"
                         $report += "Important: $important`n"
                     }
-                } catch {
+                }
+                catch {
                     $report += "Error checking pending updates`n"
                 }
                 
@@ -4299,7 +4531,8 @@ Computer: $($env:COMPUTERNAME)
                 $wuServer = (Get-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -Name "WUServer" -ErrorAction SilentlyContinue).WUServer
                 if ($wuServer) {
                     $report += "WSUS Server: $wuServer`n"
-                } else {
+                }
+                else {
                     $report += "WSUS: Not configured (using Microsoft Update)`n"
                 }
                 
@@ -4310,7 +4543,8 @@ Computer: $($env:COMPUTERNAME)
                 if ($open -eq "Y") {
                     notepad $reportPath
                 }
-            } catch {
+            }
+            catch {
                 Write-Error "Failed to generate report: $($_.Exception.Message)"
             }
         }
@@ -4333,7 +4567,7 @@ function Test-DNSHealth {
     # Get configured DNS servers
     Write-Info "Configured DNS Servers:"
     try {
-        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object {$_.Status -eq "Up"}
+        $adapters = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
         
         foreach ($adapter in $adapters) {
             Write-Info "`n  Adapter: $($adapter.Name)"
@@ -4342,7 +4576,8 @@ function Test-DNSHealth {
                 
                 if ($dnsServers.ServerAddresses.Count -eq 0) {
                     Write-Warning "    No DNS servers configured"
-                } else {
+                }
+                else {
                     foreach ($dnsServer in $dnsServers.ServerAddresses) {
                         Write-Info "    DNS Server: $dnsServer"
                         
@@ -4350,18 +4585,21 @@ function Test-DNSHealth {
                         $pingResult = Test-Connection -ComputerName $dnsServer -Count 1 -Quiet -ErrorAction SilentlyContinue
                         if ($pingResult) {
                             $ping = Test-Connection -ComputerName $dnsServer -Count 1 -ErrorAction SilentlyContinue
-                            $latency = $ping.ResponseTime
+                            $latency = if ($ping.PSObject.Properties['Latency']) { $ping.Latency } else { $ping.ResponseTime }
                             Write-Success "      Connectivity: OK (${latency}ms)"
-                        } else {
+                        }
+                        else {
                             Write-Error "      Connectivity: FAILED"
                         }
                     }
                 }
-            } catch {
+            }
+            catch {
                 Write-Warning "    Could not retrieve DNS configuration"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to enumerate network adapters: $($_.Exception.Message)"
     }
     
@@ -4381,12 +4619,15 @@ function Test-DNSHealth {
             
             if ($resolutionTime -gt $DNS_RESOLUTION_CRITICAL_MS) {
                 Write-Error "    Resolution Time: ${resolutionTime}ms (CRITICAL: >${DNS_RESOLUTION_CRITICAL_MS}ms)"
-            } elseif ($resolutionTime -gt $DNS_RESOLUTION_WARNING_MS) {
+            }
+            elseif ($resolutionTime -gt $DNS_RESOLUTION_WARNING_MS) {
                 Write-Warning "    Resolution Time: ${resolutionTime}ms (WARNING: >${DNS_RESOLUTION_WARNING_MS}ms)"
-            } else {
+            }
+            else {
                 Write-Success "    Resolution Time: ${resolutionTime}ms"
             }
-        } catch {
+        }
+        catch {
             Write-Error "  $domain`: Resolution FAILED - $($_.Exception.Message)"
         }
     }
@@ -4398,13 +4639,15 @@ function Test-DNSHealth {
         Write-Info "  Total cached entries: $($dnsCache.Count)"
         
         # Check for failed lookups in cache
-        $failedLookups = $dnsCache | Where-Object {$_.Status -ne 0}
+        $failedLookups = $dnsCache | Where-Object { $_.Status -ne 0 }
         if ($failedLookups) {
             Write-Warning "  Failed lookups in cache: $($failedLookups.Count)"
-        } else {
+        }
+        else {
             Write-Success "  No failed lookups in cache"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not retrieve DNS cache: $($_.Exception.Message)"
     }
     
@@ -4414,10 +4657,12 @@ function Test-DNSHealth {
         $dnsClientSvc = Get-Service -Name "Dnscache" -ErrorAction Stop
         if ($dnsClientSvc.Status -eq "Running") {
             Write-Success "DNS Client service is running"
-        } else {
+        }
+        else {
             Write-Error "DNS Client service is NOT running: $($dnsClientSvc.Status)"
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check DNS Client service: $($_.Exception.Message)"
     }
     
@@ -4435,7 +4680,8 @@ function Test-DNSHealth {
         if ($dnsSuffixList) {
             Write-Info "  Suffix Search List: $($dnsSuffixList -join ', ')"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not retrieve DNS suffix configuration: $($_.Exception.Message)"
     }
     
@@ -4451,14 +4697,17 @@ function Test-DNSHealth {
             if ($dnsServerSvc) {
                 if ($dnsServerSvc.Status -eq "Running") {
                     Write-Success "  DNS Server service is running"
-                } else {
+                }
+                else {
                     Write-Error "  DNS Server service is NOT running: $($dnsServerSvc.Status)"
                 }
             }
-        } else {
+        }
+        else {
             Write-Info "DNS Server role is not installed (client-only)"
         }
-    } catch {
+    }
+    catch {
         Write-Info "Could not check DNS Server role (may not be domain controller)"
     }
     
@@ -4466,19 +4715,21 @@ function Test-DNSHealth {
     Write-Info "`nReverse DNS Lookup Test:"
     try {
         $localIP = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
-            $_.InterfaceAlias -notlike "*Loopback*" -and $_.IPAddress -ne "127.0.0.1"
-        } | Select-Object -First 1).IPAddress
+                $_.InterfaceAlias -notlike "*Loopback*" -and $_.IPAddress -ne "127.0.0.1"
+            } | Select-Object -First 1).IPAddress
         
         if ($localIP) {
             Write-Info "  Testing reverse lookup for: $localIP"
             try {
                 $reverseResult = Resolve-DnsName -Name $localIP -ErrorAction Stop
                 Write-Success "    Reverse lookup successful: $($reverseResult.NameHost)"
-            } catch {
+            }
+            catch {
                 Write-Warning "    Reverse lookup failed"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not perform reverse DNS lookup test"
     }
 }
@@ -4492,7 +4743,7 @@ function Start-DNSLogCollection {
     #>
     Write-Header "DNS Log Collection"
     
-    $tssAvailable = Test-TSSAvailable
+    $null = Test-TSSAvailable
     
     Write-Info "Select DNS Collection Type:"
     Write-Host "1. Export DNS Configuration & Cache" -ForegroundColor Yellow
@@ -4543,7 +4794,8 @@ $(nslookup $env:COMPUTERNAME 2>&1)
                     $nslookupOutput | Out-File -FilePath (Join-Path $exportPath "NSLookupTests_$timestamp.txt")
                     
                     Write-Success "DNS configuration exported to: $exportPath"
-                } catch {
+                }
+                catch {
                     Write-Error "Failed to export DNS configuration: $($_.Exception.Message)"
                 }
             }
@@ -4588,7 +4840,7 @@ logman stop "DNS-Trace" -ets
                     # Export DNS Client events
                     Write-Info "Exporting DNS Client events..."
                     Get-WinEvent -FilterHashtable @{
-                        LogName = 'Microsoft-Windows-DNS-Client/Operational'
+                        LogName   = 'Microsoft-Windows-DNS-Client/Operational'
                         StartTime = $sevenDaysAgo
                     } -ErrorAction SilentlyContinue | Export-Csv -Path (Join-Path $exportPath "DNSClient_Events_$timestamp.csv") -NoTypeInformation
                     
@@ -4597,13 +4849,14 @@ logman stop "DNS-Trace" -ets
                     if ($dnsServerLog) {
                         Write-Info "Exporting DNS Server events..."
                         Get-WinEvent -FilterHashtable @{
-                            LogName = 'DNS Server'
+                            LogName   = 'DNS Server'
                             StartTime = $sevenDaysAgo
                         } -ErrorAction SilentlyContinue | Export-Csv -Path (Join-Path $exportPath "DNSServer_Events_$timestamp.csv") -NoTypeInformation
                     }
                     
                     Write-Success "DNS event logs exported to: $exportPath"
-                } catch {
+                }
+                catch {
                     Write-Error "Failed to export DNS events: $($_.Exception.Message)"
                 }
             }
@@ -4749,7 +5002,8 @@ function Show-AdditionalScenarios {
                     wevtutil epl Security (Join-Path $exportPath "security.evtx")
                     
                     Write-Success "Event logs exported to: $($exportPath)"
-                } catch {
+                }
+                catch {
                     Write-Error "Failed to export event logs: $($_.Exception.Message)"
                 }
             }
@@ -4770,9 +5024,9 @@ function Show-AdditionalScenarios {
 function Show-ValidatorInfo {
     Write-Header "Validator Script Information"
     Write-Info "The validator script generates HTML output with:"
-    Write-Info "  • Key server sizing and specifications"
-    Write-Info "  • High-level health status"
-    Write-Info "  • Configuration details"
+    Write-Info "  * Key server sizing and specifications"
+    Write-Info "  * High-level health status"
+    Write-Info "  * Configuration details"
     Write-Info "`nOutput location: C:\Windows\ServerScanner"
     Write-Info "`nRequired: Run on ALL servers (cluster nodes or standalone)"
     Write-Info "Zip the ServerScanner folder and share for analysis"
@@ -4806,15 +5060,19 @@ function Test-TLSConfiguration {
                     
                     if ($clientEnabled.Enabled -eq 1 -and $clientDisabledByDefault.DisabledByDefault -eq 0) {
                         Write-Success "  Client: ENABLED"
-                    } elseif ($clientEnabled.Enabled -eq 0 -or $clientDisabledByDefault.DisabledByDefault -eq 1) {
+                    }
+                    elseif ($clientEnabled.Enabled -eq 0 -or $clientDisabledByDefault.DisabledByDefault -eq 1) {
                         Write-Warning "  Client: DISABLED"
-                    } else {
+                    }
+                    else {
                         Write-Info "  Client: Not explicitly configured (using system default)"
                     }
-                } catch {
+                }
+                catch {
                     Write-Info "  Client: Not explicitly configured (using system default)"
                 }
-            } else {
+            }
+            else {
                 Write-Info "  Client: Not explicitly configured (using system default)"
             }
             
@@ -4826,18 +5084,23 @@ function Test-TLSConfiguration {
                     
                     if ($serverEnabled.Enabled -eq 1 -and $serverDisabledByDefault.DisabledByDefault -eq 0) {
                         Write-Success "  Server: ENABLED"
-                    } elseif ($serverEnabled.Enabled -eq 0 -or $serverDisabledByDefault.DisabledByDefault -eq 1) {
+                    }
+                    elseif ($serverEnabled.Enabled -eq 0 -or $serverDisabledByDefault.DisabledByDefault -eq 1) {
                         Write-Warning "  Server: DISABLED"
-                    } else {
+                    }
+                    else {
                         Write-Info "  Server: Not explicitly configured (using system default)"
                     }
-                } catch {
+                }
+                catch {
                     Write-Info "  Server: Not explicitly configured (using system default)"
                 }
-            } else {
+            }
+            else {
                 Write-Info "  Server: Not explicitly configured (using system default)"
             }
-        } else {
+        }
+        else {
             Write-Info "  Protocol registry key does not exist (using system default)"
         }
         
@@ -4859,13 +5122,15 @@ function Test-TLSConfiguration {
             
             if ($schUseStrongCrypto.SchUseStrongCrypto -eq 1) {
                 Write-Success ".NET 4.x (32-bit): Strong Crypto ENABLED"
-            } else {
+            }
+            else {
                 Write-Warning ".NET 4.x (32-bit): Strong Crypto NOT enabled"
             }
             
             if ($systemDefaultTls.SystemDefaultTlsVersions -eq 1) {
                 Write-Success ".NET 4.x (32-bit): System Default TLS ENABLED"
-            } else {
+            }
+            else {
                 Write-Warning ".NET 4.x (32-bit): System Default TLS NOT enabled"
             }
         }
@@ -4877,17 +5142,20 @@ function Test-TLSConfiguration {
             
             if ($schUseStrongCrypto64.SchUseStrongCrypto -eq 1) {
                 Write-Success ".NET 4.x (64-bit): Strong Crypto ENABLED"
-            } else {
+            }
+            else {
                 Write-Warning ".NET 4.x (64-bit): Strong Crypto NOT enabled"
             }
             
             if ($systemDefaultTls64.SystemDefaultTlsVersions -eq 1) {
                 Write-Success ".NET 4.x (64-bit): System Default TLS ENABLED"
-            } else {
+            }
+            else {
                 Write-Warning ".NET 4.x (64-bit): System Default TLS NOT enabled"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check .NET Framework TLS configuration: $($_.Exception.Message)"
     }
     
@@ -4899,7 +5167,8 @@ function Test-TLSConfiguration {
         
         if ($securityProtocol -match "Tls12") {
             Write-Success "TLS 1.2 is available in PowerShell"
-        } else {
+        }
+        else {
             Write-Warning "TLS 1.2 is NOT configured in PowerShell"
             Write-Info "To enable: [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12"
         }
@@ -4907,7 +5176,8 @@ function Test-TLSConfiguration {
         if ($securityProtocol -match "Tls13") {
             Write-Success "TLS 1.3 is available in PowerShell"
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check PowerShell TLS configuration: $($_.Exception.Message)"
     }
     
@@ -4923,11 +5193,14 @@ function Test-TLSConfiguration {
                 $suite = $_.Name
                 if ($suite -match "TLS_AES|TLS_CHACHA20") {
                     Write-Success "  $suite (TLS 1.3)"
-                } elseif ($suite -match "GCM|ECDHE") {
+                }
+                elseif ($suite -match "GCM|ECDHE") {
                     Write-Success "  $suite (Strong)"
-                } elseif ($suite -match "CBC") {
+                }
+                elseif ($suite -match "CBC") {
                     Write-Warning "  $suite (Consider disabling CBC mode ciphers)"
-                } else {
+                }
+                else {
                     Write-Info "  $suite"
                 }
             }
@@ -4943,13 +5216,16 @@ function Test-TLSConfiguration {
                 $weakCiphers | ForEach-Object {
                     Write-Warning "  - $($_.Name)"
                 }
-            } else {
+            }
+            else {
                 Write-Success "No weak cipher suites detected"
             }
-        } else {
+        }
+        else {
             Write-Warning "Could not retrieve cipher suite information (may require Windows Server 2012 R2+)"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not check cipher suites: $($_.Exception.Message)"
     }
 }
@@ -4987,7 +5263,8 @@ Computer: $($env:COMPUTERNAME)
                     $clientProps = Get-ItemProperty -Path $clientPath -ErrorAction SilentlyContinue
                     $report += "Client Enabled: $($clientProps.Enabled)`n"
                     $report += "Client DisabledByDefault: $($clientProps.DisabledByDefault)`n"
-                } else {
+                }
+                else {
                     $report += "Client: Not configured`n"
                 }
                 
@@ -4996,10 +5273,12 @@ Computer: $($env:COMPUTERNAME)
                     $serverProps = Get-ItemProperty -Path $serverPath -ErrorAction SilentlyContinue
                     $report += "Server Enabled: $($serverProps.Enabled)`n"
                     $report += "Server DisabledByDefault: $($serverProps.DisabledByDefault)`n"
-                } else {
+                }
+                else {
                     $report += "Server: Not configured`n"
                 }
-            } else {
+            }
+            else {
                 $report += "Not configured (using system defaults)`n"
             }
         }
@@ -5027,7 +5306,8 @@ Computer: $($env:COMPUTERNAME)
                     $report += "$($suite.Name)`n"
                 }
             }
-        } catch {
+        }
+        catch {
             $report += "Could not retrieve cipher suites`n"
         }
         
@@ -5038,11 +5318,13 @@ Computer: $($env:COMPUTERNAME)
         if ($open -eq "Y") {
             try {
                 notepad $reportPath
-            } catch {
+            }
+            catch {
                 Write-Warning "Could not open report automatically. Please navigate to: $($reportPath)"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to generate TLS report: $($_.Exception.Message)"
     }
 }
@@ -5078,7 +5360,8 @@ Computer: $($env:COMPUTERNAME)
             $report += "Model: $($cs.Model)`n"
             $report += "Domain: $($cs.Domain)`n"
             $report += "Last Boot: $($os.LastBootUpTime)`n"
-        } catch {
+        }
+        catch {
             $report += "Error retrieving system information: $($_.Exception.Message)`n"
         }
         
@@ -5089,7 +5372,8 @@ Computer: $($env:COMPUTERNAME)
             $report += "Total: $($totalMemGB) GB`n"
             $report += "Free: $($freeMemGB) GB`n"
             $report += "Usage: $([math]::Round((($totalMemGB - $freeMemGB) / $totalMemGB) * 100, 2))%`n"
-        } catch {
+        }
+        catch {
             $report += "Error retrieving memory information`n"
         }
         
@@ -5099,30 +5383,33 @@ Computer: $($env:COMPUTERNAME)
             $report += "Name: $($cpu.Name)`n"
             $report += "Cores: $($cpu.NumberOfCores)`n"
             $report += "Logical Processors: $($cpu.NumberOfLogicalProcessors)`n"
-        } catch {
+        }
+        catch {
             $report += "Error retrieving CPU information`n"
         }
         
         $report += "`n--- DISK SPACE ---`n"
         try {
-            $volumes = Get-Volume -ErrorAction Stop | Where-Object {$_.DriveLetter -ne $null}
+            $volumes = Get-Volume -ErrorAction Stop | Where-Object { $null -ne $_.DriveLetter -and $_.Size -gt 0 }
             foreach ($vol in $volumes) {
                 $freeGB = [math]::Round($vol.SizeRemaining / 1GB, 2)
                 $totalGB = [math]::Round($vol.Size / 1GB, 2)
                 $usedPercent = [math]::Round((($vol.Size - $vol.SizeRemaining) / $vol.Size) * 100, 2)
                 $report += "Drive $($vol.DriveLetter): $($usedPercent)% used - $($freeGB) GB free of $($totalGB) GB`n"
             }
-        } catch {
+        }
+        catch {
             $report += "Error retrieving disk information`n"
         }
         
         $report += "`n--- NETWORK ADAPTERS ---`n"
         try {
-            $adapters = Get-NetAdapter -ErrorAction Stop | Where-Object {$_.Status -eq "Up"}
+            $adapters = Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
             foreach ($adapter in $adapters) {
                 $report += "$($adapter.Name): $($adapter.Status) - $($adapter.LinkSpeed)`n"
             }
-        } catch {
+        }
+        catch {
             $report += "Error retrieving network adapter information`n"
         }
         
@@ -5141,15 +5428,17 @@ Computer: $($env:COMPUTERNAME)
         
         $report += "`n--- STOPPED AUTOMATIC SERVICES ---`n"
         try {
-            $stoppedServices = Get-Service -ErrorAction Stop | Where-Object {$_.StartType -eq "Automatic" -and $_.Status -ne "Running"}
+            $stoppedServices = Get-Service -ErrorAction Stop | Where-Object { $_.StartType -eq "Automatic" -and $_.Status -ne "Running" }
             if ($stoppedServices) {
                 foreach ($svc in $stoppedServices) {
                     $report += "$($svc.Name): $($svc.Status)`n"
                 }
-            } else {
+            }
+            else {
                 $report += "All automatic services are running`n"
             }
-        } catch {
+        }
+        catch {
             $report += "Error retrieving service information`n"
         }
         
@@ -5157,7 +5446,8 @@ Computer: $($env:COMPUTERNAME)
         try {
             $powerPlan = powercfg /getactivescheme
             $report += "$($powerPlan)`n"
-        } catch {
+        }
+        catch {
             $report += "Error retrieving power plan information`n"
         }
         
@@ -5168,11 +5458,13 @@ Computer: $($env:COMPUTERNAME)
         if ($open -eq "Y") {
             try {
                 notepad $reportPath
-            } catch {
+            }
+            catch {
                 Write-Warning "Could not open report automatically. Please navigate to: $($reportPath)"
             }
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to generate system report: $($_.Exception.Message)"
     }
 }
@@ -5182,12 +5474,12 @@ Computer: $($env:COMPUTERNAME)
 function Show-MainMenu {
     Clear-Host
     Write-Host @"
-╔═══════════════════════════════════════════════════════════════╗
-║                                                               ║
-║     WINDOWS SERVER TROUBLESHOOTING & LOG COLLECTION TOOL      ║
-║                         Version 2.1                           ║
-║                                                               ║
-╚═══════════════════════════════════════════════════════════════╝
++===============================================================+
+|                                                               |
+|     WINDOWS SERVER TROUBLESHOOTING & LOG COLLECTION TOOL      |
+|                         Version 2.1                           |
+|                                                               |
++===============================================================+
 "@ -ForegroundColor Cyan
 
     Write-Host "`nPRIMARY DIAGNOSTICS:" -ForegroundColor Yellow
@@ -5214,7 +5506,7 @@ function Show-MainMenu {
     
     Write-Host "`n  0. Exit" -ForegroundColor Red
     
-    Write-Host "`n" + "═" * 65 -ForegroundColor Cyan
+    Write-Host ("`n" + ("=" * 65)) -ForegroundColor Cyan
 }
 
 function Start-TroubleshootingTool {
@@ -5243,7 +5535,8 @@ function Start-TroubleshootingTool {
         try {
             Start-Transcript -Path $transcriptPath -ErrorAction Stop
             Write-Success "Transcript logging enabled: $($transcriptPath)"
-        } catch {
+        }
+        catch {
             Write-Warning "Could not start transcript logging: $($_.Exception.Message)"
             $EnableLogging = $false
         }
@@ -5351,15 +5644,18 @@ function Start-TroubleshootingTool {
             }
             
         } while ($choice -ne "0")
-    } catch {
+    }
+    catch {
         Write-Error "An unexpected error occurred: $($_.Exception.Message)"
         Write-Info "Stack Trace: $($_.ScriptStackTrace)"
-    } finally {
+    }
+    finally {
         if ($EnableLogging -and $transcriptPath) {
             try {
                 Stop-Transcript
                 Write-Success "Transcript saved to: $($transcriptPath)"
-            } catch {
+            }
+            catch {
                 Write-Warning "Could not stop transcript: $($_.Exception.Message)"
             }
         }
@@ -5370,7 +5666,8 @@ function Start-TroubleshootingTool {
 #region Script Entry Point
 if ($EnableLogging) {
     Start-TroubleshootingTool -EnableLogging
-} else {
+}
+else {
     Start-TroubleshootingTool
 }
 #endregion
