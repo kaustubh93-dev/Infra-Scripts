@@ -4166,6 +4166,155 @@ function Test-IISHealth {
     catch {
         Write-DiagError "Error checking worker processes: $($_.Exception.Message)"
     }
+
+    # 5. Check AppPool Identities & Permissions
+    Write-Info "`nChecking AppPool Identities & Permissions..."
+    try {
+        if ($appPools) {
+            foreach ($pool in $appPools) {
+                if ($pool.processModel.identityType -eq 'SpecificUser') {
+                    $userName = $pool.processModel.userName
+                    Write-Info "AppPool '$($pool.Name)' uses custom identity: $userName"
+                    # Check if it's a local user and warn
+                    if ($userName -match "^[^\\]+$" -or $userName -match "^\.\\") {
+                        $cleanName = $userName -replace "^\.\\", ""
+                        $localUser = Get-LocalUser -Name $cleanName -ErrorAction SilentlyContinue
+                        if ($localUser) {
+                            Write-Success "Local user account '$cleanName' exists."
+                        }
+                        else {
+                            Write-DiagWarning "Local user account '$cleanName' not found. AppPool may fail to start."
+                        }
+                    }
+                    else {
+                        Write-Info "Domain/External account detected. Ensure password is not expired and account has 'Log on as a batch job' rights."
+                    }
+                }
+                else {
+                    # Built-in identity
+                    Write-Success "AppPool '$($pool.Name)' uses built-in identity ($($pool.processModel.identityType))."
+                }
+            }
+        }
+        else {
+            Write-Info "No Application Pools to check identities for."
+        }
+    }
+    catch {
+        Write-DiagError "Error checking AppPool identities: $($_.Exception.Message)"
+    }
+
+    # 6. Check Site Authentication Methods
+    Write-Info "`nChecking Site Authentication Methods..."
+    try {
+        if ($sites) {
+            foreach ($site in $sites) {
+                $siteName = $site.Name
+                $authMethods = @()
+                
+                $anon = Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/anonymousAuthentication' -Name enabled -PSPath "IIS:\Sites\$siteName" -ErrorAction SilentlyContinue
+                if ($anon -and $anon.Value -eq $true) { $authMethods += "Anonymous" }
+                
+                $basic = Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/basicAuthentication' -Name enabled -PSPath "IIS:\Sites\$siteName" -ErrorAction SilentlyContinue
+                if ($basic -and $basic.Value -eq $true) { $authMethods += "Basic" }
+                
+                $win = Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' -Name enabled -PSPath "IIS:\Sites\$siteName" -ErrorAction SilentlyContinue
+                if ($win -and $win.Value -eq $true) { $authMethods += "Windows" }
+                
+                if ($authMethods.Count -gt 0) {
+                    Write-Info "Site '$siteName' enabled authentication: $($authMethods -join ', ')"
+                }
+                else {
+                    Write-DiagWarning "Site '$siteName' has no primary authentication methods enabled (or could not read config)."
+                }
+            }
+        }
+    }
+    catch {
+        Write-DiagError "Error checking authentication: $($_.Exception.Message)"
+    }
+
+    # 7. Check SSL/TLS Certificate Validation
+    Write-Info "`nChecking SSL/TLS Certificates..."
+    try {
+        if ($sites) {
+            $checkedHashes = @()
+            foreach ($site in $sites) {
+                # Look for https bindings
+                $httpsBindings = $site.bindings.Collection | Where-Object { $_.protocol -eq 'https' }
+                foreach ($binding in $httpsBindings) {
+                    $hashStr = ""
+                    if ($null -ne $binding.certificateHash) {
+                        if ($binding.certificateHash -is [byte[]]) {
+                            $hashStr = ($binding.certificateHash | ForEach-Object { $_.ToString("X2") }) -join ""
+                        }
+                        else {
+                            $hashStr = $binding.certificateHash.ToString() -replace " ", ""
+                        }
+                    }
+                    
+                    if ($hashStr) {
+                        if ($checkedHashes -notcontains $hashStr) {
+                            $checkedHashes += $hashStr
+                             
+                            # Search local machine stores
+                            $cert = Get-ChildItem -Path Cert:\LocalMachine\My, Cert:\LocalMachine\WebHosting -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $hashStr } | Select-Object -First 1
+                             
+                            if ($cert) {
+                                $daysRemaining = ($cert.NotAfter - (Get-Date)).Days
+                                if ($daysRemaining -lt 0) {
+                                    Write-DiagError "Certificate for '$($site.Name)' is EXPIRED! (Thumbprint: $hashStr, Expired on: $($cert.NotAfter))"
+                                }
+                                elseif ($daysRemaining -lt 30) {
+                                    Write-DiagWarning "Certificate for '$($site.Name)' expires in $daysRemaining days. (Expires: $($cert.NotAfter))"
+                                }
+                                else {
+                                    Write-Success "Certificate for '$($site.Name)' is valid ($daysRemaining days remaining)."
+                                }
+                            }
+                            else {
+                                Write-DiagWarning "Bound certificate for '$($site.Name)' (Thumbprint: $hashStr) not found in Local Machine stores. (Check binding correctness)"
+                            }
+                        }
+                    }
+                }
+            }
+            if ($checkedHashes.Count -eq 0) {
+                Write-Info "No HTTPS bindings found."
+            }
+        }
+    }
+    catch {
+        Write-DiagError "Error checking certificates: $($_.Exception.Message)"
+    }
+
+    # 8. Check IP Restrictions
+    Write-Info "`nChecking IP Security Restrictions..."
+    try {
+        if ($sites) {
+            foreach ($site in $sites) {
+                $siteName = $site.Name
+                $ipSec = Get-WebConfigurationProperty -Filter 'system.webServer/security/ipSecurity' -Name allowUnlisted -PSPath "IIS:\Sites\$siteName" -ErrorAction SilentlyContinue
+                if ($ipSec -and $ipSec.Value -eq $false) {
+                    Write-DiagWarning "Site '$siteName' has 'allowUnlisted' IP security set to FALSE. Unlisted IPs are blocked."
+                }
+                else {
+                    # Check for explicit deny rules
+                    $denyRules = Get-WebConfiguration -Filter 'system.webServer/security/ipSecurity/add[@allowed="false"]' -PSPath "IIS:\Sites\$siteName" -ErrorAction SilentlyContinue
+                    if ($denyRules) {
+                        $count = @($denyRules).Count
+                        Write-DiagWarning "Site '$siteName' has $count explicit IP deny rules configured."
+                    }
+                    else {
+                        Write-Success "Site '$siteName' has no primary IP restrictions blocking unlisted traffic."
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        Write-DiagError "Error checking IP restrictions: $($_.Exception.Message)"
+    }
 }
 #endregion
 
