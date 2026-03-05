@@ -1,4 +1,4 @@
-# Windows Server Troubleshooting & Log Collection Tool
+# Windows Server Troubleshooting & Log Collection Tool (WSTT)
 
 ## Overview
 
