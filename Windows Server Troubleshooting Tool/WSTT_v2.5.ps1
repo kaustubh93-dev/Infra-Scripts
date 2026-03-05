@@ -4025,6 +4025,150 @@ function Get-DotNetFrameworkVersion {
 }
 #endregion
 
+#region IIS Diagnostics
+function Test-IISHealth {
+    <#
+    .SYNOPSIS
+        Performs comprehensive IIS health checks
+    .DESCRIPTION
+        Checks IIS services, AppPools, Websites, and Worker Processes.
+    #>
+    Write-Header "IIS Health Diagnostics"
+    
+    # Check if we can determine if IIS is installed (WindowsFeature module might not be available everywhere, so wrap it or ignore)
+    try {
+        if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
+            $iisInstalled = Get-WindowsFeature -Name Web-Server -ErrorAction Stop
+            if (-not $iisInstalled -or $iisInstalled.Installed -eq $false) {
+                Write-DiagWarning "IIS Web-Server role is not installed."
+                return
+            }
+        }
+    }
+    catch {}
+    
+    # Import WebAdministration
+    try {
+        Import-Module WebAdministration -ErrorAction Stop
+    }
+    catch {
+        Write-DiagWarning "Could not import WebAdministration module. IIS feature may be missing or corrupt (Requires PowerShell 5.1/Windows). Execute from 64-bit PowerShell if possible."
+        return
+    }
+
+    # 1. Check IIS Services
+    Write-Info "`nChecking IIS Core Services Status..."
+    $iisServices = @("W3SVC", "WAS", "IISADMIN")
+    foreach ($svc in $iisServices) {
+        try {
+            $service = Get-Service -Name $svc -ErrorAction SilentlyContinue
+            if ($service) {
+                if ($service.Status -eq 'Running') {
+                    Write-Success "Service '$svc' is Running."
+                }
+                else {
+                    Write-DiagWarning "Service '$svc' is $($service.Status)."
+                }
+            }
+            else {
+                Write-DiagWarning "Service '$svc' not found."
+            }
+        }
+        catch {
+            Write-DiagWarning "Failed to query service '$svc'."
+        }
+    }
+
+    # 2. Check AppPools
+    Write-Info "`nChecking Application Pools..."
+    try {
+        if (Test-Path "IIS:\AppPools") {
+            $appPools = Get-ChildItem "IIS:\AppPools" -ErrorAction SilentlyContinue
+            if ($appPools) {
+                foreach ($pool in $appPools) {
+                    $state = $pool.state
+                    $identity = $pool.processModel.identityType
+                    if ($state -eq 'Started') {
+                        Write-Success "AppPool: $($pool.Name) | State: $state | Identity: $identity"
+                    }
+                    else {
+                        Write-DiagWarning "AppPool: $($pool.Name) | State: $state | Identity: $identity"
+                    }
+                }
+            }
+            else {
+                Write-Info "No Application Pools found."
+            }
+        }
+        else {
+            Write-DiagWarning "IIS:\AppPools path not found. Is IIS configured correctly?"
+        }
+    }
+    catch {
+        Write-DiagError "Error checking Application Pools: $($_.Exception.Message)"
+    }
+
+    # 3. Check Websites
+    Write-Info "`nChecking Websites..."
+    try {
+        if (Test-Path "IIS:\Sites") {
+            $sites = Get-ChildItem "IIS:\Sites" -ErrorAction SilentlyContinue
+            if ($sites) {
+                foreach ($site in $sites) {
+                    $state = $site.state
+                    $bindings = ($site.bindings.Collection | ForEach-Object { "$($_.protocol)://$($_.bindingInformation)" }) -join ", "
+                    $path = $site.physicalPath
+                    if ($state -eq 'Started') {
+                        Write-Success "Site: $($site.Name) | State: $state | Bindings: $bindings | Path: $path"
+                    }
+                    else {
+                        Write-DiagWarning "Site: $($site.Name) | State: $state | Bindings: $bindings | Path: $path"
+                    }
+                }
+            }
+            else {
+                Write-Info "No Websites found."
+            }
+        }
+    }
+    catch {
+        Write-DiagError "Error checking Websites: $($_.Exception.Message)"
+    }
+
+    # 4. Check Worker Processes
+    Write-Info "`nChecking IIS Worker Processes (w3wp.exe)..."
+    try {
+        $w3wps = Get-Process -Name w3wp -ErrorAction SilentlyContinue
+        if ($w3wps) {
+            foreach ($wp in $w3wps) {
+                # Attempt to get the AppPool Name from CommandLine
+                $appPoolName = "Unknown"
+                try {
+                    $wmiProc = Get-WmiObject Win32_Process -Filter "ProcessId = $($wp.Id)" -ErrorAction Stop
+                    if ($wmiProc.CommandLine -match "-ap `"(?<AppPool>[^`"]+)`"") {
+                        $appPoolName = $Matches['AppPool']
+                    }
+                    elseif ($wmiProc.CommandLine -match "-ap (?<AppPool>\S+)") {
+                        $appPoolName = $Matches['AppPool']
+                    }
+                }
+                catch {}
+                
+                $memMB = [math]::Round($wp.WorkingSet / 1MB, 2)
+                $cpuStr = if ($wp.CPU) { [math]::Round($wp.CPU, 2) } else { "N/A" }
+                Write-Info "PID: $($wp.Id) | AppPool: $appPoolName | Memory: $memMB MB | CPU Time: $cpuStr sec"
+            }
+        }
+        else {
+            Write-Info "No w3wp.exe worker processes currently running."
+        }
+    }
+    catch {
+        Write-DiagError "Error checking worker processes: $($_.Exception.Message)"
+    }
+}
+#endregion
+
 #region Main Menu and Execution
 function Show-MainMenu {
     <#
@@ -4069,6 +4213,7 @@ UTILITIES:" -ForegroundColor Yellow
     Write-Host " 15. Configure TSS Path" -ForegroundColor White
     Write-Host " 16. Check TSS Status" -ForegroundColor White
     Write-Host " 17. Check .NET Framework Versions" -ForegroundColor White
+    Write-Host " 18. IIS Troubleshooting & Diagnostics" -ForegroundColor White
     
     Write-Host "
   0. Exit" -ForegroundColor Red
@@ -4127,7 +4272,7 @@ function Start-TroubleshootingTool {
     try {
         do {
             Show-MainMenu
-            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-17)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17")
+            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-18)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18")
             
             switch ($choice) {
                 "1" {
@@ -4220,6 +4365,10 @@ function Start-TroubleshootingTool {
                 "17" {
                     Clear-Host
                     Get-DotNetFrameworkVersion
+                }
+                "18" {
+                    Clear-Host
+                    Test-IISHealth
                 }
                 "0" {
                     Write-Host "`nExiting... Thank you for using the troubleshooting tool!" -ForegroundColor Cyan
