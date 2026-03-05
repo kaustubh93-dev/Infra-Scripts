@@ -3896,6 +3896,133 @@ Computer: $($env:COMPUTERNAME)
         Write-DiagError "Failed to generate system report: $($_.Exception.Message)"
     }
 }
+
+function Get-DotNetFrameworkVersion {
+    <#
+    .SYNOPSIS
+        Gets installed .NET Framework and .NET Core versions
+    .DESCRIPTION
+        Scans registry and outputs all installed versions of .NET framework
+    #>
+    Write-Header "Checking .NET Framework Versions"
+    
+    $now = Get-Date
+
+    try {
+        $release = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction SilentlyContinue).Release
+    }
+    catch {
+        $release = $null
+    }
+
+    $OSVersion = switch ($release) {
+        { $_ -ge 533325 } { ".NET Framework 4.8.1"; break }
+        { $_ -ge 528040 } { ".NET Framework 4.8"; break }
+        { $_ -ge 461808 } { ".NET Framework 4.7.2"; break }
+        { $_ -ge 461308 } { ".NET Framework 4.7.1"; break }
+        { $_ -ge 460798 } { ".NET Framework 4.7"; break }
+        { $_ -ge 394802 } { ".NET Framework 4.6.2"; break }
+        { $_ -ge 394254 } { ".NET Framework 4.6.1"; break }
+        { $_ -ge 393295 } { ".NET Framework 4.6"; break }
+        { $_ -ge 379893 } { ".NET Framework 4.5.2"; break }
+        { $_ -ge 378675 } { ".NET Framework 4.5.1"; break }
+        { $_ -ge 378389 } { ".NET Framework 4.5"; break }
+        default { "No .NET Framework 4.5+ detected" }
+    }
+
+    $list = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP' -Recurse -ErrorAction SilentlyContinue |
+    Get-ItemProperty -Name Version, Release -ErrorAction SilentlyContinue |
+    Select-Object @{Name = 'Framework'; Expression = { $_.PSChildName } }, Version, Release |
+    Sort-Object Framework, Version, Release;
+
+    $Result = foreach ($item in $list) {
+        [pscustomobject]@{
+            Product   = '.NET Framework'
+            Framework = $item.Framework
+            Version   = $item.Version
+            Release   = $item.Release
+        }
+    }
+
+    $Result += [pscustomobject]@{
+        Product   = '.NET Framework OS Default'
+        Framework = $OSVersion
+        Version   = $release
+        Release   = ''
+    }
+
+    $registryPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    
+    $programs = @()
+
+    foreach ($path in $registryPaths) {
+        if (Test-Path $path) {
+            $programs += Get-ItemProperty $path -ErrorAction SilentlyContinue |
+            Select-Object DisplayName, DisplayVersion, Publisher, InstallDate
+        }
+    }
+
+    $programs = $programs | Where-Object { $_.DisplayName -and $_.DisplayName.Trim() -like "*Core Runtime*" } | Sort-Object DisplayName
+
+    if ($programs) {
+        $Result += foreach ($item in $programs) {
+            [pscustomobject]@{
+                Product   = '.NET Core'
+                Framework = $item.DisplayName
+                Version   = $item.DisplayVersion
+                Release   = ''
+            }
+        }
+    }
+
+    $Result | Format-Table -AutoSize
+    
+    Write-Info "`n"
+    $export = Get-ValidatedChoice -Prompt "Export .NET versions report to CSV? (Y/N)" -ValidChoices @("Y", "N")
+    if ($export -eq "Y") {
+        $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $reportPath = Join-Path $script:DefaultLogPath "DotNetVersions_$($timestamp).csv"
+        
+        if (-not (Test-PathValid -Path $script:DefaultLogPath -CreateIfNotExist)) {
+            Write-DiagError "Cannot create report directory"
+            return
+        }
+        
+        # Add metadata for CSV
+        $CsvResult = foreach ($item in $Result) {
+            [pscustomobject]@{
+                ComputerName = $env:COMPUTERNAME
+                Timestamp    = $now.ToString('yyyy/MM/dd HH:mm:ss')
+                Product      = $item.Product
+                Framework    = $item.Framework
+                Version      = $item.Version
+                Release      = $item.Release
+            }
+        }
+        
+        try {
+            $CsvResult | ConvertTo-Csv -NoTypeInformation | Out-File -FilePath $reportPath -Encoding UTF8 -ErrorAction Stop
+            Write-Success "Report generated: $($reportPath)"
+            
+            $open = Get-ValidatedChoice -Prompt "Open report? (Y/N)" -ValidChoices @("Y", "N")
+            if ($open -eq "Y") {
+                try {
+                    notepad $reportPath
+                }
+                catch {
+                    Write-DiagWarning "Could not open report automatically."
+                }
+            }
+        }
+        catch {
+            Write-DiagError "Failed to generate .NET versions report: $($_.Exception.Message)"
+        }
+    }
+}
 #endregion
 
 #region Main Menu and Execution
@@ -3941,6 +4068,7 @@ UTILITIES:" -ForegroundColor Yellow
     Write-Host " 14. Validator Script Information" -ForegroundColor White
     Write-Host " 15. Configure TSS Path" -ForegroundColor White
     Write-Host " 16. Check TSS Status" -ForegroundColor White
+    Write-Host " 17. Check .NET Framework Versions" -ForegroundColor White
     
     Write-Host "
   0. Exit" -ForegroundColor Red
@@ -3999,7 +4127,7 @@ function Start-TroubleshootingTool {
     try {
         do {
             Show-MainMenu
-            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-16)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16")
+            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-17)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17")
             
             switch ($choice) {
                 "1" {
@@ -4088,6 +4216,10 @@ function Start-TroubleshootingTool {
                 "16" {
                     Clear-Host
                     $null = Test-TSSAvailable
+                }
+                "17" {
+                    Clear-Host
+                    Get-DotNetFrameworkVersion
                 }
                 "0" {
                     Write-Host "`nExiting... Thank you for using the troubleshooting tool!" -ForegroundColor Cyan
