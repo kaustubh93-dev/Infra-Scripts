@@ -7,11 +7,12 @@
 .PARAMETER EnableLogging
     Enables transcript logging of the entire session
 .EXAMPLE
-    .\WindowsServertroubleshootingtool_v2.5.ps1
-    .\WindowsServertroubleshootingtool_v2.5.ps1 -EnableLogging
+    .\WSTT_v3.0.ps1
+    .\WSTT_v3.0.ps1 -EnableLogging
 .NOTES
-    Version: 2.5
+    Version: 3.0
     Requires: Administrator privileges
+    v3.0: Added 15 new network diagnostic checks (gateway, duplex, MTU, offload, routing, etc.)
     Enhanced with improved error handling, validation, and best practices
 #>
 
@@ -50,6 +51,15 @@ Set-Variable -Name MONITORING_AGENT_CPU_WARNING -Value 50 -Option ReadOnly -Forc
 Set-Variable -Name JAVA_CPU_WARNING_SECONDS -Value 100 -Option ReadOnly -Force
 Set-Variable -Name SPLIT_IO_WARNING_THRESHOLD -Value 100 -Option ReadOnly -Force
 Set-Variable -Name DISK_QUEUE_WARNING_THRESHOLD -Value 2 -Option ReadOnly -Force
+Set-Variable -Name PAGED_POOL_CRITICAL_MB -Value 400 -Option ReadOnly -Force
+Set-Variable -Name PAGED_POOL_WARNING_MB -Value 300 -Option ReadOnly -Force
+Set-Variable -Name AVAILABLE_MB_CRITICAL -Value 500 -Option ReadOnly -Force
+Set-Variable -Name AVAILABLE_MB_WARNING -Value 1024 -Option ReadOnly -Force
+Set-Variable -Name HANDLE_LEAK_WARNING -Value 10000 -Option ReadOnly -Force
+Set-Variable -Name THREAD_LEAK_WARNING -Value 500 -Option ReadOnly -Force
+Set-Variable -Name WS_TRIM_WARNING_THRESHOLD -Value 1000 -Option ReadOnly -Force
+Set-Variable -Name PAGEFILE_USAGE_WARNING_PERCENT -Value 70 -Option ReadOnly -Force
+Set-Variable -Name PAGEFILE_USAGE_CRITICAL_PERCENT -Value 90 -Option ReadOnly -Force
 
 # Path Configuration
 $script:TempBasePath = Join-Path $env:TEMP "ServerDiagnostics"
@@ -119,6 +129,18 @@ function Write-Header {
     Write-Host "========================================" -ForegroundColor Cyan
 }
 
+function Write-Section {
+    <#
+    .SYNOPSIS
+        Displays a section divider with title for readable output grouping
+    .PARAMETER Text
+        The section title
+    #>
+    param([string]$Text)
+    Write-Host ""
+    Write-Host "--- $Text ---" -ForegroundColor DarkCyan
+}
+
 function Write-Success {
     <#
     .SYNOPSIS
@@ -150,8 +172,7 @@ function Write-DiagError {
         The error message to display
     #>
     param([string]$Text)
-    # Forward to the built-in error cmdlet to preserve error records and streams
-    Microsoft.PowerShell.Utility\Write-Error -Message $Text
+    Write-Host "[ERROR] $($Text)" -ForegroundColor Red
 }
 
 function Write-Info {
@@ -575,7 +596,9 @@ function Test-NetworkConfiguration {
         Performs comprehensive network configuration diagnostics
     .DESCRIPTION
         Checks RSS status, ephemeral port usage, VMQ settings, adapter properties,
-        power plan, and network statistics
+        power plan, network statistics, default gateway, link speed/duplex, TCP offload,
+        MTU/jumbo frames, DNS suffix, WINS, proxy, NIC drivers, binding order, firewall
+        rules, RDMA/SMB Direct, TCP parameters, NIC error events, and routing table
     .EXAMPLE
         Test-NetworkConfiguration
     .NOTES
@@ -615,7 +638,7 @@ function Test-NetworkConfiguration {
     }
      
     # Ephemeral Port Usage (Port Exhaustion)
-    Write-Info "`nChecking TCP Ephemeral Ports:"
+    Write-Section "TCP Ephemeral Ports"
     try {
         $tcpParams = Get-NetTCPSetting -SettingName "Internet" -ErrorAction Stop
         $maxPorts = $tcpParams.DynamicPortRangeNumberOfPorts
@@ -646,7 +669,7 @@ function Test-NetworkConfiguration {
     }
 
     # Check VMQ (Virtual Machine Queue) Status
-    Write-Info "`nChecking VMQ Status (Relevant for Hyper-V Hosts):"
+    Write-Section "VMQ Status (Relevant for Hyper-V Hosts)"
     try {
         $vmq = Get-NetAdapterVmq -ErrorAction SilentlyContinue
         if ($vmq) {
@@ -666,7 +689,7 @@ function Test-NetworkConfiguration {
     }
 
     # Check Network Adapter Advanced Properties
-    Write-Info "`nChecking Network Adapter Buffer Settings..."
+    Write-Section "Network Adapter Buffer Settings"
     if ($activeAdapters) {
         foreach ($adapter in $activeAdapters) {
             Write-Info "`nAdapter: $($adapter.Name)"
@@ -703,7 +726,7 @@ function Test-NetworkConfiguration {
     }
     
     # Check Power Plan
-    Write-Info "`nChecking Power Plan..."
+    Write-Section "Power Plan"
     try {
         $powerPlan = powercfg /getactivescheme
         if ($powerPlan -like "*High performance*") {
@@ -720,7 +743,7 @@ function Test-NetworkConfiguration {
     }
     
     # Network Statistics (reuses cached $activeAdapters)
-    Write-Info "`nNetwork Interface Statistics:"
+    Write-Section "Network Interface Statistics"
     if ($activeAdapters) {
         foreach ($adpt in $activeAdapters) {
             try {
@@ -741,7 +764,7 @@ function Test-NetworkConfiguration {
     }
 
     # Packet Discards (vmxnet3 alert) — reuses cached $activeAdapters
-    Write-Info "`nChecking Packet Discards..."
+    Write-Section "Packet Discards"
     if ($activeAdapters) {
         foreach ($adpt in $activeAdapters) {
             try {
@@ -762,7 +785,7 @@ function Test-NetworkConfiguration {
     }
 
     # Port Reachability (self-telnet) — uses TcpClient with 2s timeout instead of Test-NetConnection
-    Write-Info "`nPort Reachability (localhost):"
+    Write-Section "Port Reachability (localhost)"
     foreach ($portDef in $script:CommonPorts) {
         try {
             $tcpClient = New-Object System.Net.Sockets.TcpClient
@@ -784,7 +807,7 @@ function Test-NetworkConfiguration {
     }
 
     # NIC Teaming / Dual MAC Detection
-    Write-Info "`nNIC Teaming Configuration:"
+    Write-Section "NIC Teaming Configuration"
     try {
         $teams = Get-NetLbfoTeam -ErrorAction SilentlyContinue
         if ($teams) {
@@ -808,7 +831,7 @@ function Test-NetworkConfiguration {
     }
 
     # WAN Heartbeat / Cluster Link Flapping
-    Write-Info "`nChecking for WAN/Heartbeat Loss Events (last 24h):"
+    Write-Section "WAN/Heartbeat Loss Events (last 24h)"
     try {
         $heartbeatEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -829,6 +852,515 @@ function Test-NetworkConfiguration {
     catch {
         Write-Info "  Could not query heartbeat events (Failover Clustering may not be installed)"
     }
+
+    #region v3.0 Network Checks
+
+    # 1. Default Gateway Reachability
+    Write-Section "Default Gateway Reachability"
+    try {
+        $gateways = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop
+        if ($gateways) {
+            foreach ($gw in $gateways) {
+                $gwIP = $gw.NextHop
+                $ifIndex = $gw.InterfaceIndex
+                $ifAlias = (Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.ifIndex -eq $ifIndex }).Name
+                if ([string]::IsNullOrWhiteSpace($ifAlias)) { $ifAlias = "ifIndex $ifIndex" }
+                try {
+                    $ping = Test-Connection -ComputerName $gwIP -Count 2 -ErrorAction Stop
+                    $avgMs = [math]::Round(($ping.ResponseTime | Measure-Object -Average).Average, 1)
+                    if ($avgMs -lt 5) {
+                        Write-Success "  Gateway $gwIP ($ifAlias): Reachable (avg ${avgMs}ms)"
+                    }
+                    elseif ($avgMs -lt 50) {
+                        Write-Info "  Gateway $gwIP ($ifAlias): Reachable (avg ${avgMs}ms)"
+                    }
+                    else {
+                        Write-DiagWarning "  Gateway $gwIP ($ifAlias): Reachable but HIGH latency (avg ${avgMs}ms)"
+                    }
+                }
+                catch {
+                    Write-DiagError "  Gateway $gwIP ($ifAlias): NOT Reachable!"
+                }
+            }
+        }
+        else {
+            Write-DiagWarning "  No default gateway configured"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not retrieve default gateway: $($_.Exception.Message)"
+    }
+
+    # 2. Duplicate IP Detection
+    Write-Section "Duplicate IP Detection"
+    try {
+        $ipAddresses = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+            Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' }
+        $duplicateFound = $false
+        foreach ($ip in $ipAddresses) {
+            try {
+                $arpResult = arp -a $ip.IPAddress 2>&1
+                $arpEntries = $arpResult | Select-String '([0-9a-fA-F]{2}-){5}[0-9a-fA-F]{2}'
+                $uniqueMACs = $arpEntries | ForEach-Object {
+                    if ($_ -match '(([0-9a-fA-F]{2}-){5}[0-9a-fA-F]{2})') { $Matches[0] }
+                } | Select-Object -Unique
+                if ($uniqueMACs -and @($uniqueMACs).Count -gt 1) {
+                    $duplicateFound = $true
+                    Write-DiagError "  DUPLICATE IP DETECTED: $($ip.IPAddress) has multiple MAC addresses!"
+                    foreach ($mac in $uniqueMACs) {
+                        Write-DiagWarning "    MAC: $mac"
+                    }
+                }
+            }
+            catch { }
+        }
+        if (-not $duplicateFound) {
+            Write-Success "  No duplicate IP addresses detected"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not perform duplicate IP detection: $($_.Exception.Message)"
+    }
+
+    # 3. Network Adapter Link Speed & Duplex
+    Write-Section "Adapter Link Speed & Duplex"
+    if ($activeAdapters) {
+        foreach ($adpt in $activeAdapters) {
+            $linkSpeed = $adpt.LinkSpeed
+            Write-Info "  $($adpt.Name): Link Speed = $linkSpeed"
+            try {
+                $duplexProp = Get-NetAdapterAdvancedProperty -Name $adpt.Name -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DisplayName -like "*Duplex*" -or $_.RegistryKeyword -like "*SpeedDuplex*" }
+                if ($duplexProp) {
+                    $duplexValue = $duplexProp.DisplayValue
+                    Write-Info "    Duplex Setting: $duplexValue"
+                    if ($duplexValue -like "*Half*") {
+                        Write-DiagError "    HALF DUPLEX detected - this causes severe packet loss and retransmissions!"
+                    }
+                }
+            }
+            catch { }
+            if ($linkSpeed -match '100\s*(Mbps|M)' -and $adpt.DriverDescription -notlike '*Virtual*') {
+                Write-DiagWarning "    WARNING: 100 Mbps link speed on physical adapter - possible autonegotiation failure"
+            }
+        }
+    }
+
+    # 4. TCP Chimney / Task Offload Status
+    Write-Section "TCP Offload Settings"
+    try {
+        $offload = Get-NetOffloadGlobalSetting -ErrorAction Stop
+        Write-Info "  Chimney Offload: $($offload.Chimney)"
+        Write-Info "  Receive Side Coalescing: $($offload.ReceiveSegmentCoalescing)"
+        Write-Info "  Network Direct (RDMA): $($offload.NetworkDirect)"
+        Write-Info "  Task Offload: $($offload.TaskOffload)"
+        Write-Info "  Packet Coalescing Filter: $($offload.PacketCoalescingFilter)"
+
+        if ($offload.Chimney -eq 'Enabled') {
+            Write-DiagWarning "  TCP Chimney is ENABLED - this can cause issues with some NIC drivers"
+            Write-Info "  Disable: Set-NetOffloadGlobalSetting -Chimney Disabled"
+        }
+        if ($offload.TaskOffload -eq 'Disabled') {
+            Write-DiagWarning "  Task Offload is DISABLED - CPU will handle all checksum/segmentation work"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not retrieve TCP offload settings: $($_.Exception.Message)"
+    }
+
+    # Per-adapter offload
+    if ($activeAdapters) {
+        foreach ($adpt in $activeAdapters) {
+            try {
+                $adapterOffload = Get-NetAdapterChecksumOffload -Name $adpt.Name -ErrorAction SilentlyContinue
+                if ($adapterOffload) {
+                    $txEnabled = $adapterOffload.TcpIPv4Checksum
+                    $rxEnabled = $adapterOffload.UdpIPv4Checksum
+                    if ($txEnabled -eq 'Disabled' -or $rxEnabled -eq 'Disabled') {
+                        Write-DiagWarning "  $($adpt.Name): Some checksum offloads are DISABLED (TCP=$txEnabled, UDP=$rxEnabled)"
+                    }
+                }
+            }
+            catch { }
+        }
+    }
+
+    # 5. MTU / Jumbo Frames Consistency
+    Write-Section "MTU Configuration"
+    try {
+        $mtuSettings = Get-NetIPInterface -AddressFamily IPv4 -ErrorAction Stop |
+            Where-Object { $_.ConnectionState -eq 'Connected' } |
+            Select-Object InterfaceAlias, NlMtu
+        $mtuValues = @()
+        foreach ($iface in $mtuSettings) {
+            Write-Info "  $($iface.InterfaceAlias): MTU = $($iface.NlMtu)"
+            $mtuValues += $iface.NlMtu
+            if ($iface.NlMtu -gt 1500) {
+                Write-Info "    Jumbo Frames enabled (MTU > 1500)"
+            }
+        }
+        $uniqueMTUs = $mtuValues | Select-Object -Unique
+        if (@($uniqueMTUs).Count -gt 1) {
+            Write-DiagWarning "  INCONSISTENT MTU values detected across interfaces: $($uniqueMTUs -join ', ')"
+            Write-Info "  MTU mismatch can cause fragmentation, black-holed packets, and path MTU discovery failures"
+        }
+        else {
+            Write-Success "  MTU is consistent across all connected interfaces ($($uniqueMTUs[0]))"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check MTU settings: $($_.Exception.Message)"
+    }
+
+    # 6. DNS Suffix & Search Order
+    Write-Section "DNS Suffix Configuration"
+    try {
+        $dnsGlobal = Get-DnsClientGlobalSetting -ErrorAction Stop
+        Write-Info "  Primary DNS Suffix: $(if ($dnsGlobal.SuffixSearchList.Count -gt 0) { $dnsGlobal.SuffixSearchList -join ', ' } else { '(none)' })"
+        Write-Info "  Use Devolution: $($dnsGlobal.UseDevolution)"
+        Write-Info "  Devolution Level: $($dnsGlobal.DevolutionLevel)"
+    }
+    catch {
+        Write-DiagWarning "  Could not retrieve global DNS suffix settings"
+    }
+    if ($activeAdapters) {
+        foreach ($adpt in $activeAdapters) {
+            try {
+                $dnsClient = Get-DnsClient -InterfaceAlias $adpt.Name -ErrorAction SilentlyContinue
+                if ($dnsClient) {
+                    $suffix = if ([string]::IsNullOrWhiteSpace($dnsClient.ConnectionSpecificSuffix)) { "(none)" } else { $dnsClient.ConnectionSpecificSuffix }
+                    $registerInDns = $dnsClient.RegisterThisConnectionsAddress
+                    Write-Info "  $($adpt.Name): Suffix='$suffix' RegisterInDNS=$registerInDns"
+                }
+            }
+            catch { }
+        }
+    }
+
+    # 7. WINS Configuration
+    Write-Section "WINS Configuration"
+    try {
+        $winsConfigs = Get-CimInstance Win32_NetworkAdapterConfiguration -ErrorAction Stop |
+            Where-Object { $_.IPEnabled -eq $true }
+        $winsFound = $false
+        foreach ($cfg in $winsConfigs) {
+            $primary = $cfg.WINSPrimaryServer
+            $secondary = $cfg.WINSSecondaryServer
+            if (-not [string]::IsNullOrWhiteSpace($primary) -or -not [string]::IsNullOrWhiteSpace($secondary)) {
+                $winsFound = $true
+                $desc = $cfg.Description
+                Write-Info "  ${desc}:"
+                if ($primary) { Write-Info "    Primary WINS: $primary" }
+                if ($secondary) { Write-Info "    Secondary WINS: $secondary" }
+            }
+        }
+        if (-not $winsFound) {
+            Write-Info "  No WINS servers configured (normal for modern environments)"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check WINS configuration: $($_.Exception.Message)"
+    }
+
+    # 8. Proxy / WinHTTP Settings
+    Write-Section "WinHTTP Proxy Configuration"
+    try {
+        $proxyOutput = netsh winhttp show proxy 2>&1
+        $proxyStr = ($proxyOutput | Out-String).Trim()
+        if ($proxyStr -like "*Direct access*") {
+            Write-Success "  No proxy configured (direct access)"
+        }
+        elseif ($proxyStr -like "*Proxy Server*") {
+            Write-DiagWarning "  Proxy is configured:"
+            foreach ($line in $proxyOutput) {
+                $trimmed = $line.ToString().Trim()
+                if ($trimmed) { Write-Info "    $trimmed" }
+            }
+            Write-Info "  Note: Proxy misconfiguration can block Windows Update, activation, and Azure agent connectivity"
+        }
+        else {
+            Write-Info "  $proxyStr"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check proxy settings"
+    }
+
+    # IE proxy (current user)
+    try {
+        $ieProxy = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
+        if ($ieProxy.ProxyEnable -eq 1) {
+            Write-DiagWarning "  IE/System Proxy ENABLED: $($ieProxy.ProxyServer)"
+            if ($ieProxy.ProxyOverride) {
+                Write-Info "    Bypass list: $($ieProxy.ProxyOverride)"
+            }
+        }
+    }
+    catch { }
+
+    # 9. Network Adapter Driver Version & Date
+    Write-Section "Network Adapter Driver Information"
+    if ($activeAdapters) {
+        foreach ($adpt in $activeAdapters) {
+            try {
+                $driverInfo = Get-NetAdapter -Name $adpt.Name -ErrorAction Stop
+                $driverVersion = $driverInfo.DriverVersion
+                $driverDate = $driverInfo.DriverDate
+                $driverDesc = $driverInfo.DriverDescription
+                $driverProvider = $driverInfo.DriverProvider
+
+                Write-Info "  $($adpt.Name):"
+                Write-Info "    Driver: $driverDesc"
+                Write-Info "    Version: $driverVersion | Provider: $driverProvider"
+                if ($driverDate) {
+                    $driverAge = ((Get-Date) - $driverDate).Days
+                    Write-Info "    Date: $($driverDate.ToString('yyyy-MM-dd')) ($driverAge days old)"
+                    if ($driverAge -gt 730) {
+                        Write-DiagWarning "    WARNING: Driver is over 2 years old - consider updating"
+                    }
+                }
+                if ($driverDesc -like "*vmxnet3*" -and $driverVersion -lt "1.8") {
+                    Write-DiagWarning "    vmxnet3 driver is outdated - upgrade to latest VMware Tools"
+                }
+            }
+            catch {
+                Write-DiagWarning "  Could not retrieve driver info for $($adpt.Name)"
+            }
+        }
+    }
+
+    # 10. Network Binding Order
+    Write-Section "Network Binding Order"
+    try {
+        $bindings = Get-NetAdapterBinding -ErrorAction Stop |
+            Where-Object { $_.ComponentID -eq 'ms_tcpip' } |
+            Sort-Object Name
+        if ($bindings) {
+            foreach ($bind in $bindings) {
+                $status = if ($bind.Enabled) { "Enabled" } else { "Disabled" }
+                Write-Info "  $($bind.Name): TCP/IPv4 = $status"
+            }
+        }
+
+        $ipv6Bindings = Get-NetAdapterBinding -ErrorAction SilentlyContinue |
+            Where-Object { $_.ComponentID -eq 'ms_tcpip6' -and $_.Enabled -eq $false }
+        if ($ipv6Bindings) {
+            Write-Info "  Note: IPv6 is disabled on: $(($ipv6Bindings.Name) -join ', ')"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check binding order: $($_.Exception.Message)"
+    }
+
+    # 11. Firewall Rules Blocking Common Ports
+    Write-Section "Firewall Rules on Common Ports"
+    try {
+        foreach ($portDef in $script:CommonPorts) {
+            $blockRules = Get-NetFirewallPortFilter -Protocol TCP -ErrorAction SilentlyContinue |
+                Where-Object { $_.LocalPort -eq $portDef.Port } |
+                ForEach-Object {
+                    $rule = $_ | Get-NetFirewallRule -ErrorAction SilentlyContinue
+                    if ($rule -and $rule.Action -eq 'Block' -and $rule.Enabled -eq 'True') { $rule }
+                }
+            if ($blockRules) {
+                Write-DiagWarning "  $($portDef.Name) (port $($portDef.Port)): BLOCKED by firewall rule(s):"
+                foreach ($r in $blockRules) {
+                    Write-DiagWarning "    Rule: '$($r.DisplayName)' Direction=$($r.Direction)"
+                }
+            }
+        }
+        Write-Success "  Firewall rule check completed"
+    }
+    catch {
+        Write-DiagWarning "  Could not check firewall rules: $($_.Exception.Message)"
+    }
+
+    # 12. RDMA / SMB Direct Status
+    Write-Section "RDMA / SMB Direct Status"
+    try {
+        $smbConfig = Get-SmbClientConfiguration -ErrorAction Stop
+        $smbMultichannel = $smbConfig.EnableMultiChannel
+        Write-Info "  SMB Multichannel: $(if ($smbMultichannel) { 'Enabled' } else { 'Disabled' })"
+    }
+    catch {
+        Write-Info "  Could not check SMB client configuration"
+    }
+    try {
+        $rdmaAdapters = Get-NetAdapterRdma -ErrorAction SilentlyContinue
+        if ($rdmaAdapters) {
+            foreach ($rdma in $rdmaAdapters) {
+                $status = if ($rdma.Enabled) { "Enabled" } else { "Disabled" }
+                Write-Info "  $($rdma.Name): RDMA = $status"
+                if ($rdma.Enabled) {
+                    $rdmaMode = $rdma.RdmaAdapterInfo
+                    if ($rdmaMode) { Write-Info "    Mode: $rdmaMode" }
+                }
+            }
+        }
+        else {
+            Write-Info "  No RDMA-capable adapters found"
+        }
+    }
+    catch {
+        Write-Info "  RDMA not available (Get-NetAdapterRdma not supported)"
+    }
+    try {
+        $smbDirect = Get-SmbServerConfiguration -ErrorAction SilentlyContinue
+        if ($null -ne $smbDirect) {
+            Write-Info "  SMB Direct (Server): $(if ($smbDirect.EnableSMBDirect) { 'Enabled' } else { 'Disabled' })"
+        }
+    }
+    catch { }
+
+    # 13. TCP/IP Stack Parameters
+    Write-Section "TCP/IP Stack Parameters"
+    try {
+        $tcpGlobal = Get-NetTCPSetting -SettingName "Internet" -ErrorAction Stop
+        Write-Info "  Auto-Tuning Level: $((Get-NetTCPSetting -SettingName Internet -ErrorAction SilentlyContinue).AutoTuningLevelLocal)"
+        Write-Info "  Initial Congestion Window: $($tcpGlobal.InitialCongestionWindow)"
+        Write-Info "  Congestion Provider: $($tcpGlobal.CongestionProvider)"
+
+        $autoTuning = netsh interface tcp show global 2>&1 | Select-String "Receive Window Auto-Tuning Level"
+        if ($autoTuning) {
+            $autoTuningValue = $autoTuning.ToString().Trim()
+            Write-Info "  $autoTuningValue"
+            if ($autoTuningValue -like "*disabled*") {
+                Write-DiagWarning "  TCP Auto-Tuning is DISABLED - this limits receive window scaling and throughput"
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not retrieve TCP global settings"
+    }
+
+    # KeepAlive
+    try {
+        $keepAlive = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name 'KeepAliveTime' -ErrorAction SilentlyContinue
+        if ($keepAlive -and $keepAlive.KeepAliveTime) {
+            $kaSeconds = $keepAlive.KeepAliveTime / 1000
+            Write-Info "  TCP KeepAlive: $kaSeconds seconds"
+            if ($kaSeconds -gt 7200) {
+                Write-DiagWarning "  KeepAlive > 2 hours - long-lived idle connections may be dropped by firewalls/load balancers"
+            }
+        }
+        else {
+            Write-Info "  TCP KeepAlive: Default (2 hours)"
+        }
+    }
+    catch { }
+
+    # Timestamps
+    try {
+        $timestamps = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name 'Tcp1323Opts' -ErrorAction SilentlyContinue
+        if ($timestamps -and $null -ne $timestamps.Tcp1323Opts) {
+            $tsValue = switch ($timestamps.Tcp1323Opts) {
+                0 { "Disabled (no window scaling, no timestamps)" }
+                1 { "Window Scaling only" }
+                2 { "Timestamps only" }
+                3 { "Both Window Scaling and Timestamps (recommended)" }
+                default { "Unknown ($($timestamps.Tcp1323Opts))" }
+            }
+            Write-Info "  TCP 1323 Options: $tsValue"
+        }
+        else {
+            Write-Info "  TCP 1323 Options: OS Default"
+        }
+    }
+    catch { }
+
+    # 14. Network Adapter Error Events
+    Write-Section "Network Adapter Error Events (last 7 days)"
+    try {
+        $nicEventIds = @(27, 32, 1073, 4198, 4199)
+        $nicEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = $nicEventIds
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 20 -ErrorAction SilentlyContinue
+
+        if ($nicEvents) {
+            $grouped = $nicEvents | Group-Object Id
+            foreach ($g in $grouped) {
+                $desc = switch ($g.Name) {
+                    '27'   { "NIC reset/reconnect" }
+                    '32'   { "Network miniport driver error" }
+                    '1073' { "Network adapter link state change" }
+                    '4198' { "TCP/IP duplicate IP address detected" }
+                    '4199' { "TCP/IP duplicate IP address resolved" }
+                    default { "Network event" }
+                }
+                Write-DiagWarning "  Event $($g.Name) ($desc): $($g.Count) occurrence(s)"
+            }
+            $nicEvents | Select-Object -First 5 | ForEach-Object {
+                Write-Info "    [$($_.TimeCreated.ToString('MM-dd HH:mm'))] EventID $($_.Id): $(Get-EventSnippet -Event $_ -MaxLength 100)"
+            }
+        }
+        else {
+            Write-Success "  No network adapter error events found"
+        }
+    }
+    catch {
+        Write-Info "  Could not query network adapter events"
+    }
+
+    # 15. Routing Table Sanity Check
+    Write-Section "Routing Table Analysis"
+    try {
+        $routes = Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop
+
+        # Check for multiple default gateways
+        $defaultRoutes = $routes | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' }
+        if (@($defaultRoutes).Count -gt 1) {
+            Write-DiagWarning "  MULTIPLE default gateways detected ($(@($defaultRoutes).Count)):"
+            foreach ($dr in $defaultRoutes) {
+                $ifAlias = (Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.ifIndex -eq $dr.InterfaceIndex }).Name
+                if ([string]::IsNullOrWhiteSpace($ifAlias)) { $ifAlias = "ifIndex $($dr.InterfaceIndex)" }
+                Write-DiagWarning "    $($dr.NextHop) via $ifAlias (metric $($dr.RouteMetric))"
+            }
+            Write-Info "  Multiple default gateways can cause intermittent connectivity - remove extras or use route metrics"
+        }
+        elseif (@($defaultRoutes).Count -eq 1) {
+            $dr = $defaultRoutes
+            $ifAlias = (Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.ifIndex -eq $dr.InterfaceIndex }).Name
+            Write-Success "  Single default gateway: $($dr.NextHop) via $ifAlias (metric $($dr.RouteMetric))"
+        }
+        else {
+            Write-DiagError "  NO default gateway configured!"
+        }
+
+        # Check for persistent routes
+        $persistentRoutes = $routes | Where-Object { $_.Protocol -eq 'NetMgmt' -and $_.DestinationPrefix -ne '0.0.0.0/0' }
+        if ($persistentRoutes) {
+            Write-Info "  Static/Persistent routes ($(@($persistentRoutes).Count)):"
+            $persistentRoutes | Select-Object -First 10 | ForEach-Object {
+                Write-Info "    $($_.DestinationPrefix) -> $($_.NextHop) (metric $($_.RouteMetric))"
+            }
+            if (@($persistentRoutes).Count -gt 10) {
+                Write-Info "    ... and $(@($persistentRoutes).Count - 10) more"
+            }
+        }
+
+        # Check for metric conflicts (same metric on different interfaces for same destination)
+        $metricConflicts = $routes | Group-Object DestinationPrefix |
+            Where-Object { $_.Count -gt 1 } |
+            ForEach-Object {
+                $metrics = $_.Group.RouteMetric | Select-Object -Unique
+                if (@($metrics).Count -eq 1 -and $_.Name -ne '255.255.255.255/32' -and $_.Name -ne '224.0.0.0/4') {
+                    $_
+                }
+            }
+        if ($metricConflicts) {
+            Write-DiagWarning "  Route metric conflicts detected (same metric, same destination, different interfaces):"
+            foreach ($conflict in $metricConflicts | Select-Object -First 5) {
+                Write-DiagWarning "    $($conflict.Name): $($conflict.Count) routes with same metric"
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not analyze routing table: $($_.Exception.Message)"
+    }
+
+    #endregion v3.0 Network Checks
 }
 
 function Start-NetworkLogCollection {
@@ -890,7 +1422,9 @@ function Test-MemoryUsage {
     .SYNOPSIS
         Analyzes system memory usage
     .DESCRIPTION
-        Checks total memory, usage percentage, top consumers, and committed bytes
+        Checks total memory, usage percentage, top consumers, committed bytes,
+        NonPaged/Paged pool, page file, compression, handles/threads, standby cache,
+        RAM hardware, resource exhaustion events, WS trimming, and leak detection
     .EXAMPLE
         Test-MemoryUsage
     #>
@@ -930,7 +1464,7 @@ function Test-MemoryUsage {
     }
     
     # Top memory consuming processes
-    Write-Info "`nTop 10 Memory Consuming Processes:"
+    Write-Section "Top 10 Memory Consuming Processes"
     # Fetch fresh process data and cache for potential reuse by CPU diagnostics
     $script:LastProcessAnalysis = Get-ProcessAnalysis
     $script:LastProcessAnalysisTime = Get-Date
@@ -943,7 +1477,7 @@ function Test-MemoryUsage {
         Id -AutoSize
     }
     
-    # Check committed bytes
+    Write-Section "Committed Memory"
     try {
         $perfCounter = Get-Counter '\Memory\% Committed Bytes In Use' -ErrorAction Stop
         if ($perfCounter) {
@@ -959,7 +1493,8 @@ function Test-MemoryUsage {
     }
 
     # NonPagedPool Usage
-    Write-Info "`nNonPaged Pool Usage:"
+    Write-Section "Kernel Memory Pools"
+    Write-Info "NonPaged Pool:"
     try {
         $npPool = Get-Counter '\Memory\Pool Nonpaged Bytes' -ErrorAction Stop
         $npMB = [math]::Round($npPool.CounterSamples.CookedValue / 1MB, 2)
@@ -976,7 +1511,8 @@ function Test-MemoryUsage {
     }
 
     # Modified Page List (file cache pressure)
-    Write-Info "`nModified Page List:"
+    Write-Section "File Cache & Paging"
+    Write-Info "Modified Page List:"
     try {
         $modPages = Get-Counter '\Memory\Modified Page List Bytes' -ErrorAction Stop
         $modGB = [math]::Round($modPages.CounterSamples.CookedValue / 1GB, 2)
@@ -1008,7 +1544,7 @@ function Test-MemoryUsage {
     }
 
     # Known Leaky Process Detection
-    Write-Info "`nKnown Memory-Intensive Processes:"
+    Write-Section "Known Memory-Intensive Processes"
     $leakSuspects = @("java", "BMCMainEngine", "MonitoringHost", "WinCollect", "sqlservr")
     try {
         foreach ($suspect in $leakSuspects) {
@@ -1029,6 +1565,386 @@ function Test-MemoryUsage {
     catch {
         Write-DiagWarning "  Could not check known processes"
     }
+
+    #region v3.0 Memory Checks
+
+    # 1. Page File Configuration & Usage
+    Write-Section "Page File Configuration & Usage"
+    try {
+        $pageFiles = Get-CimInstance Win32_PageFileUsage -ErrorAction Stop
+        if ($pageFiles) {
+            foreach ($pf in $pageFiles) {
+                $usedMB = $pf.CurrentUsage
+                $totalMB = $pf.AllocatedBaseSize
+                $peakMB = $pf.PeakUsage
+                $usedPercent = if ($totalMB -gt 0) { [math]::Round(($usedMB / $totalMB) * 100, 1) } else { 0 }
+                Write-Info "  $($pf.Name):"
+                Write-Info "    Size: $totalMB MB | Used: $usedMB MB ($usedPercent%) | Peak: $peakMB MB"
+                if ($usedPercent -gt $PAGEFILE_USAGE_CRITICAL_PERCENT) {
+                    Write-DiagError "    CRITICAL: Page file is >$($PAGEFILE_USAGE_CRITICAL_PERCENT)% full!"
+                }
+                elseif ($usedPercent -gt $PAGEFILE_USAGE_WARNING_PERCENT) {
+                    Write-DiagWarning "    WARNING: Page file usage above $($PAGEFILE_USAGE_WARNING_PERCENT)%"
+                }
+            }
+        }
+        else {
+            Write-DiagWarning "  No page files found (system may crash under memory pressure!)"
+        }
+
+        # Check page file settings (system managed vs fixed)
+        $pfSettings = Get-CimInstance Win32_PageFileSetting -ErrorAction SilentlyContinue
+        if ($pfSettings) {
+            foreach ($pfs in $pfSettings) {
+                if ($pfs.InitialSize -eq 0 -and $pfs.MaximumSize -eq 0) {
+                    Write-Success "    $($pfs.Name): System managed (recommended)"
+                }
+                else {
+                    Write-Info "    $($pfs.Name): Fixed size (Initial: $($pfs.InitialSize) MB, Max: $($pfs.MaximumSize) MB)"
+                    if ($pfs.MaximumSize -lt 4096) {
+                        Write-DiagWarning "    Page file max is under 4 GB - may be insufficient for memory dumps"
+                    }
+                }
+            }
+        }
+        else {
+            Write-DiagWarning "  No page file settings found (page file may be disabled)"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check page file configuration: $($_.Exception.Message)"
+    }
+
+    # 2. Available MBytes (more accurate than free memory)
+    Write-Section "Available Memory (includes reclaimable cache)"
+    try {
+        $availMB = Get-Counter '\Memory\Available MBytes' -ErrorAction Stop
+        $availVal = [math]::Round($availMB.CounterSamples.CookedValue, 0)
+        Write-Info "  Available MBytes: $availVal MB ($([math]::Round($availVal / 1024, 2)) GB)"
+        if ($availVal -lt $AVAILABLE_MB_CRITICAL) {
+            Write-DiagError "  CRITICAL: Available memory below $($AVAILABLE_MB_CRITICAL) MB!"
+        }
+        elseif ($availVal -lt $AVAILABLE_MB_WARNING) {
+            Write-DiagWarning "  WARNING: Available memory below $($AVAILABLE_MB_WARNING) MB"
+        }
+        else {
+            Write-Success "  Available memory is adequate"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check Available MBytes"
+    }
+
+    # 3. Memory Compression Ratio
+    Write-Section "Memory Compression"
+    try {
+        $compressProc = Get-Process -Name "Memory Compression" -ErrorAction SilentlyContinue
+        if ($compressProc) {
+            $compressWS = [math]::Round($compressProc.WorkingSet64 / 1MB, 0)
+            Write-Info "  Memory Compression process WS: $compressWS MB"
+            try {
+                $compressedBytes = Get-Counter '\Memory\Compression Store Size' -ErrorAction Stop
+                $compressedMB = [math]::Round($compressedBytes.CounterSamples.CookedValue / 1MB, 0)
+                if ($compressWS -gt 0 -and $compressedMB -gt 0) {
+                    $ratio = [math]::Round($compressedMB / $compressWS, 2)
+                    Write-Info "  Compressed Store: $compressedMB MB | Compression Ratio: ${ratio}:1"
+                    if ($compressWS -gt 2048) {
+                        Write-DiagWarning "  WARNING: Over 2 GB of compressed memory - system is under significant memory pressure"
+                    }
+                }
+            }
+            catch {
+                Write-Info "  Compression Store counter not available (Windows 10/2016+)"
+            }
+        }
+        else {
+            Write-Info "  Memory Compression process not active"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check memory compression"
+    }
+
+    # 4. Handle & Thread Count per Process
+    Write-Section "Handle & Thread Analysis"
+    Write-Info "Top Processes by Handle Count:"
+    try {
+        $handleProcs = Get-Process -ErrorAction Stop |
+            Sort-Object HandleCount -Descending |
+            Select-Object -First 10
+        foreach ($hp in $handleProcs) {
+            $handles = $hp.HandleCount
+            $threads = $hp.Threads.Count
+            $indicator = ""
+            if ($handles -gt $HANDLE_LEAK_WARNING) { $indicator = " [POTENTIAL HANDLE LEAK]" }
+            Write-Info "  $($hp.Name) (PID $($hp.Id)): Handles=$handles Threads=$threads$indicator"
+        }
+
+        $totalHandles = (Get-Process -ErrorAction Stop | Measure-Object HandleCount -Sum).Sum
+        Write-Info "  System Total Handles: $totalHandles"
+    }
+    catch {
+        Write-DiagWarning "  Could not check handle counts"
+    }
+
+    Write-Info "`nTop Processes by Thread Count:"
+    try {
+        $threadProcs = Get-Process -ErrorAction Stop |
+            Sort-Object { $_.Threads.Count } -Descending |
+            Select-Object -First 5
+        foreach ($tp in $threadProcs) {
+            $threads = $tp.Threads.Count
+            $indicator = ""
+            if ($threads -gt $THREAD_LEAK_WARNING) { $indicator = " [HIGH THREAD COUNT]" }
+            Write-Info "  $($tp.Name) (PID $($tp.Id)): Threads=$threads$indicator"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check thread counts"
+    }
+
+    # 5. Paged Pool Usage
+    Write-Section "Paged Pool Usage"
+    try {
+        $pagedPool = Get-Counter '\Memory\Pool Paged Bytes' -ErrorAction Stop
+        $ppMB = [math]::Round($pagedPool.CounterSamples.CookedValue / 1MB, 2)
+        Write-Info "  Paged Pool: $ppMB MB"
+        if ($ppMB -gt $PAGED_POOL_CRITICAL_MB) {
+            Write-DiagError "  CRITICAL: Paged Pool >$($PAGED_POOL_CRITICAL_MB)MB - risk of SESSION_POOL_EMPTY bugcheck"
+        }
+        elseif ($ppMB -gt $PAGED_POOL_WARNING_MB) {
+            Write-DiagWarning "  WARNING: Paged Pool elevated (>$($PAGED_POOL_WARNING_MB)MB)"
+        }
+        else {
+            Write-Success "  Paged Pool is within normal range"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check Paged Pool"
+    }
+
+    # 6. System Cache Working Set
+    Write-Section "System Cache Working Set"
+    try {
+        $cacheBytes = Get-Counter '\Memory\Cache Bytes' -ErrorAction Stop
+        $cacheMB = [math]::Round($cacheBytes.CounterSamples.CookedValue / 1MB, 0)
+        $cacheGB = [math]::Round($cacheBytes.CounterSamples.CookedValue / 1GB, 2)
+        Write-Info "  System Cache: $cacheMB MB ($cacheGB GB)"
+        if ($cacheGB -gt 4) {
+            Write-DiagWarning "  WARNING: Large system cache ($cacheGB GB) - may be starving user processes"
+            Write-Info "  On file servers, consider tuning LargeSystemCache registry key"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check system cache"
+    }
+
+    # 7. Memory Leak Trend Detection (Private Bytes vs Working Set)
+    Write-Section "Memory Leak Indicators (Private Bytes vs Working Set)"
+    try {
+        $topProcesses = Get-Process -ErrorAction Stop |
+            Where-Object { $_.WorkingSet64 -gt 100MB } |
+            Sort-Object WorkingSet64 -Descending |
+            Select-Object -First 10
+        foreach ($proc in $topProcesses) {
+            $wsMB = [math]::Round($proc.WorkingSet64 / 1MB, 0)
+            $privateMB = [math]::Round($proc.PrivateMemorySize64 / 1MB, 0)
+            $virtualMB = [math]::Round($proc.VirtualMemorySize64 / 1MB, 0)
+            $gap = $privateMB - $wsMB
+            $indicator = ""
+            if ($gap -gt 500) {
+                $indicator = " [LEAK SUSPECT: private >> WS by ${gap}MB]"
+            }
+            Write-Info "  $($proc.Name) (PID $($proc.Id)): WS=${wsMB}MB Private=${privateMB}MB Virtual=${virtualMB}MB$indicator"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not perform leak trend analysis"
+    }
+
+    # 8. Standby List Breakdown
+    Write-Section "Standby Cache Breakdown"
+    try {
+        $standbyCore = Get-Counter '\Memory\Standby Cache Core Bytes' -ErrorAction Stop
+        $standbyNormal = Get-Counter '\Memory\Standby Cache Normal Priority Bytes' -ErrorAction Stop
+        $standbyReserve = Get-Counter '\Memory\Standby Cache Reserve Bytes' -ErrorAction Stop
+
+        $coreMB = [math]::Round($standbyCore.CounterSamples.CookedValue / 1MB, 0)
+        $normalMB = [math]::Round($standbyNormal.CounterSamples.CookedValue / 1MB, 0)
+        $reserveMB = [math]::Round($standbyReserve.CounterSamples.CookedValue / 1MB, 0)
+        $totalStandby = $coreMB + $normalMB + $reserveMB
+
+        Write-Info "  Total Standby: $totalStandby MB ($([math]::Round($totalStandby / 1024, 2)) GB)"
+        Write-Info "    Core (high priority): $coreMB MB"
+        Write-Info "    Normal priority: $normalMB MB"
+        Write-Info "    Reserve (low priority, easily reclaimable): $reserveMB MB"
+
+        if ($totalStandby -gt 0) {
+            $reclaimablePercent = [math]::Round(($reserveMB / $totalStandby) * 100, 1)
+            Write-Info "  Easily reclaimable: $reclaimablePercent% of standby cache"
+            if ($reclaimablePercent -lt 20 -and $totalStandby -gt 2048) {
+                Write-DiagWarning "  Low reclaimable standby cache - high-priority file cache is consuming standby memory"
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not retrieve standby cache breakdown (requires Windows 8/2012+)"
+    }
+
+    # 9. RAM Hardware Information
+    Write-Section "RAM Hardware Information"
+    try {
+        $memModules = Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop
+        if ($memModules) {
+            $totalSlots = (Get-CimInstance Win32_PhysicalMemoryArray -ErrorAction SilentlyContinue).MemoryDevices
+            $usedSlots = @($memModules).Count
+            Write-Info "  DIMM Slots: $usedSlots used$(if ($totalSlots) { " of $totalSlots total" })"
+
+            $speeds = @()
+            $types = @()
+            foreach ($mod in $memModules) {
+                $sizeMB = [math]::Round($mod.Capacity / 1MB, 0)
+                $sizeGB = [math]::Round($mod.Capacity / 1GB, 1)
+                $speed = $mod.Speed
+                $manufacturer = if ($mod.Manufacturer) { $mod.Manufacturer.Trim() } else { "Unknown" }
+                $partNumber = if ($mod.PartNumber) { $mod.PartNumber.Trim() } else { "" }
+                $memType = switch ($mod.SMBIOSMemoryType) {
+                    20 { "DDR" }
+                    21 { "DDR2" }
+                    24 { "DDR3" }
+                    26 { "DDR4" }
+                    34 { "DDR5" }
+                    default { "Type $($mod.SMBIOSMemoryType)" }
+                }
+                $speeds += $speed
+                $types += $memType
+
+                Write-Info "  Slot $($mod.DeviceLocator): ${sizeGB}GB $memType @ ${speed}MHz ($manufacturer $partNumber)"
+            }
+
+            # Check for mismatched speeds
+            $uniqueSpeeds = $speeds | Where-Object { $_ -gt 0 } | Select-Object -Unique
+            if (@($uniqueSpeeds).Count -gt 1) {
+                Write-DiagError "  MISMATCHED RAM speeds detected: $($uniqueSpeeds -join ', ') MHz"
+                Write-Info "  All DIMMs will run at the slowest speed ($($uniqueSpeeds | Sort-Object | Select-Object -First 1) MHz)"
+            }
+
+            # Check for mixed types
+            $uniqueTypes = $types | Select-Object -Unique
+            if (@($uniqueTypes).Count -gt 1) {
+                Write-DiagError "  MIXED RAM types detected: $($uniqueTypes -join ', ')"
+            }
+
+            # Upgrade suggestion
+            if ($totalSlots -and $usedSlots -lt $totalSlots) {
+                $emptySlots = $totalSlots - $usedSlots
+                Write-Info "  $emptySlots empty DIMM slot(s) available for expansion"
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not retrieve RAM hardware info: $($_.Exception.Message)"
+    }
+
+    # 10. Resource Exhaustion Events (2004)
+    Write-Section "Resource Exhaustion Events (last 7 days)"
+    try {
+        $resExhaustEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 2004
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 10 -ErrorAction SilentlyContinue
+
+        if ($resExhaustEvents) {
+            Write-DiagError "  FOUND $($resExhaustEvents.Count) resource exhaustion event(s)!"
+            foreach ($evt in $resExhaustEvents | Select-Object -First 5) {
+                Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] $(Get-EventSnippet -Event $evt -MaxLength 120)"
+            }
+            Write-Info "  Event 2004 = virtual memory exhaustion - increase page file or add RAM"
+        }
+        else {
+            Write-Success "  No resource exhaustion events (Event 2004)"
+        }
+
+        # Also check for Event 333 (an LDR for memory low condition in older OS)
+        $lowMemEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 333, 2003
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 5 -ErrorAction SilentlyContinue
+        if ($lowMemEvents) {
+            Write-DiagWarning "  Also found $($lowMemEvents.Count) low-memory condition event(s) (333/2003)"
+        }
+    }
+    catch {
+        Write-Info "  Could not query resource exhaustion events"
+    }
+
+    # 11. Working Set Trimming Rate
+    Write-Section "Working Set Trimming Activity"
+    try {
+        $trimCounter = Get-Counter '\Memory\Transition Pages RePurposed/sec' -ErrorAction Stop
+        $trimRate = [math]::Round($trimCounter.CounterSamples.CookedValue, 0)
+        Write-Info "  Transition Pages Repurposed/sec: $trimRate"
+        if ($trimRate -gt $WS_TRIM_WARNING_THRESHOLD) {
+            Write-DiagWarning "  WARNING: High WS trimming rate (>$WS_TRIM_WARNING_THRESHOLD/sec) - OS is aggressively reclaiming memory"
+        }
+
+        $cacheFaults = Get-Counter '\Memory\Cache Faults/sec' -ErrorAction Stop
+        $cacheFaultRate = [math]::Round($cacheFaults.CounterSamples.CookedValue, 0)
+        Write-Info "  Cache Faults/sec: $cacheFaultRate"
+        if ($cacheFaultRate -gt 5000) {
+            Write-DiagWarning "  WARNING: High cache fault rate - system cache is being evicted frequently"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check working set trimming"
+    }
+
+    # 12. Per-Process Private Bytes vs Working Set (top suspects)
+    Write-Section "Detailed Leak Analysis (Private >> Working Set)"
+    try {
+        $leakCandidates = Get-Process -ErrorAction Stop |
+            Where-Object { $_.PrivateMemorySize64 -gt 200MB } |
+            ForEach-Object {
+                $wsMB = [math]::Round($_.WorkingSet64 / 1MB, 0)
+                $privateMB = [math]::Round($_.PrivateMemorySize64 / 1MB, 0)
+                $gdiObjects = 0
+                $userObjects = 0
+                try {
+                    $gdiObjects = $_.GDI_Objects
+                    $userObjects = $_.USER_Objects
+                }
+                catch { }
+                [PSCustomObject]@{
+                    Name      = $_.Name
+                    PID       = $_.Id
+                    WS_MB     = $wsMB
+                    Private_MB = $privateMB
+                    Gap_MB    = $privateMB - $wsMB
+                    Handles   = $_.HandleCount
+                }
+            } |
+            Where-Object { $_.Gap_MB -gt 200 } |
+            Sort-Object Gap_MB -Descending |
+            Select-Object -First 5
+
+        if ($leakCandidates) {
+            Write-DiagWarning "  Processes where Private Bytes significantly exceeds Working Set:"
+            foreach ($lc in $leakCandidates) {
+                Write-DiagWarning "    $($lc.Name) (PID $($lc.PID)): WS=$($lc.WS_MB)MB Private=$($lc.Private_MB)MB Gap=$($lc.Gap_MB)MB Handles=$($lc.Handles)"
+            }
+            Write-Info "  A large Private-WS gap suggests the process has allocated memory that was paged out (possible leak)"
+        }
+        else {
+            Write-Success "  No significant Private Bytes vs Working Set gaps detected"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not perform detailed leak analysis"
+    }
+
+    #endregion v3.0 Memory Checks
 }
 
 function Start-MemoryLogCollection {
@@ -1146,7 +2062,7 @@ function Test-CPUUsage {
     # Processor information (handle multi-socket servers)
     try {
         $cpus = @(Get-CimInstance Win32_Processor -ErrorAction Stop)
-        Write-Info "`nProcessor Information:"
+        Write-Section "Processor Information"
         if ($cpus.Count -gt 1) {
             Write-Info "  Sockets: $($cpus.Count)"
         }
@@ -1166,7 +2082,7 @@ function Test-CPUUsage {
     }
     
     # Top CPU consuming processes
-    Write-Info "`nTop 10 CPU Consuming Processes:"
+    Write-Section "Top 10 CPU Consuming Processes"
     # Reuse cached process data only if fresh (< 2 minutes old), otherwise fetch new
     $cacheAge = if ($script:LastProcessAnalysisTime) { ((Get-Date) - $script:LastProcessAnalysisTime).TotalMinutes } else { 999 }
     $processAnalysis = if ($script:LastProcessAnalysis -and $cacheAge -lt 2) { $script:LastProcessAnalysis } else { Get-ProcessAnalysis }
@@ -1195,7 +2111,7 @@ function Test-CPUUsage {
     }
 
     # Svchost.exe Breakdown (top consumers)
-    Write-Info "`nTop svchost.exe Instances by CPU:"
+    Write-Section "Top svchost.exe Instances by CPU"
     try {
         $svchosts = Get-Process -Name "svchost" -ErrorAction SilentlyContinue | Sort-Object CPU -Descending | Select-Object -First 5
         foreach ($sh in $svchosts) {
@@ -1217,7 +2133,7 @@ function Test-CPUUsage {
     }
 
     # Monitoring Agent Detection
-    Write-Info "`nMonitoring Agent CPU Check:"
+    Write-Section "Monitoring Agent CPU Check"
     $monitoringAgents = @("MonitoringHost", "HealthService", "WinCollect", "MOMAgent")
     try {
         foreach ($agent in $monitoringAgents) {
@@ -1243,7 +2159,7 @@ function Test-CPUUsage {
     try {
         $javaProcs = Get-Process -Name "java" -ErrorAction SilentlyContinue
         if ($javaProcs) {
-            Write-Info "`nJava Process CPU Check:"
+            Write-Section "Java Process CPU Check"
             foreach ($jp in $javaProcs) {
                 $cpuSec = [math]::Round($jp.CPU, 1)
                 $memMB = [math]::Round($jp.WorkingSet64 / 1MB, 0)
@@ -1261,7 +2177,7 @@ function Test-CPUUsage {
     }
 
     # Split I/O Check (storage fragmentation indicator)
-    Write-Info "`nSplit I/O Check:"
+    Write-Section "Split I/O Check"
     try {
         $splitIO = Get-Counter '\PhysicalDisk(_Total)\Split IO/sec' -ErrorAction Stop
         $splitRate = [math]::Round($splitIO.CounterSamples.CookedValue, 0)
@@ -1376,7 +2292,7 @@ function Test-DiskPerformance {
     }
     
     # Logical disk space
-    Write-Info "`nLogical Disk Space:"
+    Write-Section "Logical Disk Space"
     if ($cachedVolumes) {
         foreach ($vol in $cachedVolumes) {
             if ($vol.Size -le 0) { continue }
@@ -1398,7 +2314,7 @@ function Test-DiskPerformance {
     }
     
     # Disk latency check
-    Write-Info "`nChecking Disk Latency (avg over last few seconds)..."
+    Write-Section "Disk Latency (avg over last few seconds)"
     try {
         $diskReadLatency = Get-Counter '\PhysicalDisk(*)\Avg. Disk sec/Read' -ErrorAction Stop
         
@@ -1429,7 +2345,7 @@ function Test-DiskPerformance {
     }
     
     # Check cluster size for volumes (reuses cached $cachedVolumes)
-    Write-Info "`nChecking Cluster Size (should be 64KB for databases):"
+    Write-Section "Cluster Size (should be 64KB for databases)"
     if ($cachedVolumes) {
         foreach ($vol in $cachedVolumes) {
             $drive = $vol.DriveLetter + ":"
@@ -1450,7 +2366,7 @@ function Test-DiskPerformance {
     }
 
     # Storage Disconnect Events (129, 153)
-    Write-Info "`nStorage Error Events (last 7 days):"
+    Write-Section "Storage Error Events (last 7 days)"
     try {
         $storageEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -1476,7 +2392,7 @@ function Test-DiskPerformance {
     }
 
     # Disk Queue Length
-    Write-Info "`nDisk Queue Length:"
+    Write-Section "Disk Queue Length"
     try {
         $queueLength = Get-Counter '\PhysicalDisk(*)\Current Disk Queue Length' -ErrorAction Stop
         foreach ($sample in $queueLength.CounterSamples) {
@@ -1493,7 +2409,7 @@ function Test-DiskPerformance {
     }
 
     # Write Latency (supplement to existing read latency)
-    Write-Info "`nDisk Write Latency:"
+    Write-Section "Disk Write Latency"
     try {
         $writeLatency = Get-Counter '\PhysicalDisk(*)\Avg. Disk sec/Write' -ErrorAction Stop
         foreach ($sample in $writeLatency.CounterSamples) {
@@ -1514,7 +2430,7 @@ function Test-DiskPerformance {
     }
 
     # NTFS Metadata / Corruption Errors
-    Write-Info "`nNTFS Errors (last 30 days):"
+    Write-Section "NTFS Errors (last 30 days)"
     try {
         $ntfsEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -1538,7 +2454,7 @@ function Test-DiskPerformance {
     }
 
     # VM Pause-Critical Risk (>95% full) — reuses cached $cachedVolumes
-    Write-Info "`nVM Pause-Critical Risk Check:"
+    Write-Section "VM Pause-Critical Risk Check"
     if ($cachedVolumes) {
         foreach ($vol in ($cachedVolumes | Where-Object { $_.Size -gt 0 })) {
             $usedPercent = [math]::Round((($vol.Size - $vol.SizeRemaining) / $vol.Size) * 100, 1)
@@ -1705,7 +2621,7 @@ function Test-ServicesHealth {
     }
     
     # Stopped automatic services
-    Write-Info "`nStopped Automatic Services:"
+    Write-Section "Stopped Automatic Services"
     try {
         $stoppedAuto = Get-Service -ErrorAction Stop | Where-Object {
             $_.StartType -eq "Automatic" -and $_.Status -ne "Running"
@@ -1726,7 +2642,7 @@ function Test-ServicesHealth {
     }
     
     # Disabled services that are typically needed
-    Write-Info "`nDisabled Services (may need attention):"
+    Write-Section "Disabled Services (may need attention)"
     try {
         $disabledSvcs = Get-Service -ErrorAction Stop | Where-Object {
             $_.StartType -eq "Disabled"
@@ -1750,7 +2666,7 @@ function Test-ServicesHealth {
     }
     
     # Recently crashed services (Event 7034)
-    Write-Info "`nRecently Crashed/Terminated Services (last 24 hours):"
+    Write-Section "Recently Crashed/Terminated Services (last 24 hours)"
     try {
         $crashEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -1773,7 +2689,7 @@ function Test-ServicesHealth {
     }
 
     # W32Time NTP Sync Status
-    Write-Info "`nTime Service (NTP) Sync Status:"
+    Write-Section "Time Service (NTP) Sync Status"
     try {
         $w32tmOutput = w32tm /query /status 2>&1
         if ($LASTEXITCODE -eq 0) {
@@ -1798,7 +2714,7 @@ function Test-ServicesHealth {
     }
 
     # Task Scheduler Health
-    Write-Info "`nTask Scheduler Health:"
+    Write-Section "Task Scheduler Health"
     try {
         $schedEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'Microsoft-Windows-TaskScheduler/Operational'
@@ -1821,7 +2737,7 @@ function Test-ServicesHealth {
     }
 
     # EventLog Service Errors
-    Write-Info "`nEventLog Service Errors:"
+    Write-Section "EventLog Service Errors"
     try {
         $evtLogErrors = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -1842,7 +2758,7 @@ function Test-ServicesHealth {
     catch { Write-Info "  Could not query EventLog errors" }
 
     # Netlogon / Domain Connectivity Events
-    Write-Info "`nNetlogon Events:"
+    Write-Section "Netlogon Events"
     try {
         $netlogonEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -1863,7 +2779,7 @@ function Test-ServicesHealth {
     catch { Write-Info "  Could not query Netlogon events" }
 
     # RDP Licensing Service
-    Write-Info "`nRDP Licensing:"
+    Write-Section "RDP Licensing"
     try {
         $rdpLic = Get-Service -Name "TermServLicensing" -ErrorAction SilentlyContinue
         if ($null -ne $rdpLic) {
@@ -1943,7 +2859,7 @@ function Test-EventLogHealth {
     $logNames = @("System", "Application")
     
     foreach ($logName in $logNames) {
-        Write-Info "`n--- $logName Log ---"
+        Write-Section "$logName Log"
         
         # Check log size and capacity
         try {
@@ -1988,7 +2904,7 @@ function Test-EventLogHealth {
                 }
                 
                 # Show last 5 critical/error events
-                Write-Info "`n  Last 5 Events:"
+                Write-Section "Last 5 Events"
                 $events | Select-Object -First 5 | ForEach-Object {
                     $levelText = switch ($_.Level) { 1 { "CRITICAL" } 2 { "ERROR" } default { "UNKNOWN" } }
                     $msgSnippet = $(Get-EventSnippet -Event $_ -MaxLength 120)
@@ -2005,7 +2921,7 @@ function Test-EventLogHealth {
     }
 
     # Cluster Events (1135, 1672)
-    Write-Info "`nCluster Heartbeat/Quarantine Events (last 7 days):"
+    Write-Section "Cluster Heartbeat/Quarantine Events (last 7 days)"
     try {
         $clusterEvts = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -2026,7 +2942,7 @@ function Test-EventLogHealth {
     catch { Write-Info "  Failover Clustering may not be installed" }
 
     # Storage Events (129, 153)
-    Write-Info "`nStorage Adapter Events (129/153, last 7 days):"
+    Write-Section "Storage Adapter Events (129/153, last 7 days)"
     try {
         $storEvts = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -2047,7 +2963,7 @@ function Test-EventLogHealth {
     catch { }
 
     # DNS Update Failures (1196)
-    Write-Info "`nDNS Update Failure Events:"
+    Write-Section "DNS Update Failure Events"
     try {
         $dnsEvts = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -2065,7 +2981,7 @@ function Test-EventLogHealth {
     catch { }
 
     # Known Critical Event Summary (from $script:KnownCriticalEventIDs)
-    Write-Info "`nHigh-Priority Event Summary (last 24h):"
+    Write-Section "High-Priority Event Summary (last 24h)"
     foreach ($logName in $script:KnownCriticalEventIDs.Keys) {
         foreach ($evtDef in $script:KnownCriticalEventIDs[$logName]) {
             try {
@@ -2166,7 +3082,7 @@ function Test-DNSHealth {
     }
     
     # Configured DNS servers per adapter
-    Write-Info "`nConfigured DNS Servers:"
+    Write-Section "Configured DNS Servers"
     try {
         $adapters = Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
         foreach ($adapter in $adapters) {
@@ -2203,7 +3119,7 @@ function Test-DNSHealth {
     }
     
     # DNS resolution tests
-    Write-Info "`nDNS Resolution Tests:"
+    Write-Section "DNS Resolution Tests"
     $testDomains = @("microsoft.com", "google.com")
     
     foreach ($domain in $testDomains) {
@@ -2238,7 +3154,7 @@ function Test-DNSHealth {
     }
     
     # DNS cache statistics
-    Write-Info "`nDNS Cache Statistics:"
+    Write-Section "DNS Cache Statistics"
     try {
         $cache = Get-DnsClientCache -ErrorAction Stop
         if ($cache) {
@@ -2258,7 +3174,7 @@ function Test-DNSHealth {
     }
 
     # DNS "Bad Key" Errors
-    Write-Info "`nDNS 'Bad Key' Errors (cluster CNO/VCO failures):"
+    Write-Section "DNS Bad Key Errors (cluster CNO/VCO failures)"
     try {
         $badKeyEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'DNS Server'
@@ -2279,7 +3195,7 @@ function Test-DNSHealth {
     }
 
     # Cluster Listener Name Resolution
-    Write-Info "`nCluster Name Resolution:"
+    Write-Section "Cluster Name Resolution"
     try {
         $clusterSvc = Get-Service -Name "ClusSvc" -ErrorAction SilentlyContinue
         if ($null -ne $clusterSvc -and $clusterSvc.Status -eq "Running") {
@@ -2304,7 +3220,7 @@ function Test-DNSHealth {
     }
 
     # AD Secure Dynamic DNS Update Failures
-    Write-Info "`nDNS Dynamic Update Failures:"
+    Write-Section "DNS Dynamic Update Failures"
     try {
         $dnsUpdateFail = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -2325,7 +3241,7 @@ function Test-DNSHealth {
     catch { }
 
     # Reverse DNS Check
-    Write-Info "`nReverse DNS Lookup:"
+    Write-Section "Reverse DNS Lookup"
     try {
         $serverIPs = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' }
         foreach ($ip in $serverIPs | Select-Object -First 2) {
@@ -2446,7 +3362,7 @@ function Test-SecurityAuthentication {
     }
     
     # Recent failed logon events (Event 4625)
-    Write-Info "`nRecent Failed Logon Attempts (last 24 hours):"
+    Write-Section "Recent Failed Logon Attempts (last 24 hours)"
     try {
         $failedLogons = Get-WinEvent -FilterHashtable @{
             LogName   = 'Security'
@@ -2484,7 +3400,7 @@ function Test-SecurityAuthentication {
     }
     
     # Kerberos ticket status
-    Write-Info "`nKerberos Ticket Status:"
+    Write-Section "Kerberos Ticket Status"
     try {
         $klistOutput = klist 2>&1
         $ticketMatch = $klistOutput | Select-String "Cached Tickets"
@@ -2505,7 +3421,7 @@ function Test-SecurityAuthentication {
     }
     
     # Secure channel with domain
-    Write-Info "`nDomain Secure Channel:"
+    Write-Section "Domain Secure Channel"
     try {
         $domain = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Domain
         if ($domain -and $domain -ne "WORKGROUP") {
@@ -2527,7 +3443,7 @@ function Test-SecurityAuthentication {
     }
     
     # Windows Firewall status
-    Write-Info "`nWindows Firewall Status:"
+    Write-Section "Windows Firewall Status"
     try {
         $fwProfiles = Get-NetFirewallProfile -ErrorAction Stop
         foreach ($profile in $fwProfiles) {
@@ -2546,7 +3462,7 @@ function Test-SecurityAuthentication {
     }
 
     # Account Lockout Events (4740)
-    Write-Info "`nAccount Lockout Events (4740, last 24h):"
+    Write-Section "Account Lockout Events (4740, last 24h)"
     try {
         $lockoutEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'Security'
@@ -2569,7 +3485,7 @@ function Test-SecurityAuthentication {
     }
 
     # Logon as a Service Policy
-    Write-Info "`nLogon as a Service Policy:"
+    Write-Section "Logon as a Service Policy"
     try {
         $tmpFile = Join-Path $env:TEMP "secedit_export_$(Get-Random).cfg"
         try {
@@ -2617,7 +3533,7 @@ function Test-SecurityAuthentication {
     }
 
     # Schannel Errors (36870)
-    Write-Info "`nSchannel TLS Errors:"
+    Write-Section "Schannel TLS Errors"
     try {
         $schannelEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -2639,7 +3555,7 @@ function Test-SecurityAuthentication {
     catch { }
 
     # NTLM vs Kerberos Detection
-    Write-Info "`nAuthentication Protocol Usage (last 100 logons):"
+    Write-Section "Authentication Protocol Usage (last 100 logons)"
     try {
         $logonEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'Security'
@@ -2670,7 +3586,7 @@ function Test-SecurityAuthentication {
     }
 
     # MachineKeys Permissions
-    Write-Info "`nMachineKeys Directory Permissions:"
+    Write-Section "MachineKeys Directory Permissions"
     try {
         $mkPath = "$env:ProgramData\Microsoft\Crypto\RSA\MachineKeys"
         if (Test-Path $mkPath) {
@@ -2784,7 +3700,7 @@ function Test-WindowsUpdateStatus {
     }
     
     # Last installed updates
-    Write-Info "`nLast 10 Installed Updates:"
+    Write-Section "Last 10 Installed Updates"
     try {
         $updates = Get-HotFix -ErrorAction Stop | Sort-Object InstalledOn -Descending -ErrorAction SilentlyContinue | Select-Object -First 10
         
@@ -2825,7 +3741,7 @@ function Test-WindowsUpdateStatus {
     }
     
     # Pending reboot check
-    Write-Info "`nPending Reboot Check:"
+    Write-Section "Pending Reboot Check"
     try {
         $pendingReboot = $false
         $reasons = @()
@@ -2865,7 +3781,7 @@ function Test-WindowsUpdateStatus {
     }
     
     # OS version info
-    Write-Info "`nOS Version Information:"
+    Write-Section "OS Version Information"
     try {
         $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
         Write-Info "  OS: $($os.Caption)"
@@ -2885,7 +3801,7 @@ function Test-WindowsUpdateStatus {
     }
 
     # CBS Store Health
-    Write-Info "`nCBS Store Health:"
+    Write-Section "CBS Store Health"
     try {
         $cbsLog = "$env:SystemRoot\Logs\CBS\CBS.log"
         if (Test-Path $cbsLog) {
@@ -2904,7 +3820,7 @@ function Test-WindowsUpdateStatus {
     }
 
     # Pending.xml Check
-    Write-Info "`nPending.xml Check:"
+    Write-Section "Pending.xml Check"
     try {
         $pendingXml = "$env:SystemRoot\WinSxS\pending.xml"
         if (Test-Path $pendingXml) {
@@ -2919,7 +3835,7 @@ function Test-WindowsUpdateStatus {
     catch { }
 
     # Legacy OS Detection
-    Write-Info "`nOS Lifecycle Check:"
+    Write-Section "OS Lifecycle Check"
     try {
         $build = [int]$os.BuildNumber
         if ($build -lt 14393) {
@@ -2936,7 +3852,7 @@ function Test-WindowsUpdateStatus {
     catch { }
 
     # Failed Update Events
-    Write-Info "`nFailed Update Events (last 7 days):"
+    Write-Section "Failed Update Events (last 7 days)"
     try {
         $updateFail = Get-WinEvent -FilterHashtable @{
             LogName   = 'Setup'
@@ -3757,6 +4673,64 @@ Computer: $($env:COMPUTERNAME)
     }
 }
 
+function Export-DiagnosticSection {
+    <#
+    .SYNOPSIS
+        Captures diagnostic output from a script block and offers to save and open it
+    .PARAMETER Title
+        Report title
+    .PARAMETER ScriptBlock
+        The diagnostic function to capture output from
+    #>
+    param(
+        [string]$Title,
+        [scriptblock]$ScriptBlock
+    )
+    
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $safeTitle = $Title -replace '[^a-zA-Z0-9]', '_'
+    $reportPath = Join-Path $script:DefaultLogPath "${safeTitle}_${timestamp}.txt"
+    
+    if (-not (Test-PathValid -Path $script:DefaultLogPath -CreateIfNotExist)) {
+        Write-DiagError "Cannot create report directory"
+        return
+    }
+    
+    try {
+        $report = @()
+        $report += "=" * 65
+        $report += "$Title Report"
+        $report += "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        $report += "Computer:  $($env:COMPUTERNAME)"
+        $report += "=" * 65
+        $report += ""
+        
+        # Capture all output streams from the script block
+        $output = & $ScriptBlock *>&1
+        foreach ($line in $output) {
+            $text = $line.ToString()
+            # Strip ANSI/color codes if any, and format cleanly
+            $report += $text
+        }
+        
+        $report | Out-File -FilePath $reportPath -Encoding UTF8 -ErrorAction Stop
+        Write-Success "Report saved to: $reportPath"
+        
+        $open = Get-ValidatedChoice -Prompt "Open report in Notepad? (Y/N)" -ValidChoices @("Y", "N")
+        if ($open -eq "Y") {
+            try {
+                notepad $reportPath
+            }
+            catch {
+                Write-DiagWarning "Could not open report. Navigate to: $reportPath"
+            }
+        }
+    }
+    catch {
+        Write-DiagError "Failed to save report: $($_.Exception.Message)"
+    }
+}
+
 function Export-SystemReport {
     <#
     .SYNOPSIS
@@ -4085,7 +5059,7 @@ function Test-IISHealth {
     }
 
     # 1. Check IIS Services
-    Write-Info "`nChecking IIS Core Services Status..."
+    Write-Section "IIS Core Services Status"
     $iisServices = @("W3SVC", "WAS", "IISADMIN")
     foreach ($svc in $iisServices) {
         try {
@@ -4108,7 +5082,7 @@ function Test-IISHealth {
     }
 
     # 2. Check AppPools
-    Write-Info "`nChecking Application Pools..."
+    Write-Section "Application Pools"
     try {
         if (Test-Path "IIS:\AppPools") {
             $appPools = Get-ChildItem "IIS:\AppPools" -ErrorAction SilentlyContinue
@@ -4137,7 +5111,7 @@ function Test-IISHealth {
     }
 
     # 3. Check Websites
-    Write-Info "`nChecking Websites..."
+    Write-Section "Websites"
     try {
         if (Test-Path "IIS:\Sites") {
             $sites = Get-ChildItem "IIS:\Sites" -ErrorAction SilentlyContinue
@@ -4164,7 +5138,7 @@ function Test-IISHealth {
     }
 
     # 4. Check Worker Processes
-    Write-Info "`nChecking IIS Worker Processes (w3wp.exe)..."
+    Write-Section "IIS Worker Processes (w3wp.exe)"
     try {
         $w3wps = Get-Process -Name w3wp -ErrorAction SilentlyContinue
         if ($w3wps) {
@@ -4196,7 +5170,7 @@ function Test-IISHealth {
     }
 
     # 5. Check AppPool Identities & Permissions
-    Write-Info "`nChecking AppPool Identities & Permissions..."
+    Write-Section "AppPool Identities & Permissions"
     try {
         if ($appPools) {
             foreach ($pool in $appPools) {
@@ -4233,7 +5207,7 @@ function Test-IISHealth {
     }
 
     # 6. Check Site Authentication Methods
-    Write-Info "`nChecking Site Authentication Methods..."
+    Write-Section "Site Authentication Methods"
     try {
         if ($sites) {
             foreach ($site in $sites) {
@@ -4263,7 +5237,7 @@ function Test-IISHealth {
     }
 
     # 7. Check SSL/TLS Certificate Validation
-    Write-Info "`nChecking SSL/TLS Certificates..."
+    Write-Section "SSL/TLS Certificates"
     try {
         if ($sites) {
             $checkedHashes = @()
@@ -4317,7 +5291,7 @@ function Test-IISHealth {
     }
 
     # 8. Check IP Restrictions
-    Write-Info "`nChecking IP Security Restrictions..."
+    Write-Section "IP Security Restrictions"
     try {
         if ($sites) {
             foreach ($site in $sites) {
@@ -4359,15 +5333,15 @@ function Show-MainMenu {
 
                                                                 
      WINDOWS SERVER TROUBLESHOOTING & LOG COLLECTION TOOL       
-                         Version 2.5                            
+                         Version 3.0
                                                                 
 
 "@ -ForegroundColor Cyan
 
     Write-Host "
 PRIMARY DIAGNOSTICS:" -ForegroundColor Yellow
-    Write-Host "  1. Network Issues (Packet Loss, Slowness, RSS Check)" -ForegroundColor White
-    Write-Host "  2. Memory Issues (High Usage, Top Consumers)" -ForegroundColor White
+    Write-Host "  1. Network Issues (Packet Loss, Slowness, RSS, MTU, Routing & 15+ checks)" -ForegroundColor White
+    Write-Host "  2. Memory Issues (Usage, Leaks, Page File, Hardware & 19 checks)" -ForegroundColor White
     Write-Host "  3. CPU Issues (High Usage, Process Analysis)" -ForegroundColor White
     Write-Host "  4. Disk/Storage Issues (Latency, Performance)" -ForegroundColor White
     Write-Host "  5. Windows Services Health" -ForegroundColor White
@@ -4455,11 +5429,21 @@ function Start-TroubleshootingTool {
                     Clear-Host
                     Test-NetworkConfiguration
                     Write-Host "`n"
+                    $saveChoice = Get-ValidatedChoice -Prompt "Save network analysis to file? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($saveChoice -eq "Y") {
+                        Export-DiagnosticSection -Title "Network_Analysis" -ScriptBlock { Test-NetworkConfiguration }
+                    }
+                    Write-Host "`n"
                     Start-NetworkLogCollection
                 }
                 "2" {
                     Clear-Host
                     Test-MemoryUsage
+                    Write-Host "`n"
+                    $saveChoice = Get-ValidatedChoice -Prompt "Save memory analysis to file? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($saveChoice -eq "Y") {
+                        Export-DiagnosticSection -Title "Memory_Analysis" -ScriptBlock { Test-MemoryUsage }
+                    }
                     Write-Host "`n"
                     Start-MemoryLogCollection
                 }
@@ -4467,11 +5451,21 @@ function Start-TroubleshootingTool {
                     Clear-Host
                     Test-CPUUsage
                     Write-Host "`n"
+                    $saveChoice = Get-ValidatedChoice -Prompt "Save CPU analysis to file? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($saveChoice -eq "Y") {
+                        Export-DiagnosticSection -Title "CPU_Analysis" -ScriptBlock { Test-CPUUsage }
+                    }
+                    Write-Host "`n"
                     Start-CPULogCollection
                 }
                 "4" {
                     Clear-Host
                     Test-DiskPerformance
+                    Write-Host "`n"
+                    $saveChoice = Get-ValidatedChoice -Prompt "Save disk analysis to file? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($saveChoice -eq "Y") {
+                        Export-DiagnosticSection -Title "Disk_Analysis" -ScriptBlock { Test-DiskPerformance }
+                    }
                     Write-Host "`n"
                     Start-DiskLogCollection
                 }
@@ -4479,11 +5473,21 @@ function Start-TroubleshootingTool {
                     Clear-Host
                     Test-ServicesHealth
                     Write-Host "`n"
+                    $saveChoice = Get-ValidatedChoice -Prompt "Save services health to file? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($saveChoice -eq "Y") {
+                        Export-DiagnosticSection -Title "Services_Health" -ScriptBlock { Test-ServicesHealth }
+                    }
+                    Write-Host "`n"
                     Start-ServicesLogCollection
                 }
                 "6" {
                     Clear-Host
                     Test-EventLogHealth
+                    Write-Host "`n"
+                    $saveChoice = Get-ValidatedChoice -Prompt "Save event log analysis to file? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($saveChoice -eq "Y") {
+                        Export-DiagnosticSection -Title "EventLog_Analysis" -ScriptBlock { Test-EventLogHealth }
+                    }
                     Write-Host "`n"
                     Start-EventLogCollection
                 }
@@ -4491,17 +5495,32 @@ function Start-TroubleshootingTool {
                     Clear-Host
                     Test-DNSHealth
                     Write-Host "`n"
+                    $saveChoice = Get-ValidatedChoice -Prompt "Save DNS health to file? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($saveChoice -eq "Y") {
+                        Export-DiagnosticSection -Title "DNS_Health" -ScriptBlock { Test-DNSHealth }
+                    }
+                    Write-Host "`n"
                     Start-DNSLogCollection
                 }
                 "8" {
                     Clear-Host
                     Test-SecurityAuthentication
                     Write-Host "`n"
+                    $saveChoice = Get-ValidatedChoice -Prompt "Save security authentication to file? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($saveChoice -eq "Y") {
+                        Export-DiagnosticSection -Title "Security_Authentication" -ScriptBlock { Test-SecurityAuthentication }
+                    }
+                    Write-Host "`n"
                     Start-SecurityLogCollection
                 }
                 "9" {
                     Clear-Host
                     Test-WindowsUpdateStatus
+                    Write-Host "`n"
+                    $saveChoice = Get-ValidatedChoice -Prompt "Save Windows Update status to file? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($saveChoice -eq "Y") {
+                        Export-DiagnosticSection -Title "Windows_Update" -ScriptBlock { Test-WindowsUpdateStatus }
+                    }
                     Write-Host "`n"
                     Start-WindowsUpdateLogCollection
                 }
