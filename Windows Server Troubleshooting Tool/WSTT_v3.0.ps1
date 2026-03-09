@@ -3042,7 +3042,9 @@ function Test-DiskPerformance {
     .SYNOPSIS
         Analyzes disk performance
     .DESCRIPTION
-        Checks physical disks, logical disk space, latency, and cluster size
+        Checks physical disks, logical disk space, latency, cluster size, IOPS, throughput,
+        media type, SMART health, VSS snapshots, Storage Spaces, fragmentation, pagefile
+        placement, filter drivers, MPIO, ReFS/NTFS, disk busy time, and storage tiering
     .EXAMPLE
         Test-DiskPerformance
     #>
@@ -3244,6 +3246,444 @@ function Test-DiskPerformance {
             }
         }
     }
+
+    #region v3.0 Disk Checks
+
+    # 1. Disk IOPS (Read + Write)
+    Write-Section "Disk IOPS"
+    try {
+        $readIOPS = Get-Counter '\PhysicalDisk(*)\Disk Reads/sec' -ErrorAction Stop
+        $writeIOPS = Get-Counter '\PhysicalDisk(*)\Disk Writes/sec' -ErrorAction Stop
+        foreach ($sample in $readIOPS.CounterSamples) {
+            if ($sample.InstanceName -ne "_total" -and ($sample.CookedValue -gt 0)) {
+                $wSample = $writeIOPS.CounterSamples | Where-Object { $_.InstanceName -eq $sample.InstanceName }
+                $rIOPS = [math]::Round($sample.CookedValue, 0)
+                $wIOPS = if ($wSample) { [math]::Round($wSample.CookedValue, 0) } else { 0 }
+                $totalIOPS = $rIOPS + $wIOPS
+                Write-Info "  $($sample.InstanceName): Read=$rIOPS Write=$wIOPS Total=$totalIOPS IOPS"
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check disk IOPS"
+    }
+
+    # 2. Disk Throughput (MB/sec)
+    Write-Section "Disk Throughput"
+    try {
+        $readTP = Get-Counter '\PhysicalDisk(*)\Disk Read Bytes/sec' -ErrorAction Stop
+        $writeTP = Get-Counter '\PhysicalDisk(*)\Disk Write Bytes/sec' -ErrorAction Stop
+        foreach ($sample in $readTP.CounterSamples) {
+            if ($sample.InstanceName -ne "_total" -and ($sample.CookedValue -gt 0 -or ($writeTP.CounterSamples | Where-Object { $_.InstanceName -eq $sample.InstanceName }).CookedValue -gt 0)) {
+                $wSample = $writeTP.CounterSamples | Where-Object { $_.InstanceName -eq $sample.InstanceName }
+                $rMBs = [math]::Round($sample.CookedValue / 1MB, 2)
+                $wMBs = if ($wSample) { [math]::Round($wSample.CookedValue / 1MB, 2) } else { 0 }
+                Write-Info "  $($sample.InstanceName): Read=${rMBs} MB/s Write=${wMBs} MB/s"
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check disk throughput"
+    }
+
+    # 3. Storage Media Type (SSD vs HDD)
+    Write-Section "Storage Media Type"
+    try {
+        $physDisks = Get-PhysicalDisk -ErrorAction Stop
+        foreach ($pd in $physDisks) {
+            $mediaType = if ($pd.MediaType) { $pd.MediaType } else { "Unknown" }
+            $busType = if ($pd.BusType) { $pd.BusType } else { "Unknown" }
+            $sizeGB = [math]::Round($pd.Size / 1GB, 1)
+            Write-Info "  $($pd.FriendlyName): $mediaType ($busType) - ${sizeGB}GB"
+            if ($mediaType -eq "HDD") {
+                Write-DiagWarning "    HDD detected — expect higher latency than SSD; critical for SQL/database workloads"
+            }
+            if ($mediaType -eq "Unspecified" -and $busType -like "*iSCSI*") {
+                Write-Info "    iSCSI LUN — media type depends on SAN backend"
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not determine storage media types"
+    }
+
+    # 4. SMART / Predictive Failure Detection
+    Write-Section "Disk Health & Predictive Failure"
+    try {
+        $physDisks = Get-PhysicalDisk -ErrorAction Stop
+        foreach ($pd in $physDisks) {
+            $health = $pd.HealthStatus
+            $opStatus = $pd.OperationalStatus
+            if ($health -ne "Healthy" -or $opStatus -ne "OK") {
+                Write-DiagError "  $($pd.FriendlyName): Health=$health OpStatus=$opStatus"
+                if ($health -like "*Predict*" -or $health -like "*Warning*") {
+                    Write-DiagError "    PREDICTIVE FAILURE — replace this disk immediately!"
+                }
+            }
+            else {
+                Write-Success "  $($pd.FriendlyName): Health=$health OpStatus=$opStatus"
+            }
+        }
+        # Also check via WMI for SMART status
+        $smartDisks = Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction SilentlyContinue
+        if ($smartDisks) {
+            foreach ($sd in $smartDisks) {
+                if ($sd.PredictFailure) {
+                    Write-DiagError "  SMART Predictive Failure on InstanceName: $($sd.InstanceName)"
+                }
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check disk health: $($_.Exception.Message)"
+    }
+
+    # 5. Volume Shadow Copy (VSS) Snapshot Space
+    Write-Section "VSS Shadow Copy Usage"
+    try {
+        $shadows = Get-CimInstance Win32_ShadowCopy -ErrorAction SilentlyContinue
+        if ($shadows) {
+            $shadowsByVolume = $shadows | Group-Object VolumeName
+            foreach ($group in $shadowsByVolume) {
+                $count = $group.Count
+                $totalSizeMB = [math]::Round(($group.Group | Measure-Object -Property MaxSize -Sum).Sum / 1MB, 0)
+                $oldestDate = ($group.Group | Sort-Object InstallDate | Select-Object -First 1).InstallDate
+                Write-Info "  Volume $($group.Name): $count snapshot(s)"
+                if ($count -gt 10) {
+                    Write-DiagWarning "    $count VSS snapshots — orphaned snapshots consuming hidden disk space"
+                    Write-Info "    Clean up: vssadmin delete shadows /for=$($group.Name) /oldest"
+                }
+            }
+            Write-Info "  Total VSS snapshots: $($shadows.Count)"
+        }
+        else {
+            Write-Info "  No VSS shadow copies found"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check VSS snapshots"
+    }
+
+    # Check VSS writers health
+    try {
+        $vssWriters = vssadmin list writers 2>&1
+        $failedWriters = $vssWriters | Select-String 'State:.*Failed|State:.*Not responding|State:.*Waiting for completion' -ErrorAction SilentlyContinue
+        if ($failedWriters) {
+            Write-DiagWarning "  VSS Writer issues detected:"
+            foreach ($fw in $failedWriters) {
+                Write-DiagWarning "    $($fw.Line.Trim())"
+            }
+        }
+        else {
+            Write-Success "  All VSS writers are stable"
+        }
+    }
+    catch { }
+
+    # 6. Storage Spaces / Pool Health
+    Write-Section "Storage Spaces & Pool Health"
+    try {
+        $pools = Get-StoragePool -ErrorAction SilentlyContinue | Where-Object { $_.IsPrimordial -eq $false }
+        if ($pools) {
+            foreach ($pool in $pools) {
+                $health = $pool.HealthStatus
+                $opStatus = $pool.OperationalStatus
+                $sizeGB = [math]::Round($pool.Size / 1GB, 1)
+                $allocGB = [math]::Round($pool.AllocatedSize / 1GB, 1)
+                Write-Info "  Pool '$($pool.FriendlyName)': $allocGB/$sizeGB GB allocated"
+                if ($health -ne "Healthy") {
+                    Write-DiagError "    Pool Health: $health ($opStatus)"
+                    # Check for degraded virtual disks
+                    $vDisks = Get-VirtualDisk -StoragePool $pool -ErrorAction SilentlyContinue
+                    foreach ($vd in $vDisks) {
+                        if ($vd.HealthStatus -ne "Healthy" -or $vd.OperationalStatus -ne "OK") {
+                            Write-DiagError "    VDisk '$($vd.FriendlyName)': $($vd.HealthStatus) / $($vd.OperationalStatus)"
+                            if ($vd.OperationalStatus -like "*Degraded*") {
+                                Write-DiagError "      DEGRADED — rebuild in progress or missing disk!"
+                            }
+                        }
+                    }
+                }
+                else {
+                    Write-Success "    Pool Health: Healthy"
+                }
+            }
+        }
+        else {
+            Write-Info "  No Storage Spaces pools configured"
+        }
+    }
+    catch {
+        Write-Info "  Storage Spaces not available or not configured"
+    }
+
+    # 7. Disk Fragmentation Level
+    Write-Section "Disk Fragmentation"
+    if ($cachedVolumes) {
+        foreach ($vol in ($cachedVolumes | Where-Object { $_.DriveLetter -and $_.Size -gt 0 })) {
+            try {
+                $defragInfo = Optimize-Volume -DriveLetter $vol.DriveLetter -Analyze -Verbose 4>&1 -ErrorAction Stop
+                $fragLine = $defragInfo | Select-String 'fragmented|Current' -ErrorAction SilentlyContinue
+                if ($fragLine) {
+                    Write-Info "  Drive $($vol.DriveLetter): $($fragLine.Line.Trim())"
+                }
+                else {
+                    Write-Info "  Drive $($vol.DriveLetter): Analysis completed (check verbose output for details)"
+                }
+            }
+            catch {
+                # Optimize-Volume may fail on system volumes or SSDs (TRIM instead)
+                Write-Info "  Drive $($vol.DriveLetter): Cannot analyze (SSD uses TRIM, or volume is in use)"
+            }
+        }
+    }
+
+    # 8. Pagefile Disk Placement
+    Write-Section "Pagefile Disk Placement"
+    try {
+        $pageFiles = Get-CimInstance Win32_PageFileUsage -ErrorAction Stop
+        if ($pageFiles) {
+            foreach ($pf in $pageFiles) {
+                $pfDrive = $pf.Name.Substring(0, 2)
+                Write-Info "  Page file: $($pf.Name) ($($pf.AllocatedBaseSize) MB)"
+                # Check if pagefile is on the OS drive
+                $osDrive = $env:SystemDrive
+                if ($pfDrive -eq $osDrive) {
+                    Write-DiagWarning "    Page file is on the OS drive ($osDrive) — may cause I/O contention"
+                    Write-Info "    For high-performance servers, place page file on a separate disk"
+                }
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check pagefile placement"
+    }
+
+    # 9. Temp/TempDB Disk Check
+    Write-Section "TEMP & SQL TempDB Location"
+    try {
+        $tempPath = $env:TEMP
+        $tempDrive = $tempPath.Substring(0, 2)
+        $osDrive = $env:SystemDrive
+        Write-Info "  Windows TEMP: $tempPath (Drive: $tempDrive)"
+        if ($tempDrive -eq $osDrive) {
+            Write-Info "    TEMP is on OS drive — normal for most servers"
+        }
+
+        # Check SQL TempDB if SQL is running
+        if ($script:ClusterEnv.IsAGInstalled -or (Get-Service -Name "MSSQLSERVER" -ErrorAction SilentlyContinue)) {
+            try {
+                $conn = New-Object System.Data.SqlClient.SqlConnection "Server=.;Integrated Security=True;Connection Timeout=5"
+                $conn.Open()
+                $cmd = $conn.CreateCommand()
+                $cmd.CommandText = "SELECT physical_name FROM sys.master_files WHERE database_id = DB_ID('tempdb')"
+                $reader = $cmd.ExecuteReader()
+                while ($reader.Read()) {
+                    $tempDbPath = $reader["physical_name"]
+                    $tempDbDrive = $tempDbPath.Substring(0, 2)
+                    Write-Info "  SQL TempDB: $tempDbPath"
+                    if ($tempDbDrive -eq $osDrive) {
+                        Write-DiagWarning "    TempDB on OS drive ($osDrive) — move to a dedicated fast disk for production"
+                    }
+                }
+                $reader.Close()
+                $conn.Close()
+            }
+            catch {
+                Write-Info "  Could not query SQL TempDB location"
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check TEMP locations"
+    }
+
+    # 10. Filter Driver Stack (fltmc)
+    Write-Section "File System Filter Drivers"
+    try {
+        $fltmcOutput = fltmc 2>&1
+        $filterLines = $fltmcOutput | Select-String '^\s*\d+' -ErrorAction SilentlyContinue
+        if ($filterLines) {
+            $filterCount = $filterLines.Count
+            Write-Info "  Active filter drivers: $filterCount"
+            foreach ($fl in $filterLines | Select-Object -First 15) {
+                $line = $fl.Line.Trim()
+                # Flag known high-impact AV filters
+                if ($line -match 'WdFilter|csagent|SentinelMonitor|SymEFA|savonaccess|CbFilter|epfw|tmPreFilter') {
+                    Write-DiagWarning "    $line  [AV/Security filter — impacts I/O latency]"
+                }
+                else {
+                    Write-Info "    $line"
+                }
+            }
+            if ($filterCount -gt 15) {
+                Write-Info "    ... and $($filterCount - 15) more"
+            }
+            if ($filterCount -gt 10) {
+                Write-DiagWarning "  $filterCount filter drivers is HIGH — each adds latency to every I/O operation"
+            }
+        }
+        else {
+            Write-Info "  No filter drivers detected (or fltmc not available)"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not enumerate filter drivers"
+    }
+
+    # Check filter instances
+    try {
+        $fltmcInst = fltmc instances 2>&1
+        $instanceCount = ($fltmcInst | Select-String '^\s*\S+' | Where-Object { $_.Line -notmatch 'Filter|Instance|---' }).Count
+        if ($instanceCount -gt 0) {
+            Write-Info "  Filter instances attached to volumes: $instanceCount"
+        }
+    }
+    catch { }
+
+    # 11. Disk Timeout & Retry Settings
+    Write-Section "Disk Timeout Configuration"
+    try {
+        $diskTimeout = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Disk' -Name 'TimeOutValue' -ErrorAction SilentlyContinue
+        $timeoutValue = if ($diskTimeout -and $diskTimeout.TimeOutValue) { $diskTimeout.TimeOutValue } else { 60 }
+        Write-Info "  Disk I/O Timeout: $timeoutValue seconds"
+        if ($timeoutValue -eq 60) {
+            Write-Info "    Default value (60s) — appropriate for most configurations"
+        }
+        elseif ($timeoutValue -lt 30) {
+            Write-DiagWarning "    LOW timeout (${timeoutValue}s) — may cause premature I/O failures on slow SAN paths"
+        }
+        elseif ($timeoutValue -gt 120) {
+            Write-DiagWarning "    HIGH timeout (${timeoutValue}s) — I/O hangs will take very long to surface as errors"
+        }
+
+        # Check SAN-specific timeout for iSCSI
+        $iscsiTimeout = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e97b-e325-11ce-bfc1-08002be10318}\0000' -Name 'LinkDownTime' -ErrorAction SilentlyContinue
+        if ($iscsiTimeout -and $iscsiTimeout.LinkDownTime) {
+            Write-Info "  iSCSI Link Down Time: $($iscsiTimeout.LinkDownTime) seconds"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check disk timeout settings"
+    }
+
+    # 12. MPIO (Multipath I/O) Status
+    Write-Section "MPIO (Multipath I/O)"
+    try {
+        $mpioFeature = Get-WindowsFeature -Name Multipath-IO -ErrorAction SilentlyContinue
+        if ($mpioFeature -and $mpioFeature.Installed) {
+            Write-Success "  MPIO feature is installed"
+            try {
+                $mpioDevices = Get-MSDSMSupportedHW -ErrorAction SilentlyContinue
+                if ($mpioDevices) {
+                    Write-Info "  Supported MPIO hardware entries: $(@($mpioDevices).Count)"
+                }
+            }
+            catch { }
+
+            # Check MPIO paths
+            try {
+                $mpioDisks = mpclaim -s -d 2>&1
+                $pathLines = $mpioDisks | Select-String 'MPIO Disk' -ErrorAction SilentlyContinue
+                if ($pathLines) {
+                    Write-Info "  MPIO disks detected: $($pathLines.Count)"
+                    # Look for degraded paths
+                    $degradedPaths = $mpioDisks | Select-String 'Failed|Standby' -ErrorAction SilentlyContinue
+                    if ($degradedPaths) {
+                        Write-DiagWarning "  DEGRADED MPIO paths detected:"
+                        foreach ($dp in $degradedPaths | Select-Object -First 5) {
+                            Write-DiagWarning "    $($dp.Line.Trim())"
+                        }
+                    }
+                    else {
+                        Write-Success "  All MPIO paths are active"
+                    }
+                }
+            }
+            catch {
+                Write-Info "  Could not query MPIO disk paths (mpclaim not available)"
+            }
+        }
+        else {
+            Write-Info "  MPIO feature not installed (not needed for local storage)"
+        }
+    }
+    catch {
+        Write-Info "  Could not check MPIO status (Get-WindowsFeature may not be available)"
+    }
+
+    # 13. ReFS vs NTFS Detection
+    Write-Section "File System Type per Volume"
+    if ($cachedVolumes) {
+        foreach ($vol in ($cachedVolumes | Where-Object { $_.DriveLetter -and $_.Size -gt 0 })) {
+            $fsType = $vol.FileSystemType
+            $sizeGB = [math]::Round($vol.Size / 1GB, 1)
+            Write-Info "  Drive $($vol.DriveLetter): $fsType (${sizeGB}GB)"
+            if ($fsType -eq "ReFS") {
+                Write-Info "    ReFS: Integrity streams, auto-repair. Optimal for Hyper-V, Veeam, Storage Spaces Direct"
+                Write-Info "    Note: ReFS does not support file-level compression or encryption"
+            }
+        }
+    }
+
+    # 14. Disk Busy Time %
+    Write-Section "Disk Busy Time"
+    try {
+        $diskTime = Get-Counter '\PhysicalDisk(*)\% Disk Time' -ErrorAction Stop
+        foreach ($sample in $diskTime.CounterSamples) {
+            if ($sample.InstanceName -ne "_total") {
+                $busyPercent = [math]::Round($sample.CookedValue, 1)
+                # % Disk Time can exceed 100% on multi-spindle arrays; cap display
+                $displayPercent = [math]::Min($busyPercent, 100)
+                if ($busyPercent -gt 80) {
+                    Write-DiagWarning "  $($sample.InstanceName): $displayPercent% busy — disk is the bottleneck"
+                }
+                elseif ($busyPercent -gt 50) {
+                    Write-Info "  $($sample.InstanceName): $displayPercent% busy (moderate load)"
+                }
+                elseif ($busyPercent -gt 0) {
+                    Write-Info "  $($sample.InstanceName): $displayPercent% busy"
+                }
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check disk busy time"
+    }
+
+    # 15. Storage Tiering Status (Storage Spaces Direct / Tiered Volumes)
+    Write-Section "Storage Tiering"
+    try {
+        $tiers = Get-StorageTier -ErrorAction SilentlyContinue
+        if ($tiers) {
+            Write-Info "  Storage tiers configured:"
+            foreach ($tier in $tiers) {
+                $tierSizeGB = [math]::Round($tier.Size / 1GB, 1)
+                $mediaType = $tier.MediaType
+                Write-Info "    $($tier.FriendlyName): $mediaType - ${tierSizeGB}GB"
+            }
+
+            # Check tier optimization schedule
+            try {
+                $tierTask = Get-ScheduledTask -TaskName "Storage Tiers Optimization" -ErrorAction SilentlyContinue
+                if ($tierTask) {
+                    Write-Info "  Tiering optimization task: $($tierTask.State)"
+                    if ($tierTask.State -ne 'Ready' -and $tierTask.State -ne 'Running') {
+                        Write-DiagWarning "    Tiering task is $($tierTask.State) — hot data may not be promoted to SSD tier"
+                    }
+                }
+            }
+            catch { }
+        }
+        else {
+            Write-Info "  No storage tiers configured (standard non-tiered storage)"
+        }
+    }
+    catch {
+        Write-Info "  Storage tiering not available"
+    }
+
+    #endregion v3.0 Disk Checks
 }
 
 function Start-DiskLogCollection {
@@ -6259,7 +6699,7 @@ PRIMARY DIAGNOSTICS:" -ForegroundColor Yellow
     Write-Host "  1. Network Issues (Packet Loss, Slowness, RSS, MTU, Routing & 15+ checks)" -ForegroundColor White
     Write-Host "  2. Memory Issues (Usage, Leaks, Page File, Hardware & 19 checks)" -ForegroundColor White
     Write-Host "  3. CPU Issues (Per-Core, Queue, Interrupts, Throttling & 24 checks)" -ForegroundColor White
-    Write-Host "  4. Disk/Storage Issues (Latency, Performance)" -ForegroundColor White
+    Write-Host "  4. Disk/Storage Issues (IOPS, Latency, SMART, VSS, MPIO & 24 checks)" -ForegroundColor White
     Write-Host "  5. Windows Services Health" -ForegroundColor White
     Write-Host "  6. Event Log Analysis" -ForegroundColor White
     Write-Host "  7. DNS Health & Connectivity" -ForegroundColor White
