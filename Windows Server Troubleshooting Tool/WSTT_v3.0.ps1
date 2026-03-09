@@ -9,10 +9,15 @@
 
     v3.0 Highlights:
       - 25+ Network checks (gateway, duplex, MTU, offload, routing, proxy, RDMA, NIC drivers)
+      - 24 CPU checks (per-core, queue length, interrupts, DPC, power throttling, AV detection, NUMA)
+      - 24 Disk checks (IOPS, throughput, SMART, VSS, MPIO, filter drivers, storage tiering)
       - 19 Memory checks (page file, compression, handle/thread leaks, standby cache, RAM hardware)
       - Cluster-safe: detects AG role, CSV paths, heartbeat NICs, quorum health
       - SQL AG awareness: replica role detection, listener DNS, replication counters
       - Server 2025 ready: LBFO→SET fallback, Chimney deprecation handled
+      - Server Baseline Validation (AD OU, license, crash dump, drivers, software inventory)
+      - Task Scheduler Diagnostics (failed tasks, stuck tasks, orphaned, credential, SDDL audit)
+      - HTML Diagnostic Report generation (dark-themed, collapsible, color-coded)
       - Clean formatted output with --- Section --- dividers and [ERROR]/[SUCCESS] tags
       - Save-to-file option on all diagnostic sections (options 1-9)
       - Non-English locale detection at startup
@@ -47,6 +52,23 @@
                   dividers, save-to-file prompt on all 9 primary diagnostics
       [Bugs]      Get-WmiObject→Get-CimInstance, WorkingSet→WorkingSet64, klist null-safe,
                   CBS.log path corrected, TSS argument safety, event property bounds check
+      [CPU]       15 new checks: per-core hotspots, privileged vs user time, processor queue,
+                  context switches, interrupt/DPC time, uptime, power throttling, AV/filter
+                  driver CPU, Hyper-V overhead, real-time 5s sampling, thread/process counts,
+                  DPC queue rate, NUMA imbalance, WHEA/thermal events, process affinity
+      [Disk]      15 new checks: IOPS, throughput, media type (SSD/HDD), SMART predictive
+                  failure, VSS snapshots/writers, Storage Spaces pools, fragmentation,
+                  pagefile placement, TempDB location, filter driver stack, disk timeout,
+                  MPIO paths, ReFS/NTFS detection, disk busy time, storage tiering
+      [TaskSched] 8 checks: failed tasks with error decoding, stuck/long-running tasks,
+                  disabled tasks, high-privilege audit, credential failures, SDDL permissions,
+                  orphaned executables, trigger health (expired/disabled)
+      [Baseline]  9 checks from Validator scripts: AD OU path, license activation, crash dump
+                  config, installed software, NIC power save, Windows features, NTFS 8.3,
+                  page file clear at shutdown, critical system driver versions
+      [Report]    HTML diagnostic report: dark-themed, collapsible sections, color-coded
+                  output, runs all 12 diagnostics, opens in browser
+      [Fix]       System.Web.HttpUtility→System.Net.WebUtility for Server 2019/Core compat
 #>
 
 param(
@@ -7012,6 +7034,426 @@ function Test-TaskSchedulerHealth {
 }
 #endregion
 
+function Test-ServerBaseline {
+    <#
+    .SYNOPSIS
+        Performs SOE baseline validation checks from Validator scripts
+    .DESCRIPTION
+        Checks AD OU, license activation, crash dump config, installed software,
+        NIC power save, Windows features, NTFS 8.3, page file clear, and driver versions
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Header "Server Baseline Validation"
+
+    # 1. AD OU Path Detection
+    Write-Section "Active Directory OU Path"
+    try {
+        $domain = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Domain
+        if ($domain -and $domain -ne "WORKGROUP") {
+            try {
+                $searcher = New-Object System.DirectoryServices.DirectorySearcher
+                $searcher.Filter = "(&(objectClass=computer)(name=$env:COMPUTERNAME))"
+                $searcher.PropertiesToLoad.Add("distinguishedName") | Out-Null
+                $result = $searcher.FindOne()
+                if ($result) {
+                    $dn = $result.Properties["distinguishedname"][0]
+                    $ou = $dn.Substring($env:COMPUTERNAME.Length + 4)
+                    Write-Info "  Computer: $env:COMPUTERNAME"
+                    Write-Info "  DN: $dn"
+                    Write-Info "  OU: $ou"
+                }
+                else {
+                    Write-DiagWarning "  Computer object not found in AD"
+                }
+            }
+            catch {
+                Write-DiagWarning "  Could not query AD: $($_.Exception.Message)"
+            }
+        }
+        else {
+            Write-Info "  Server is not domain-joined (WORKGROUP)"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not determine domain membership"
+    }
+
+    # 2. Windows License/Activation Status
+    Write-Section "Windows License & Activation"
+    try {
+        $license = Get-CimInstance SoftwareLicensingProduct -ErrorAction Stop |
+            Where-Object { $_.PartialProductKey -and $_.ApplicationId -eq '55c92734-d682-4d71-983e-d6ec3f16059f' } |
+            Select-Object -First 1
+        if ($license) {
+            $statusText = switch ($license.LicenseStatus) {
+                0 { "Unlicensed" }
+                1 { "Licensed" }
+                2 { "OOBGrace (Out-of-Box Grace)" }
+                3 { "OOTGrace (Out-of-Tolerance Grace)" }
+                4 { "NonGenuineGrace" }
+                5 { "Notification" }
+                6 { "ExtendedGrace" }
+                default { "Unknown ($($license.LicenseStatus))" }
+            }
+            Write-Info "  Product: $($license.Name)"
+            Write-Info "  Status: $statusText"
+            Write-Info "  Partial Key: $($license.PartialProductKey)"
+            if ($license.LicenseStatus -ne 1) {
+                Write-DiagError "  SERVER IS NOT PROPERLY LICENSED!"
+                Write-Info "  Run: slmgr /ato to attempt activation"
+            }
+            else {
+                Write-Success "  Windows is properly activated"
+            }
+        }
+        else {
+            Write-DiagWarning "  Could not determine license status"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check activation: $($_.Exception.Message)"
+    }
+
+    # 3. Crash Dump Configuration
+    Write-Section "Crash Dump Configuration"
+    try {
+        $crashCtrl = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' -ErrorAction Stop
+        $dumpType = switch ($crashCtrl.CrashDumpEnabled) {
+            0 { "None (CRITICAL - no dump on crash!)" }
+            1 { "Complete Memory Dump" }
+            2 { "Kernel Memory Dump" }
+            3 { "Small Memory Dump (minidump)" }
+            7 { "Automatic Memory Dump (recommended)" }
+            default { "Unknown ($($crashCtrl.CrashDumpEnabled))" }
+        }
+        Write-Info "  Dump Type: $dumpType"
+        Write-Info "  Dump File: $($crashCtrl.DumpFile)"
+        Write-Info "  Auto Restart: $(if ($crashCtrl.AutoReboot -eq 1) { 'Yes' } else { 'No' })"
+        Write-Info "  Overwrite Existing: $(if ($crashCtrl.Overwrite -eq 1) { 'Yes' } else { 'No' })"
+
+        if ($crashCtrl.CrashDumpEnabled -eq 0) {
+            Write-DiagError "  NO crash dumps configured! Enable Automatic Memory Dump for debugging"
+        }
+        elseif ($crashCtrl.CrashDumpEnabled -eq 3) {
+            Write-DiagWarning "  Small dumps only — insufficient for most crash analysis. Recommend Automatic (7) or Kernel (2)"
+        }
+
+        # Check if dedicated dump file location has space
+        $dumpPath = Split-Path $crashCtrl.DumpFile -Parent -ErrorAction SilentlyContinue
+        if ($dumpPath) {
+            $dumpDrive = $dumpPath.Substring(0, 2)
+            $vol = Get-Volume -DriveLetter $dumpDrive[0] -ErrorAction SilentlyContinue
+            if ($vol) {
+                $freeGB = [math]::Round($vol.SizeRemaining / 1GB, 1)
+                $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory / 1GB, 0)
+                Write-Info "  Dump drive ($dumpDrive): ${freeGB}GB free (RAM: ${ramGB}GB)"
+                if ($freeGB -lt $ramGB) {
+                    Write-DiagWarning "  Dump drive has less free space than RAM — complete dump may fail"
+                }
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check crash dump config: $($_.Exception.Message)"
+    }
+
+    # 4. Installed Software Inventory (non-Microsoft, top 20)
+    Write-Section "Installed Software (non-Microsoft, top 20)"
+    try {
+        $regPaths = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        )
+        $software = foreach ($path in $regPaths) {
+            if (Test-Path $path) {
+                Get-ItemProperty $path -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DisplayName -and $_.Publisher -and $_.Publisher -notlike '*Microsoft*' } |
+                    Select-Object DisplayName, DisplayVersion, Publisher, InstallDate
+            }
+        }
+        $software = $software | Sort-Object DisplayName -Unique
+        if ($software) {
+            Write-Info "  Non-Microsoft software: $(@($software).Count) packages"
+            $software | Select-Object -First 20 | ForEach-Object {
+                $ver = if ($_.DisplayVersion) { "v$($_.DisplayVersion)" } else { "" }
+                Write-Info "    $($_.DisplayName) $ver ($($_.Publisher))"
+            }
+            if (@($software).Count -gt 20) {
+                Write-Info "    ... and $(@($software).Count - 20) more"
+            }
+        }
+        else {
+            Write-Info "  No non-Microsoft software found"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not enumerate installed software"
+    }
+
+    # 5. NIC Power Save Setting
+    Write-Section "NIC Power Management (Allow Turn Off)"
+    try {
+        $netAdapters = Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' }
+        foreach ($nic in $netAdapters) {
+            try {
+                $pnpDevice = Get-CimInstance Win32_NetworkAdapter -Filter "NetConnectionID='$($nic.Name)'" -ErrorAction SilentlyContinue
+                if ($pnpDevice -and $pnpDevice.PNPDeviceID) {
+                    $powerMgmt = Get-CimInstance MSPower_DeviceEnable -Namespace root\wmi -ErrorAction SilentlyContinue |
+                        Where-Object { $_.InstanceName -like "*$($pnpDevice.PNPDeviceID)*" }
+                    if ($powerMgmt) {
+                        if ($powerMgmt.Enable) {
+                            Write-DiagWarning "  $($nic.Name): Power save ENABLED — can cause intermittent disconnects on servers!"
+                            Write-Info "    Disable: Device Manager → NIC → Power Management → Uncheck 'Allow to turn off'"
+                        }
+                        else {
+                            Write-Success "  $($nic.Name): Power save disabled (good for servers)"
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check NIC power management"
+    }
+
+    # 6. Windows Features Installed
+    Write-Section "Installed Windows Features"
+    try {
+        if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
+            $features = Get-WindowsFeature -ErrorAction Stop | Where-Object { $_.Installed -eq $true }
+            $roleFeatures = $features | Where-Object { $_.FeatureType -eq 'Role' }
+            $featureFeatures = $features | Where-Object { $_.FeatureType -eq 'Feature' -or $_.FeatureType -eq 'Role Service' }
+            Write-Info "  Installed Roles: $(@($roleFeatures).Count)"
+            foreach ($r in $roleFeatures) {
+                Write-Info "    [Role] $($r.DisplayName)"
+            }
+            Write-Info "  Installed Features/Role Services: $(@($featureFeatures).Count)"
+            $featureFeatures | Select-Object -First 15 | ForEach-Object {
+                Write-Info "    $($_.DisplayName)"
+            }
+            if (@($featureFeatures).Count -gt 15) {
+                Write-Info "    ... and $(@($featureFeatures).Count - 15) more"
+            }
+        }
+        else {
+            Write-Info "  Get-WindowsFeature not available (workstation OS)"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not enumerate Windows features"
+    }
+
+    # 7. NTFS 8.3 Short Name Setting
+    Write-Section "NTFS 8.3 Short Name Generation"
+    try {
+        $ntfs83 = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name 'NtfsDisable8dot3NameCreation' -ErrorAction SilentlyContinue
+        $val = if ($ntfs83) { $ntfs83.NtfsDisable8dot3NameCreation } else { 0 }
+        $statusText = switch ($val) {
+            0 { "Enabled on all volumes (default — performance overhead on large volumes)" }
+            1 { "Disabled on all volumes (recommended for servers)" }
+            2 { "Enabled per-volume (NTFS setting)" }
+            3 { "Disabled except system volume" }
+            default { "Unknown ($val)" }
+        }
+        Write-Info "  NtfsDisable8dot3NameCreation: $val — $statusText"
+        if ($val -eq 0) {
+            Write-DiagWarning "  Consider disabling 8.3 names for performance on high-file-count volumes"
+            Write-Info "  Set: fsutil behavior set disable8dot3 1"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check 8.3 name setting"
+    }
+
+    # 8. Clear Page File at Shutdown
+    Write-Section "Clear Page File at Shutdown"
+    try {
+        $clearPF = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -Name 'ClearPageFileAtShutdown' -ErrorAction SilentlyContinue
+        $enabled = if ($clearPF -and $clearPF.ClearPageFileAtShutdown -eq 1) { $true } else { $false }
+        if ($enabled) {
+            Write-Success "  Page file cleared at shutdown (security compliant)"
+            Write-Info "  Note: This can significantly increase shutdown/restart time"
+        }
+        else {
+            Write-Info "  Page file NOT cleared at shutdown (faster restarts, but memory artifacts persist)"
+            Write-Info "  For compliance: Set ClearPageFileAtShutdown=1 in Memory Management registry"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check page file clear setting"
+    }
+
+    # 9. System Driver File Versions
+    Write-Section "Critical System Driver Versions"
+    try {
+        $criticalDrivers = @(
+            @{ Path = "$env:SystemRoot\System32\drivers\tcpip.sys"; Name = "TCP/IP Stack" },
+            @{ Path = "$env:SystemRoot\System32\drivers\afd.sys"; Name = "Ancillary Function Driver (Winsock)" },
+            @{ Path = "$env:SystemRoot\System32\drivers\storport.sys"; Name = "Storage Port Driver" },
+            @{ Path = "$env:SystemRoot\System32\drivers\ntfs.sys"; Name = "NTFS File System" },
+            @{ Path = "$env:SystemRoot\System32\drivers\mpio.sys"; Name = "Multipath I/O" },
+            @{ Path = "$env:SystemRoot\System32\drivers\mrxsmb.sys"; Name = "SMB Redirector" },
+            @{ Path = "$env:SystemRoot\System32\drivers\srv2.sys"; Name = "SMB Server" },
+            @{ Path = "$env:SystemRoot\System32\drivers\http.sys"; Name = "HTTP Protocol Stack" },
+            @{ Path = "$env:SystemRoot\System32\drivers\fltMgr.sys"; Name = "Filter Manager" },
+            @{ Path = "$env:SystemRoot\System32\drivers\ndis.sys"; Name = "NDIS Network Stack" }
+        )
+        foreach ($drv in $criticalDrivers) {
+            if (Test-Path $drv.Path) {
+                $fileInfo = Get-Item $drv.Path -ErrorAction SilentlyContinue
+                $ver = $fileInfo.VersionInfo.FileVersion
+                $lastWrite = $fileInfo.LastWriteTime.ToString('yyyy-MM-dd')
+                Write-Info "  $($drv.Name): v$ver ($lastWrite)"
+            }
+            else {
+                Write-Info "  $($drv.Name): Not present"
+            }
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not check driver versions"
+    }
+}
+
+function Export-HTMLReport {
+    <#
+    .SYNOPSIS
+        Generates a comprehensive HTML diagnostic report
+    .DESCRIPTION
+        Runs all diagnostic checks and produces a styled, collapsible HTML report
+    #>
+    Write-Header "Generating HTML Diagnostic Report"
+
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $reportPath = Join-Path $script:DefaultLogPath "ServerReport_${env:COMPUTERNAME}_${timestamp}.html"
+
+    if (-not (Test-PathValid -Path $script:DefaultLogPath -CreateIfNotExist)) {
+        Write-DiagError "Cannot create report directory"
+        return
+    }
+
+    Write-Info "Running all diagnostics and capturing output..."
+    Write-Info "This may take 2-5 minutes..."
+
+    # Capture output from all major diagnostic functions
+    $sections = @(
+        @{ Title = "Server Baseline Validation"; Cmd = { Test-ServerBaseline } },
+        @{ Title = "Network Configuration"; Cmd = { Test-NetworkConfiguration } },
+        @{ Title = "Memory Usage Analysis"; Cmd = { Test-MemoryUsage } },
+        @{ Title = "CPU Usage Analysis"; Cmd = { Test-CPUUsage } },
+        @{ Title = "Disk Performance Analysis"; Cmd = { Test-DiskPerformance } },
+        @{ Title = "Windows Services Health"; Cmd = { Test-ServicesHealth } },
+        @{ Title = "Event Log Analysis"; Cmd = { Test-EventLogHealth } },
+        @{ Title = "DNS Health"; Cmd = { Test-DNSHealth } },
+        @{ Title = "Security & Authentication"; Cmd = { Test-SecurityAuthentication } },
+        @{ Title = "Windows Update Status"; Cmd = { Test-WindowsUpdateStatus } },
+        @{ Title = "TLS Configuration"; Cmd = { Test-TLSConfiguration } },
+        @{ Title = "Cross-Category Scorecard"; Cmd = { Test-CrossCategoryHealth } }
+    )
+
+    # Build HTML
+    $css = @"
+<style>
+body { font-family: Consolas, 'Courier New', monospace; background: #1e1e1e; color: #d4d4d4; margin: 20px; font-size: 13px; }
+h1 { color: #569cd6; border-bottom: 2px solid #569cd6; padding-bottom: 10px; }
+h2 { color: #4ec9b0; cursor: pointer; padding: 8px; background: #252526; border-left: 3px solid #4ec9b0; margin-top: 20px; }
+h2:hover { background: #2d2d30; }
+.section { padding: 10px 15px; background: #1e1e1e; border-left: 1px solid #333; display: none; }
+.section.visible { display: block; }
+pre { white-space: pre-wrap; word-wrap: break-word; margin: 0; line-height: 1.5; }
+.success { color: #6a9955; }
+.warning { color: #ce9178; }
+.error { color: #f44747; font-weight: bold; }
+.info { color: #d4d4d4; }
+.section-header { color: #c586c0; }
+.meta { color: #808080; font-size: 12px; margin-bottom: 20px; }
+.summary { background: #252526; padding: 15px; border: 1px solid #333; margin: 15px 0; }
+.expand-all { color: #569cd6; cursor: pointer; text-decoration: underline; margin-left: 15px; font-size: 12px; }
+</style>
+"@
+
+    $js = @"
+<script>
+function toggleSection(id) {
+    var el = document.getElementById(id);
+    el.classList.toggle('visible');
+}
+function toggleAll() {
+    var sections = document.querySelectorAll('.section');
+    var anyHidden = Array.from(sections).some(s => !s.classList.contains('visible'));
+    sections.forEach(s => { if (anyHidden) s.classList.add('visible'); else s.classList.remove('visible'); });
+}
+</script>
+"@
+
+    $htmlBody = @"
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Server Diagnostic Report - $env:COMPUTERNAME</title>
+$css
+</head>
+<body>
+<h1>Server Diagnostic Report — $env:COMPUTERNAME</h1>
+<div class="meta">
+Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Tool: WSTT v3.0 | OS: $((Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption)
+<span class="expand-all" onclick="toggleAll()">[Expand/Collapse All]</span>
+</div>
+$js
+"@
+
+    $sectionIndex = 0
+    foreach ($section in $sections) {
+        $sectionIndex++
+        Write-Info "  [$sectionIndex/$($sections.Count)] $($section.Title)..."
+
+        # Capture all output streams
+        $output = & $section.Cmd *>&1 | Out-String
+
+        # Colorize the output for HTML
+        $htmlOutput = [System.Net.WebUtility]::HtmlEncode($output)
+        $htmlOutput = $htmlOutput -replace '\[SUCCESS\]', '<span class="success">[SUCCESS]</span>'
+        $htmlOutput = $htmlOutput -replace '\[ERROR\]', '<span class="error">[ERROR]</span>'
+        $htmlOutput = $htmlOutput -replace 'WARNING:', '<span class="warning">WARNING:</span>'
+        $htmlOutput = $htmlOutput -replace '\[INFO\]', '<span class="info">[INFO]</span>'
+        $htmlOutput = $htmlOutput -replace '---\s(.+?)\s---', '<span class="section-header">--- $1 ---</span>'
+        $htmlOutput = $htmlOutput -replace '={40}', '<span class="section-header">========================================</span>'
+
+        $htmlBody += @"
+
+<h2 onclick="toggleSection('section$sectionIndex')">▸ $($section.Title)</h2>
+<div class="section" id="section$sectionIndex">
+<pre>$htmlOutput</pre>
+</div>
+"@
+    }
+
+    $htmlBody += @"
+
+</body>
+</html>
+"@
+
+    try {
+        $htmlBody | Out-File -FilePath $reportPath -Encoding UTF8 -ErrorAction Stop
+        Write-Success "HTML Report generated: $reportPath"
+        Write-Info "  File size: $([math]::Round((Get-Item $reportPath).Length / 1KB, 1)) KB"
+
+        $open = Get-ValidatedChoice -Prompt "Open report in browser? (Y/N)" -ValidChoices @("Y", "N")
+        if ($open -eq "Y") {
+            Start-Process $reportPath
+        }
+    }
+    catch {
+        Write-DiagError "Failed to generate HTML report: $($_.Exception.Message)"
+    }
+}
+
 #region Main Menu and Execution
 function Show-MainMenu {
     <#
@@ -7058,6 +7500,8 @@ UTILITIES:" -ForegroundColor Yellow
     Write-Host " 17. Check .NET Framework Versions" -ForegroundColor White
     Write-Host " 18. IIS Troubleshooting & Diagnostics" -ForegroundColor White
     Write-Host " 19. Task Scheduler Diagnostics" -ForegroundColor White
+    Write-Host " 20. Server Baseline Validation" -ForegroundColor White
+    Write-Host " 21. Generate HTML Diagnostic Report" -ForegroundColor Green
     
     Write-Host "
   0. Exit" -ForegroundColor Red
@@ -7134,7 +7578,7 @@ function Start-TroubleshootingTool {
     try {
         do {
             Show-MainMenu
-            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-19)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19")
+            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-21)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21")
             
             switch ($choice) {
                 "1" {
@@ -7280,6 +7724,14 @@ function Start-TroubleshootingTool {
                 "19" {
                     Clear-Host
                     Test-TaskSchedulerHealth
+                }
+                "20" {
+                    Clear-Host
+                    Test-ServerBaseline
+                }
+                "21" {
+                    Clear-Host
+                    Export-HTMLReport
                 }
                 "0" {
                     Write-Host "`nExiting... Thank you for using the troubleshooting tool!" -ForegroundColor Cyan

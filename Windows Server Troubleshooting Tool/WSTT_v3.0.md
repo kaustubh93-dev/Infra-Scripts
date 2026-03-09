@@ -50,6 +50,78 @@ A comprehensive PowerShell-based interactive diagnostic tool for **Windows Serve
 | 11 | Working Set Trimming | Transition pages repurposed/sec, cache faults |
 | 12 | Detailed Leak Analysis | Processes where Private >> WS by >200MB |
 
+### 💻 CPU Diagnostics — 15 New Checks
+| # | Check | What It Detects |
+|---|-------|-----------------|
+| 1 | Per-Core CPU Usage | Hot cores at >95% (single-threaded bottleneck) |
+| 2 | Privileged vs User Time | Kernel (driver) vs application CPU split |
+| 3 | Processor Queue Length | Threads waiting for CPU (>2×cores = need more CPU) |
+| 4 | Context Switches/sec | Thread contention (>15K/core = thrashing) |
+| 5 | Interrupt & DPC Time | NIC/storage driver CPU theft (>15% = critical) |
+| 6 | System Uptime | Long uptimes >90d, kernel timer drift risk |
+| 7 | Power Throttling | CPU running below full speed (VM host overcommit, thermal) |
+| 8 | Antivirus CPU Detection | 12 AV products + fltmc filter driver stack |
+| 9 | Hyper-V Hypervisor Overhead | Hypervisor run time, overhead %, guest time |
+| 10 | Real-Time CPU (5s sample) | Two-snapshot delta — current vs cumulative CPU |
+| 11 | Thread & Process Count | System-wide totals (>5K threads = resource exhaustion) |
+| 12 | DPC Queue Rate | Per-core DPCs/sec (>5K/core = driver bottleneck) |
+| 13 | NUMA Node Imbalance | Memory imbalance across NUMA nodes (>20%) |
+| 14 | CPU Event Log | WHEA hardware errors, thermal throttling events |
+| 15 | Process CPU Affinity | Processes locked to subset of cores |
+
+### 💾 Disk/Storage Diagnostics — 15 New Checks
+| # | Check | What It Detects |
+|---|-------|-----------------|
+| 1 | Disk IOPS | Read/Write/Total IOPS per physical disk |
+| 2 | Disk Throughput | MB/sec read and write bandwidth |
+| 3 | Storage Media Type | SSD vs HDD vs iSCSI LUN identification |
+| 4 | SMART / Predictive Failure | Disk health, operational status, WMI SMART |
+| 5 | VSS Shadow Copy Usage | Snapshot count, orphaned snapshots, VSS writer health |
+| 6 | Storage Spaces / Pool Health | Degraded pools, virtual disk rebuild status |
+| 7 | Disk Fragmentation | Optimize-Volume analysis per volume |
+| 8 | Pagefile Disk Placement | Pagefile on OS drive I/O contention |
+| 9 | Temp/TempDB Location | Windows TEMP + SQL TempDB on C: risk |
+| 10 | Filter Driver Stack (fltmc) | Active filter drivers, AV filters flagged |
+| 11 | Disk Timeout Settings | I/O timeout value, iSCSI link down time |
+| 12 | MPIO Status | Feature installed, path health, degraded paths |
+| 13 | ReFS vs NTFS Detection | File system type per volume with guidance |
+| 14 | Disk Busy Time % | Sustained >80% = disk is the bottleneck |
+| 15 | Storage Tiering | Tier configuration, optimization task status |
+
+### 📋 Task Scheduler Diagnostics — 8 New Checks (Option 19)
+| # | Check | What It Detects |
+|---|-------|-----------------|
+| 1 | Failed Tasks | Non-zero LastTaskResult with error code decoding |
+| 2 | Long-Running / Stuck Tasks | Tasks in Running state >4h |
+| 3 | Disabled Tasks | Non-Microsoft tasks accidentally turned off |
+| 4 | High-Privilege Audit | SYSTEM + Highest RunLevel — security risk |
+| 5 | Credential Failures | Expired passwords (0x8007052E), access denied |
+| 6 | SDDL Permission Audit | Everyone/Authenticated Users with Full Access |
+| 7 | Orphaned Tasks | Actions pointing to non-existent executables |
+| 8 | Trigger Health | Expired end boundaries, disabled triggers |
+
+### ✅ Server Baseline Validation — 9 New Checks (Option 20)
+| # | Check | Source |
+|---|-------|--------|
+| 1 | Active Directory OU Path | DirectoryServices searcher |
+| 2 | Windows License & Activation | SoftwareLicensingProduct |
+| 3 | Crash Dump Configuration | CrashControl registry + space check |
+| 4 | Installed Software Inventory | Registry Uninstall keys (non-Microsoft) |
+| 5 | NIC Power Save Setting | WMI MSPower_DeviceEnable |
+| 6 | Windows Features Installed | Get-WindowsFeature roles + features |
+| 7 | NTFS 8.3 Short Name Setting | FileSystem registry key |
+| 8 | Clear Page File at Shutdown | Memory Management registry |
+| 9 | Critical System Driver Versions | tcpip.sys, afd.sys, storport.sys, ntfs.sys, etc. |
+
+### 📄 HTML Diagnostic Report (Option 21)
+- Runs **all 12 diagnostic functions** automatically
+- Produces a **dark-themed, collapsible HTML** report
+- Color-coded: `[SUCCESS]` green, `[ERROR]` red, `WARNING:` orange
+- Section headers are **clickable** to expand/collapse
+- **Expand/Collapse All** button
+- Opens in default browser on completion
+- Uses `System.Net.WebUtility` (compatible with Server 2019/Core)
+
 ### 🔄 Cluster & SQL AG Awareness (NEW)
 | Feature | Description |
 |---------|-------------|
@@ -95,18 +167,19 @@ A comprehensive PowerShell-based interactive diagnostic tool for **Windows Serve
 - TSS argument passing via single-string ArgumentList (preserves quoted paths)
 - Event 4624 property access bounds-checked
 - IIS `$appPools`/`$sites` declared at function scope
+- `System.Web.HttpUtility` → `System.Net.WebUtility` (Server 2019/Core compat for HTML report)
 
 ---
 
 ## Features
 
-### 🔍 Primary Diagnostics (Options 1-9)
+### 🔍 Primary Diagnostics (Options 1-10)
 | Option | Category | Check Count |
 |--------|----------|-------------|
 | 1 | Network Issues | 25+ checks |
 | 2 | Memory Issues | 19 checks |
-| 3 | CPU Issues | 8+ checks + AG replication counters |
-| 4 | Disk/Storage Issues | 9+ checks |
+| 3 | CPU Issues | 24 checks (per-core, queue, interrupts, AV, Hyper-V, NUMA) |
+| 4 | Disk/Storage Issues | 24 checks (IOPS, SMART, VSS, MPIO, tiering) |
 | 5 | Windows Services Health | 9 checks (AG-aware) |
 | 6 | Event Log Analysis | 8+ checks + FailoverClustering log |
 | 7 | DNS Health & Connectivity | 10+ checks + AG Listener DNS |
@@ -132,7 +205,7 @@ A comprehensive PowerShell-based interactive diagnostic tool for **Windows Serve
 - PowerShell TLS configuration
 - Remediation commands and export
 
-### 📊 Utilities (Options 12-18)
+### 📊 Utilities (Options 12-21)
 | Option | Feature |
 |--------|---------|
 | 12 | Generate System Report |
@@ -142,6 +215,9 @@ A comprehensive PowerShell-based interactive diagnostic tool for **Windows Serve
 | 16 | Check TSS Status |
 | 17 | .NET Framework Version Check |
 | 18 | IIS Troubleshooting & Diagnostics |
+| 19 | Task Scheduler Diagnostics |
+| 20 | Server Baseline Validation |
+| **21** | **Generate HTML Diagnostic Report** |
 
 ---
 
@@ -199,8 +275,8 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 PRIMARY DIAGNOSTICS:
   1. Network Issues (Packet Loss, Slowness, RSS, MTU, Routing & 15+ checks)
   2. Memory Issues (Usage, Leaks, Page File, Hardware & 19 checks)
-  3. CPU Issues (High Usage, Process Analysis)
-  4. Disk/Storage Issues (Latency, Performance)
+  3. CPU Issues (Per-Core, Queue, Interrupts, Throttling & 24 checks)
+  4. Disk/Storage Issues (IOPS, Latency, SMART, VSS, MPIO & 24 checks)
   5. Windows Services Health
   6. Event Log Analysis
   7. DNS Health & Connectivity
@@ -212,7 +288,16 @@ ADDITIONAL SCENARIOS:
  11. Additional Troubleshooting Scenarios
 
 UTILITIES:
- 12-18. Reports, TLS, TSS, .NET, IIS
+ 12. Generate System Report
+ 13. TLS Configuration Validation
+ 14. Validator Script Information
+ 15. Configure TSS Path
+ 16. Check TSS Status
+ 17. Check .NET Framework Versions
+ 18. IIS Troubleshooting & Diagnostics
+ 19. Task Scheduler Diagnostics
+ 20. Server Baseline Validation
+ 21. Generate HTML Diagnostic Report
 
   0. Exit
 =================================================================
@@ -303,12 +388,34 @@ Log Send Queue: 🟡 >10MB (replication lag)
 Redo Queue:     🟡 >10MB (secondary applying slowly)
 ```
 
+### CPU Advanced
+```
+Per-Core:         🔴 >95% on any single core (hot core)
+Privileged Time:  🟡 >15% kernel > user  🔴 >30% kernel
+Queue Length:     🟡 >1×cores  🔴 >2×cores
+Context Switches: 🟡 >8K/core  🔴 >15K/core
+Interrupt/DPC:    🟡 >5%  🔴 >15%
+Throttling:       🟡 <95% performance  🔴 <80% performance
+DPC Queue:        🔴 >5K/core
+NUMA Imbalance:   🟡 >20% memory difference
+System Threads:   🟡 >5,000  Processes: 🟡 >500
+```
+
+### Disk Advanced
+```
+Disk Busy:    🟡 >50%  🔴 >80%
+Disk Timeout: 🟡 <30s (too aggressive)  🟡 >120s (too long)
+VSS Snapshots: 🟡 >10 per volume (orphaned)
+Filter Drivers: 🟡 >10 active (latency impact)
+```
+
 ---
 
 ## Output Files
 
 | File Type | Default Location | Format |
 |-----------|------------------|--------|
+| **HTML Diagnostic Report** | **`%TEMP%\ServerDiagnostics\Logs\`** | **.html** |
 | Diagnostic reports | `%TEMP%\ServerDiagnostics\Logs\` | .txt |
 | System reports | `%TEMP%\ServerDiagnostics\Logs\` | .txt |
 | TLS reports | `%TEMP%\ServerDiagnostics\Logs\` | .txt |
@@ -384,12 +491,13 @@ $script:DefaultLogPath = Join-Path $script:TempBasePath "Logs"
 
 | Metric | Value |
 |--------|-------|
-| Total lines | ~6,050 |
-| Functions | 52 |
-| Diagnostic checks | 80+ |
+| Total lines | ~7,760 |
+| Functions | 57 |
+| Total diagnostic checks | 150+ |
+| Menu options | 22 (0-21) |
 | OS versions supported | 2019, 2022, 2025 |
 | Cluster-safe checks | 12 |
-| New in v3.0 | 27 network checks, 19 memory checks, cluster/AG awareness |
+| New in v3.0 | 27 network, 24 CPU, 24 disk, 19 memory, 8 task scheduler, 9 baseline, HTML report, cluster/AG awareness |
 
 ---
 
