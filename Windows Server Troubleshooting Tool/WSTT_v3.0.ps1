@@ -419,6 +419,202 @@ function Get-ProcessAnalysis {
 }
 #endregion
 
+#region Cluster and SQL AG Helper Functions
+function Get-ClusterEnvironmentInfo {
+    <#
+    .SYNOPSIS
+        Detects cluster membership, role, and SQL AG state for the local node
+    .DESCRIPTION
+        Returns a hashtable with IsClusterNode, ClusterName, NodeName, 
+        IsAGInstalled, AGReplicas, and ClusterNetworks information.
+        All downstream checks should use this cached result.
+    .OUTPUTS
+        Hashtable with cluster and AG environment details
+    #>
+    $info = @{
+        IsClusterNode      = $false
+        ClusterName        = $null
+        NodeName           = $env:COMPUTERNAME
+        ClusterNodes       = @()
+        ClusterNetworks    = @()
+        HeartbeatOnlyNICs  = @()
+        CSVPaths           = @()
+        QuorumType         = $null
+        QuorumResource     = $null
+        IsCAUEnabled       = $false
+        IsAGInstalled      = $false
+        AGDetails          = @()
+        LocalReplicaRole   = $null
+    }
+
+    # Check if Failover Clustering is running
+    try {
+        $clusSvc = Get-Service -Name "ClusSvc" -ErrorAction SilentlyContinue
+        if ($null -eq $clusSvc -or $clusSvc.Status -ne "Running") {
+            return $info
+        }
+        $info.IsClusterNode = $true
+    }
+    catch { return $info }
+
+    # Cluster basics
+    try {
+        $cluster = Get-Cluster -ErrorAction Stop
+        $info.ClusterName = $cluster.Name
+        $info.ClusterNodes = @(Get-ClusterNode -ErrorAction SilentlyContinue | Select-Object Name, State, NodeWeight)
+    }
+    catch { }
+
+    # Cluster networks — identify heartbeat-only NICs
+    try {
+        $networks = Get-ClusterNetwork -ErrorAction SilentlyContinue
+        $info.ClusterNetworks = @($networks)
+        # Role 1 = Cluster only (heartbeat), Role 3 = Cluster and Client
+        $info.HeartbeatOnlyNICs = @($networks | Where-Object { $_.Role -eq 1 } |
+            ForEach-Object {
+                $netName = $_.Name
+                try {
+                    $adapters = Get-ClusterNetworkInterface -Network $netName -ErrorAction SilentlyContinue
+                    $adapters | Where-Object { $_.Node -eq $env:COMPUTERNAME } | ForEach-Object { $_.Adapter }
+                }
+                catch { }
+            })
+    }
+    catch { }
+
+    # Cluster Shared Volumes
+    try {
+        $csvs = Get-ClusterSharedVolume -ErrorAction SilentlyContinue
+        $info.CSVPaths = @($csvs | ForEach-Object {
+                $_.SharedVolumeInfo.FriendlyVolumeName
+            })
+    }
+    catch { }
+
+    # Quorum
+    try {
+        $quorum = Get-ClusterQuorum -ErrorAction SilentlyContinue
+        if ($quorum) {
+            $info.QuorumType = $quorum.QuorumType
+            $info.QuorumResource = if ($quorum.QuorumResource) { $quorum.QuorumResource.Name } else { "(none)" }
+        }
+    }
+    catch { }
+
+    # Cluster-Aware Updating
+    try {
+        $cauRun = Get-CauRun -ErrorAction SilentlyContinue
+        if ($null -ne $cauRun -and $cauRun.Status -ne 'Completed' -and $cauRun.Status -ne 'NotStarted') {
+            $info.IsCAUEnabled = $true
+        }
+    }
+    catch { }
+
+    # SQL AG Detection
+    try {
+        $sqlSvc = Get-Service -Name "MSSQLSERVER" -ErrorAction SilentlyContinue
+        if ($null -ne $sqlSvc -and $sqlSvc.Status -eq "Running") {
+            $info.IsAGInstalled = $true
+            try {
+                $agQuery = @"
+SELECT ag.name AS ag_name,
+       ars.role_desc AS local_role,
+       ars.synchronization_health_desc AS sync_health,
+       al.dns_name AS listener_name,
+       al.port AS listener_port
+FROM sys.dm_hadr_availability_replica_states ars
+JOIN sys.availability_groups ag ON ars.group_id = ag.group_id
+LEFT JOIN sys.availability_group_listeners al ON ag.group_id = al.group_id
+WHERE ars.is_local = 1
+"@
+                $agResults = Invoke-Sqlcmd -Query $agQuery -ServerInstance "." -ErrorAction Stop
+                $info.AGDetails = @($agResults)
+                if ($agResults.Count -gt 0) {
+                    $info.LocalReplicaRole = $agResults[0].local_role
+                }
+            }
+            catch {
+                # Invoke-Sqlcmd may not be available; try SqlClient directly
+                try {
+                    $conn = New-Object System.Data.SqlClient.SqlConnection "Server=.;Integrated Security=True;Connection Timeout=5"
+                    $conn.Open()
+                    $cmd = $conn.CreateCommand()
+                    $cmd.CommandText = "SELECT ag.name AS ag_name, ars.role_desc AS local_role, ars.synchronization_health_desc AS sync_health FROM sys.dm_hadr_availability_replica_states ars JOIN sys.availability_groups ag ON ars.group_id = ag.group_id WHERE ars.is_local = 1"
+                    $reader = $cmd.ExecuteReader()
+                    while ($reader.Read()) {
+                        $info.AGDetails += [PSCustomObject]@{
+                            ag_name       = $reader["ag_name"]
+                            local_role    = $reader["local_role"]
+                            sync_health   = $reader["sync_health"]
+                            listener_name = $null
+                            listener_port = $null
+                        }
+                        $info.LocalReplicaRole = $reader["local_role"]
+                    }
+                    $reader.Close()
+                    $conn.Close()
+                }
+                catch { }
+            }
+        }
+    }
+    catch { }
+
+    return $info
+}
+
+function Test-PathOnCSV {
+    <#
+    .SYNOPSIS
+        Checks if a given path resides on a Cluster Shared Volume
+    .PARAMETER Path
+        The file system path to validate
+    .PARAMETER CSVPaths
+        Array of CSV mount points from Get-ClusterEnvironmentInfo
+    .OUTPUTS
+        Boolean — $true if path is on a CSV
+    #>
+    param(
+        [string]$Path,
+        [string[]]$CSVPaths
+    )
+    if (-not $CSVPaths -or $CSVPaths.Count -eq 0) { return $false }
+    foreach ($csv in $CSVPaths) {
+        if ($Path -like "$csv*") { return $true }
+    }
+    return $false
+}
+
+function Get-NonHeartbeatGateways {
+    <#
+    .SYNOPSIS
+        Returns default gateways excluding cluster heartbeat-only networks
+    .PARAMETER HeartbeatAdapters
+        Array of adapter names that are cluster heartbeat-only
+    #>
+    param(
+        [string[]]$HeartbeatAdapters = @()
+    )
+    try {
+        $gateways = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop
+        if ($HeartbeatAdapters.Count -eq 0) { return $gateways }
+        $filtered = @()
+        foreach ($gw in $gateways) {
+            $ifAlias = (Get-NetAdapter -ErrorAction SilentlyContinue |
+                Where-Object { $_.ifIndex -eq $gw.InterfaceIndex }).Name
+            if ($ifAlias -notin $HeartbeatAdapters) {
+                $filtered += $gw
+            }
+            else {
+                Write-Info "  Skipping heartbeat-only adapter '$ifAlias' for gateway ping"
+            }
+        }
+        return $filtered
+    }
+    catch { return @() }
+}
+#endregion
+
 #region TSS Functions
 function Set-TSSPath {
     <#
@@ -858,7 +1054,7 @@ function Test-NetworkConfiguration {
     # 1. Default Gateway Reachability
     Write-Section "Default Gateway Reachability"
     try {
-        $gateways = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop
+        $gateways = Get-NonHeartbeatGateways -HeartbeatAdapters $script:ClusterEnv.HeartbeatOnlyNICs
         if ($gateways) {
             foreach ($gw in $gateways) {
                 $gwIP = $gw.NextHop
@@ -1981,6 +2177,12 @@ function Start-MemoryLogCollection {
                 }
                 
                 if (Test-PathValid -Path $logPath -CreateIfNotExist) {
+                    if ($script:ClusterEnv.IsClusterNode -and (Test-PathOnCSV -Path $logPath -CSVPaths $script:ClusterEnv.CSVPaths)) {
+                        Write-DiagWarning "WARNING: Path '$logPath' is on a Cluster Shared Volume!"
+                        Write-DiagWarning "Writing large traces to CSV can cause I/O storms affecting all cluster nodes."
+                        $csvConfirm = Get-ValidatedChoice -Prompt "Continue anyway? (Y/N)" -ValidChoices @("Y", "N")
+                        if ($csvConfirm -ne "Y") { return }
+                    }
                     $confirm = Get-ValidatedChoice -Prompt "Start trace? (Y/N)" -ValidChoices @("Y", "N")
                     if ($confirm -eq "Y") {
                         Invoke-TSSCommand -Command "-Xperf Memory -XperfMaxFileMB 4096 -StopWaitTimeInSec 300 -LogFolderPath $logPath"
@@ -2003,6 +2205,12 @@ function Start-MemoryLogCollection {
                 }
                 
                 if (Test-PathValid -Path $logPath -CreateIfNotExist) {
+                    if ($script:ClusterEnv.IsClusterNode -and (Test-PathOnCSV -Path $logPath -CSVPaths $script:ClusterEnv.CSVPaths)) {
+                        Write-DiagWarning "WARNING: Path '$logPath' is on a Cluster Shared Volume!"
+                        Write-DiagWarning "Writing large traces to CSV can cause I/O storms affecting all cluster nodes."
+                        $csvConfirm = Get-ValidatedChoice -Prompt "Continue anyway? (Y/N)" -ValidChoices @("Y", "N")
+                        if ($csvConfirm -ne "Y") { return }
+                    }
                     $confirm = Get-ValidatedChoice -Prompt "Start trace? (Y/N)" -ValidChoices @("Y", "N")
                     if ($confirm -eq "Y") {
                         Invoke-TSSCommand -Command "-Xperf Memory -WaitEvent HighMemory:90 -StopWaitTimeInSec 300 -LogFolderPath $logPath"
@@ -2189,6 +2397,39 @@ function Test-CPUUsage {
     catch {
         Write-DiagWarning "  Could not check Split I/O"
     }
+
+    # SQL AG Replication Counters (v3.0 cluster-safe)
+    if ($script:ClusterEnv.IsAGInstalled) {
+        Write-Section "SQL AG Replication Health"
+        try {
+            $sendQueue = Get-Counter '\SQLServer:Database Replica(*)\Log Send Queue' -ErrorAction Stop
+            foreach ($sample in $sendQueue.CounterSamples) {
+                if ($sample.InstanceName -ne "_total" -and $sample.CookedValue -gt 0) {
+                    $queueKB = [math]::Round($sample.CookedValue, 0)
+                    Write-Info "  $($sample.InstanceName): Log Send Queue = $queueKB KB"
+                    if ($queueKB -gt 10240) {
+                        Write-DiagWarning "    WARNING: Log send queue >10MB - AG replication lag"
+                    }
+                }
+            }
+        }
+        catch {
+            Write-Info "  SQL AG counters not available (AG may not be configured or SQL not running)"
+        }
+        try {
+            $redoQueue = Get-Counter '\SQLServer:Database Replica(*)\Redo Queue Size' -ErrorAction Stop
+            foreach ($sample in $redoQueue.CounterSamples) {
+                if ($sample.InstanceName -ne "_total" -and $sample.CookedValue -gt 0) {
+                    $redoKB = [math]::Round($sample.CookedValue, 0)
+                    Write-Info "  $($sample.InstanceName): Redo Queue = $redoKB KB"
+                    if ($redoKB -gt 10240) {
+                        Write-DiagWarning "    WARNING: Redo queue >10MB - secondary applying changes slowly"
+                    }
+                }
+            }
+        }
+        catch { }
+    }
 }
 
 function Start-CPULogCollection {
@@ -2226,6 +2467,12 @@ function Start-CPULogCollection {
                 }
                 
                 if (Test-PathValid -Path $logPath -CreateIfNotExist) {
+                    if ($script:ClusterEnv.IsClusterNode -and (Test-PathOnCSV -Path $logPath -CSVPaths $script:ClusterEnv.CSVPaths)) {
+                        Write-DiagWarning "WARNING: Path '$logPath' is on a Cluster Shared Volume!"
+                        Write-DiagWarning "Writing large traces to CSV can cause I/O storms affecting all cluster nodes."
+                        $csvConfirm = Get-ValidatedChoice -Prompt "Continue anyway? (Y/N)" -ValidChoices @("Y", "N")
+                        if ($csvConfirm -ne "Y") { return }
+                    }
                     $confirm = Get-ValidatedChoice -Prompt "Start trace? (Y/N)" -ValidChoices @("Y", "N")
                     if ($confirm -eq "Y") {
                         Invoke-TSSCommand -Command "-Xperf CPU -XperfMaxFileMB 4096 -StopWaitTimeInSec 300 -LogFolderPath $logPath"
@@ -2602,7 +2849,12 @@ function Test-ServicesHealth {
                     Write-Success "  $($svc.DisplayName) ($($svc.Name)): Running"
                 }
                 elseif ($svc.Status -eq "Stopped" -and $svc.StartType -eq "Automatic") {
-                    Write-DiagError "  $($svc.DisplayName) ($($svc.Name)): STOPPED (Auto-Start)"
+                    if ($svcName -eq "SQLSERVERAGENT" -and $script:ClusterEnv.IsAGInstalled -and $script:ClusterEnv.LocalReplicaRole -eq "SECONDARY") {
+                        Write-Info "  $($svc.DisplayName) ($($svc.Name)): Stopped (expected on AG SECONDARY replica)"
+                    }
+                    else {
+                        Write-DiagError "  $($svc.DisplayName) ($($svc.Name)): STOPPED (Auto-Start)"
+                    }
                 }
                 elseif ($svc.Status -eq "Stopped") {
                     Write-Info "  $($svc.DisplayName) ($($svc.Name)): Stopped ($($svc.StartType))"
@@ -2941,6 +3193,35 @@ function Test-EventLogHealth {
     }
     catch { Write-Info "  Failover Clustering may not be installed" }
 
+    # FailoverClustering Operational Log (v3.0 cluster-safe)
+    if ($script:ClusterEnv.IsClusterNode) {
+        Write-Section "Failover Clustering Operational Log (last 24h)"
+        try {
+            $fcEvents = Get-WinEvent -FilterHashtable @{
+                LogName   = 'Microsoft-Windows-FailoverClustering/Operational'
+                Level     = 1, 2, 3
+                StartTime = (Get-Date).AddHours(-24)
+            } -MaxEvents 20 -ErrorAction SilentlyContinue
+
+            if ($fcEvents) {
+                Write-DiagWarning "  Found $($fcEvents.Count) FailoverClustering event(s):"
+                $fcGrouped = $fcEvents | Group-Object Id | Sort-Object Count -Descending | Select-Object -First 5
+                foreach ($g in $fcGrouped) {
+                    Write-DiagWarning "    Event $($g.Name): $($g.Count) occurrence(s)"
+                }
+                $fcEvents | Select-Object -First 3 | ForEach-Object {
+                    Write-Info "    [$($_.TimeCreated.ToString('MM-dd HH:mm'))] ID:$($_.Id) $(Get-EventSnippet -Event $_ -MaxLength 100)"
+                }
+            }
+            else {
+                Write-Success "  No FailoverClustering errors/warnings in last 24 hours"
+            }
+        }
+        catch {
+            Write-Info "  FailoverClustering Operational log not available"
+        }
+    }
+
     # Storage Events (129, 153)
     Write-Section "Storage Adapter Events (129/153, last 7 days)"
     try {
@@ -3217,6 +3498,27 @@ function Test-DNSHealth {
     }
     catch {
         Write-Info "  Could not check cluster name resolution"
+    }
+
+    # AG Listener Name Resolution (v3.0 cluster-safe)
+    if ($script:ClusterEnv.IsAGInstalled -and $script:ClusterEnv.AGDetails.Count -gt 0) {
+        Write-Section "AG Listener Name Resolution"
+        foreach ($ag in $script:ClusterEnv.AGDetails) {
+            if ($ag.listener_name) {
+                Write-Info "  AG '$($ag.ag_name)' listener: $($ag.listener_name):$($ag.listener_port)"
+                try {
+                    $resolved = Resolve-DnsName $ag.listener_name -ErrorAction Stop
+                    Write-Success "    Resolves to: $($resolved.IPAddress -join ', ')"
+                }
+                catch {
+                    Write-DiagError "    FAILED to resolve AG listener '$($ag.listener_name)'!"
+                    Write-Info "    Stale listener DNS is the #1 cause of AG connectivity failures post-failover"
+                }
+            }
+            else {
+                Write-DiagWarning "  AG '$($ag.ag_name)': No listener configured"
+            }
+        }
     }
 
     # AD Secure Dynamic DNS Update Failures
@@ -4108,6 +4410,45 @@ function Test-CrossCategoryHealth {
     }
     catch { Write-Info "   Could not check" }
 
+    # 8. Quorum Health (v3.0)
+    if ($script:ClusterEnv.IsClusterNode) {
+        Write-Info "8. Cluster Quorum Health:"
+        try {
+            $quorumType = $script:ClusterEnv.QuorumType
+            $quorumRes = $script:ClusterEnv.QuorumResource
+            Write-Info "   Quorum Type: $quorumType | Witness: $quorumRes"
+            
+            $downNodes = $script:ClusterEnv.ClusterNodes | Where-Object { $_.State -ne 'Up' }
+            if ($downNodes) {
+                $issues++
+                Write-DiagError "   ISSUE: $(@($downNodes).Count) cluster node(s) not in 'Up' state:"
+                foreach ($dn in $downNodes) {
+                    Write-DiagWarning "     $($dn.Name): $($dn.State)"
+                }
+            }
+            else {
+                Write-Success "   OK - All $(@($script:ClusterEnv.ClusterNodes).Count) cluster nodes are Up"
+            }
+        }
+        catch {
+            Write-Info "   Could not check quorum"
+        }
+
+        # 9. SQL AG Sync Health (v3.0)
+        if ($script:ClusterEnv.IsAGInstalled -and $script:ClusterEnv.AGDetails.Count -gt 0) {
+            Write-Info "9. SQL AG Synchronization:"
+            foreach ($ag in $script:ClusterEnv.AGDetails) {
+                if ($ag.sync_health -eq 'HEALTHY') {
+                    Write-Success "   AG '$($ag.ag_name)': $($ag.local_role) - $($ag.sync_health)"
+                }
+                else {
+                    $issues++
+                    Write-DiagError "   ISSUE: AG '$($ag.ag_name)': $($ag.local_role) - $($ag.sync_health)"
+                }
+            }
+        }
+    }
+
     # Summary
     Write-Host ""
     if ($issues -eq 0) {
@@ -4214,12 +4555,25 @@ function Show-AdditionalScenarios {
             if ($tssAvailable) {
                 Write-Host "TSS.ps1 -SDP Cluster -AcceptEula" -ForegroundColor Cyan
                 Write-Info "Run on ALL cluster nodes"
+                if ($script:ClusterEnv.IsClusterNode) {
+                    $activeOwners = @()
+                    try {
+                        $activeOwners = Get-ClusterGroup -ErrorAction SilentlyContinue | Where-Object { $_.OwnerNode -eq $env:COMPUTERNAME -and $_.State -eq 'Online' }
+                    }
+                    catch { }
+                    if ($activeOwners) {
+                        Write-DiagWarning "This node owns $(@($activeOwners).Count) active cluster group(s). Consider running on a passive node first:"
+                        $activeOwners | Select-Object -First 5 | ForEach-Object { Write-Info "    $($_.Name): $($_.State)" }
+                    }
+                }
             }
             else {
                 Write-DiagWarning "TSS is not available. Install TSS from the main menu (option 15)."
             }
             Write-Info "`nCluster Logs:"
-            Write-Host "Get-ClusterLog -TimeSpan 60 -UseLocalTime -Destination D:\clusterlog\" -ForegroundColor Cyan
+            $clusterLogDest = Join-Path $env:TEMP "clusterlog"
+            Write-Host "Get-ClusterLog -TimeSpan 60 -UseLocalTime -Destination $clusterLogDest" -ForegroundColor Cyan
+            Write-DiagWarning "Note: Avoid using Cluster Shared Volumes as the destination"
             Write-Info "`nFor Event 1135 (intermittent):"
             Write-Host "TSS.ps1 -Scenario SHA_MsCluster -WaitEvent Evt:1135:System -AcceptEula" -ForegroundColor Cyan
             Write-Info "Generate Cluster Validation Report from Failover Cluster Manager"
@@ -4232,6 +4586,10 @@ function Show-AdditionalScenarios {
             Write-Info "2. Run SFC scan:"
             Write-Host "   sfc /scannow" -ForegroundColor Cyan
             Write-Info "3. Reset Windows Update components:"
+            if ($script:ClusterEnv.IsClusterNode) {
+                Write-DiagWarning "CLUSTER NODE DETECTED: If Cluster-Aware Updating (CAU) is active, do NOT manually stop Windows Update services."
+                Write-Info "  Use Failover Cluster Manager > Cluster-Aware Updating instead."
+            }
             Write-Host @"
    net stop wuauserv
    net stop bits
@@ -5402,6 +5760,19 @@ function Start-TroubleshootingTool {
     # Initialize diagnostic paths
     if (-not (Initialize-DiagnosticPaths)) {
         Write-DiagError "Failed to initialize diagnostic paths. Some features may not work correctly."
+    }
+    
+    # Detect cluster and SQL AG environment once at startup
+    Write-Info "Detecting cluster and SQL AG environment..."
+    $script:ClusterEnv = Get-ClusterEnvironmentInfo
+    if ($script:ClusterEnv.IsClusterNode) {
+        Write-Success "Cluster node detected: $($script:ClusterEnv.ClusterName)"
+        if ($script:ClusterEnv.IsAGInstalled -and $script:ClusterEnv.LocalReplicaRole) {
+            Write-Info "  SQL AG Role: $($script:ClusterEnv.LocalReplicaRole)"
+        }
+    }
+    else {
+        Write-Info "Standalone server (no cluster detected)"
     }
     
     # Start transcript logging if requested
