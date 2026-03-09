@@ -527,7 +527,7 @@ JOIN sys.availability_groups ag ON ars.group_id = ag.group_id
 LEFT JOIN sys.availability_group_listeners al ON ag.group_id = al.group_id
 WHERE ars.is_local = 1
 "@
-                $agResults = Invoke-Sqlcmd -Query $agQuery -ServerInstance "." -ErrorAction Stop
+                $agResults = Invoke-Sqlcmd -Query $agQuery -ServerInstance "." -ConnectionTimeout 5 -QueryTimeout 10 -ErrorAction Stop
                 $info.AGDetails = @($agResults)
                 if ($agResults.Count -gt 0) {
                     $info.LocalReplicaRole = $agResults[0].local_role
@@ -1008,7 +1008,7 @@ function Test-NetworkConfiguration {
         $teams = Get-NetLbfoTeam -ErrorAction SilentlyContinue
         if ($teams) {
             foreach ($team in $teams) {
-                Write-Info "  Team: $($team.Name) - Mode: $($team.TeamingMode) - LB: $($team.LoadBalancingAlgorithm)"
+                Write-Info "  [LBFO] Team: $($team.Name) - Mode: $($team.TeamingMode) - LB: $($team.LoadBalancingAlgorithm)"
                 if ($team.TeamingMode -eq "SwitchIndependent" -and $team.LoadBalancingAlgorithm -eq "AddressHash") {
                     Write-DiagWarning "    Dual MAC risk: SwitchIndependent + AddressHash may cause connectivity issues"
                 }
@@ -1019,11 +1019,42 @@ function Test-NetworkConfiguration {
             }
         }
         else {
-            Write-Info "  No NIC teams configured"
+            # Server 2025+ uses Switch Embedded Teaming (SET) instead of LBFO
+            $setTeams = Get-NetSwitchTeam -ErrorAction SilentlyContinue
+            if ($setTeams) {
+                foreach ($st in $setTeams) {
+                    Write-Info "  [SET] Team: $($st.Name)"
+                    $setMembers = Get-NetSwitchTeamMember -Team $st.Name -ErrorAction SilentlyContinue
+                    foreach ($sm in $setMembers) {
+                        Write-Info "    Member: $($sm.Name) - Status: $($sm.Status)"
+                    }
+                }
+            }
+            else {
+                Write-Info "  No NIC teams configured (LBFO or SET)"
+            }
         }
     }
     catch {
-        Write-Info "  NIC teaming not available (LBFO cmdlets missing)"
+        # LBFO cmdlets missing (Server 2025+) — try SET
+        try {
+            $setTeams = Get-NetSwitchTeam -ErrorAction SilentlyContinue
+            if ($setTeams) {
+                foreach ($st in $setTeams) {
+                    Write-Info "  [SET] Team: $($st.Name) (Switch Embedded Teaming)"
+                    $setMembers = Get-NetSwitchTeamMember -Team $st.Name -ErrorAction SilentlyContinue
+                    foreach ($sm in $setMembers) {
+                        Write-Info "    Member: $($sm.Name)"
+                    }
+                }
+            }
+            else {
+                Write-Info "  No NIC teams configured"
+            }
+        }
+        catch {
+            Write-Info "  NIC teaming not available (LBFO/SET cmdlets missing)"
+        }
     }
 
     # WAN Heartbeat / Cluster Link Flapping
@@ -1146,16 +1177,23 @@ function Test-NetworkConfiguration {
     Write-Section "TCP Offload Settings"
     try {
         $offload = Get-NetOffloadGlobalSetting -ErrorAction Stop
-        Write-Info "  Chimney Offload: $($offload.Chimney)"
+        # Chimney is deprecated/removed on newer OS — access safely
+        $chimneyValue = $offload | Select-Object -ExpandProperty Chimney -ErrorAction SilentlyContinue
+        if ($null -ne $chimneyValue) {
+            Write-Info "  Chimney Offload: $chimneyValue"
+            if ($chimneyValue -eq 'Enabled') {
+                Write-DiagWarning "  TCP Chimney is ENABLED - deprecated; disable for stability"
+                Write-Info "  Disable: Set-NetOffloadGlobalSetting -Chimney Disabled"
+            }
+        }
+        else {
+            Write-Info "  Chimney Offload: N/A (removed on this OS version)"
+        }
         Write-Info "  Receive Side Coalescing: $($offload.ReceiveSegmentCoalescing)"
         Write-Info "  Network Direct (RDMA): $($offload.NetworkDirect)"
         Write-Info "  Task Offload: $($offload.TaskOffload)"
         Write-Info "  Packet Coalescing Filter: $($offload.PacketCoalescingFilter)"
 
-        if ($offload.Chimney -eq 'Enabled') {
-            Write-DiagWarning "  TCP Chimney is ENABLED - this can cause issues with some NIC drivers"
-            Write-Info "  Disable: Set-NetOffloadGlobalSetting -Chimney Disabled"
-        }
         if ($offload.TaskOffload -eq 'Disabled') {
             Write-DiagWarning "  Task Offload is DISABLED - CPU will handle all checksum/segmentation work"
         }
@@ -1804,7 +1842,8 @@ function Test-MemoryUsage {
             }
         }
         else {
-            Write-DiagWarning "  No page file settings found (page file may be disabled)"
+            # Win32_PageFileSetting is empty when page file is system-managed (most common config)
+            Write-Success "  Page file is system-managed (Win32_PageFileSetting empty — normal behavior)"
         }
     }
     catch {
@@ -4004,7 +4043,14 @@ function Test-WindowsUpdateStatus {
     # Last installed updates
     Write-Section "Last 10 Installed Updates"
     try {
-        $updates = Get-HotFix -ErrorAction Stop | Sort-Object InstalledOn -Descending -ErrorAction SilentlyContinue | Select-Object -First 10
+        $updates = Get-HotFix -ErrorAction Stop |
+            Where-Object { $null -ne $_.InstalledOn } |
+            Sort-Object InstalledOn -Descending -ErrorAction SilentlyContinue |
+            Select-Object -First 10
+        # Also get updates with null dates (common on Server 2019)
+        $nullDateUpdates = Get-HotFix -ErrorAction SilentlyContinue |
+            Where-Object { $null -eq $_.InstalledOn } |
+            Select-Object -First 5
         
         if ($updates) {
             foreach ($update in $updates) {
@@ -4035,7 +4081,14 @@ function Test-WindowsUpdateStatus {
             }
         }
         else {
-            Write-DiagWarning "  No hotfix information available"
+            Write-DiagWarning "  No hotfix information available (with known install dates)"
+        }
+        # Show updates with unknown dates (common Server 2019 bug)
+        if ($nullDateUpdates -and @($nullDateUpdates).Count -gt 0) {
+            Write-Info "  Updates with unknown install date (Server 2019 known issue):"
+            foreach ($ndu in $nullDateUpdates) {
+                Write-Info "    $($ndu.HotFixID) - (date unavailable) - $($ndu.Description)"
+            }
         }
     }
     catch {
@@ -4142,13 +4195,23 @@ function Test-WindowsUpdateStatus {
         $build = [int]$os.BuildNumber
         if ($build -lt 14393) {
             Write-DiagError "  OS Build $build (Server 2012/2012 R2 or older) - End of extended support"
-            Write-Info "  Strongly recommend in-place upgrade or migration to Server 2019/2022"
+            Write-Info "  Strongly recommend in-place upgrade or migration to Server 2022/2025"
         }
         elseif ($build -lt 17763) {
-            Write-DiagWarning "  OS Build $build (Server 2016) - Consider upgrade to Server 2019/2022"
+            Write-DiagWarning "  OS Build $build (Server 2016) - Approaching end of mainstream support"
+            Write-Info "  Plan upgrade to Server 2022 or 2025"
+        }
+        elseif ($build -lt 20348) {
+            Write-Info "  OS Build $build (Server 2019) - Supported (extended support until Oct 2029)"
+        }
+        elseif ($build -lt 26100) {
+            Write-Success "  OS Build $build (Server 2022) - Fully supported"
+        }
+        elseif ($build -ge 26100) {
+            Write-Success "  OS Build $build (Server 2025) - Latest release"
         }
         else {
-            Write-Success "  OS Build $build - supported version"
+            Write-Info "  OS Build $build - version not recognized"
         }
     }
     catch { }
@@ -5773,6 +5836,12 @@ function Start-TroubleshootingTool {
     }
     else {
         Write-Info "Standalone server (no cluster detected)"
+    }
+    
+    # Locale check — warn if non-English (some checks parse English command output)
+    $osLocale = (Get-Culture).Name
+    if ($osLocale -notlike "en-*") {
+        Write-DiagWarning "Non-English locale detected ($osLocale). Some checks (w32tm, klist, netsh, secedit) parse English output and may report incomplete results."
     }
     
     # Start transcript logging if requested
