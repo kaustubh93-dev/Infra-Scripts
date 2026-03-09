@@ -3,17 +3,50 @@
 .SYNOPSIS
     Comprehensive Windows Server Troubleshooting and Log Collection Script
 .DESCRIPTION
-    Interactive script to diagnose and collect logs for Network, Memory, CPU, and Disk issues
+    Interactive diagnostic tool for Windows Server 2019, 2022, and 2025.
+    Diagnoses and collects logs for Network, Memory, CPU, Disk, Services, DNS,
+    Security, Windows Update, TLS/SSL, IIS, and Cluster/SQL AG environments.
+
+    v3.0 Highlights:
+      - 25+ Network checks (gateway, duplex, MTU, offload, routing, proxy, RDMA, NIC drivers)
+      - 19 Memory checks (page file, compression, handle/thread leaks, standby cache, RAM hardware)
+      - Cluster-safe: detects AG role, CSV paths, heartbeat NICs, quorum health
+      - SQL AG awareness: replica role detection, listener DNS, replication counters
+      - Server 2025 ready: LBFO→SET fallback, Chimney deprecation handled
+      - Clean formatted output with --- Section --- dividers and [ERROR]/[SUCCESS] tags
+      - Save-to-file option on all diagnostic sections (options 1-9)
+      - Non-English locale detection at startup
 .PARAMETER EnableLogging
     Enables transcript logging of the entire session
 .EXAMPLE
     .\WSTT_v3.0.ps1
+.EXAMPLE
     .\WSTT_v3.0.ps1 -EnableLogging
 .NOTES
-    Version: 3.0
-    Requires: Administrator privileges
-    v3.0: Added 15 new network diagnostic checks (gateway, duplex, MTU, offload, routing, etc.)
-    Enhanced with improved error handling, validation, and best practices
+    Version:  3.0
+    Requires: Administrator privileges, PowerShell 5.1+
+    Tested:   Windows Server 2019, 2022, 2025
+
+    v3.0 Changes from v2.5:
+      [Network]   15 new checks: gateway reachability, duplicate IP, link speed/duplex,
+                  TCP offload, MTU consistency, DNS suffix, WINS, proxy/WinHTTP, NIC drivers,
+                  binding order, firewall block rules, RDMA/SMB Direct, TCP stack params,
+                  NIC error events, routing table analysis
+      [Memory]    12 new checks: page file config, available MBytes, memory compression,
+                  handle/thread counts, paged pool, system cache, leak trend detection,
+                  standby cache breakdown, RAM hardware info, resource exhaustion events,
+                  WS trimming rate, per-process private vs WS analysis
+      [Cluster]   AG role detection (PRIMARY/SECONDARY) via sys.dm_hadr views,
+                  CSV path guard on trace output, heartbeat NIC filtering,
+                  FailoverClustering/Operational log, quorum health, AG sync scorecard,
+                  AG listener DNS check, active cluster group ownership warnings
+      [Compat]    Server 2025: LBFO→SET fallback, Chimney safe-access, OS lifecycle updated
+                  Server 2019: Get-HotFix InstalledOn null handling
+                  Locale: Non-English detection and warning at startup
+      [UX]        Write-DiagError now uses [ERROR] tag (no stack traces), Write-Section
+                  dividers, save-to-file prompt on all 9 primary diagnostics
+      [Bugs]      Get-WmiObject→Get-CimInstance, WorkingSet→WorkingSet64, klist null-safe,
+                  CBS.log path corrected, TSS argument safety, event property bounds check
 #>
 
 param(
