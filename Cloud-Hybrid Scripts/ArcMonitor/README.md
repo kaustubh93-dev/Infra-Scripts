@@ -155,10 +155,10 @@ The diagram above shows the complete onboarding pipeline. Key decision points:
 |-------|--------|------------|
 | **Input validation** | Validates hostname/IP format, deduplicates entries | Invalid names removed with warning |
 | **Reachability check** | ICMP ping + WinRM port 5985 TCP test | Unreachable servers skipped |
-| **Config validation** | Blocks if `<YOUR-TENANT-ID>` placeholders remain | Redirects to Setup Wizard |
-| **[1/4] PreReq Checks** | 13 remote checks on target via `Invoke-Command` | `[F]` Auto-fix / `[S]` Skip / `[I]` Ignore |
-| **[2/4] Agent Install** | Download → Authenticode signature verify → install | Abort server on failure |
-| **[3/4] Arc Connect** | `azcmagent connect` with Service Principal auth | Log error, continue next server |
+| **Config validation** | Blocks if placeholders remain + validates GUID format | Redirects to Setup Wizard |
+| **[1/4] PreReq Checks** | 16 remote checks on target via `Invoke-Command` | `[F]` Auto-fix / `[S]` Skip / `[I]` Ignore |
+| **[2/4] Agent Install** | Download → Authenticode signature verify → install → cleanup | Abort server on failure |
+| **[3/4] Arc Connect** | `azcmagent connect` with SP auth (retry on transient errors) | Exit code mapping with guidance |
 | **[4/4] HIMDS Verify** | Confirm Hybrid Instance Metadata service running | Report status |
 
 > **Monitor window** opens in a separate PowerShell process after config validation and renders the live TUI dashboard throughout all phases.
@@ -169,7 +169,7 @@ The diagram above shows the complete onboarding pipeline. Key decision points:
 
 ## Remote Prerequisite Checks
 
-All 13 checks run **on the target server** via `Invoke-Command`, not on the management server:
+All 16 checks run **on the target server** via `Invoke-Command`, not on the management server:
 
 | # | Check | What | Auto-Fix |
 |---|-------|------|:--------:|
@@ -177,15 +177,18 @@ All 13 checks run **on the target server** via `Invoke-Command`, not on the mana
 | 2 | **Remote Session** | WinRM PSSession establishment (30s timeout) | — |
 | 3 | **Platform Detect** | VMware / HyperV / AzureLocal / Physical / KVM / Nutanix / AWS / GCP / Azure VM | — |
 | 4 | **Azure VM Exclusion** | Azure IMDS check — auto-skip native Azure VMs | N/A |
-| 5 | **OS Version** | Windows Server 2012+ or supported Linux | No |
+| 5 | **OS Version** | Windows Server 2012 R2+ (rejects client SKUs via `ProductType`) | No |
 | 6 | **PS Version** | PowerShell 5.0+ | Yes |
 | 7 | **.NET Framework** | 4.6.2+ (Release >= 394802) | Yes |
 | 8 | **TLS 1.2** | Registry + SecurityProtocol | **Yes** |
 | 9 | **Admin Rights** | WindowsBuiltInRole::Administrator | No |
-| 10 | **Disk Space** | 2 GB+ free on C: | **Yes** (temp cleanup) |
-| 11 | **Existing Agent** | Skip if already Connected | — |
-| 12 | **Azure Endpoints** | 9 required URLs via TcpClient (5s timeout each) | No |
-| 13 | **Required Services** | WinRM, W32Time running | **Yes** |
+| 10 | **Disk Space** | 2 GB+ free on system drive | **Yes** (temp cleanup) |
+| 11 | **Clock Skew** | System clock within 5 minutes of NTP (prevents auth errors) | No |
+| 12 | **Pending Reboot** | CBS, WindowsUpdate, PendingFileRename checks | No |
+| 13 | **Existing Agent** | Handles Connected (skip), Disconnected (reconnect), Expired (must disconnect first) | — |
+| 14 | **HIMDS Service** | Hybrid Instance Metadata service state | — |
+| 15 | **Azure Endpoints** | 10 required URLs via TcpClient incl. `servicebus.windows.net` (5s each) | No |
+| 16 | **Required Services** | WinRM, W32Time running | **Yes** |
 
 ### Auto-Remediation
 
@@ -437,14 +440,18 @@ The framework implements security hardening measures for enterprise environments
 |---------|-------------|
 | **RemoteSigned execution policy** | All child PowerShell windows use `-ExecutionPolicy RemoteSigned` (not `Bypass`). |
 | **Authenticode verification** | Downloaded agent install scripts are checked for valid Microsoft Authenticode signatures before execution. |
+| **SP secret via environment variable** | Service Principal secret passed via `$env:IDENTITY_SECRET` instead of command-line argument, preventing exposure in process listings. Cleaned up in `finally` block. |
 | **Atomic state file writes** | JSON state file is written to a temp file first, then atomically renamed to prevent partial reads. |
 | **PSSession timeouts** | WinRM sessions use 30s open timeout and 60s operation timeout to prevent hanging. |
+| **Retry with backoff** | Transient `azcmagent` errors (exit codes 16, 19, 21) are retried up to 2 times with exponential backoff. |
+| **Installer cleanup** | Downloaded agent install scripts are automatically removed after installation. |
 
 ### Input Validation & Scope
 
 | Feature | Description |
 |---------|-------------|
 | **Server name validation** | All user-entered server names are validated against hostname (RFC 1123) and IPv4 patterns. Invalid entries are rejected. |
+| **GUID format validation** | TenantId and SubscriptionId are validated as proper GUIDs before onboarding — prevents `azcmagent` error code 23. |
 | **No global variable pollution** | All config uses `$script:` scope instead of `$Global:`. No sensitive data leaks to the global scope. |
 | **`Set-StrictMode -Version Latest`** | Enabled on all entry points to catch undefined variables and property access. |
 | **`-WhatIf` / `-Confirm` support** | Destructive operations (auto-fix, remote reboot) support `ShouldProcess` for dry-run previews. |
@@ -493,8 +500,18 @@ Invoke-Pester .\Tests\ArcMonitor.Tests.ps1 -Output Detailed
 | "Access is denied" on remote session | Credential not admin | Use local admin or domain admin account |
 | "Azure endpoints BLOCKED" | Firewall blocking outbound 443 | Allow endpoints listed in [Network Requirements](#network-requirements) |
 | "Azure native VM detected" | Target is an Azure VM | Remove from list — Azure VMs must not use Arc |
+| "Client OS not supported" | Windows 10/11 client detected | Arc servers requires Windows Server (2012 R2+) |
+| "Clock skew exceeds 5 min" | System clock drift | Sync with NTP: `w32tm /resync /force` |
+| "Reboot pending" | CBS/WindowsUpdate pending | Reboot the target server before onboarding |
+| "Agent EXPIRED" | Arc agent token expired | Run `azcmagent disconnect --force-local-only` then reconnect |
 | Config still shows `<YOUR-TENANT-ID>` | Setup Wizard not run | Run `.\Start-ArcMonitor.ps1 -Mode Setup` first |
-| `azcmagent connect` error code 23 | Invalid GUID in config | Verify TenantId/SubscriptionId are valid GUIDs |
+| "TenantId is not a valid GUID" | Malformed ID in config | Verify format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |
+| `azcmagent` exit code **16** | Network/transport error | Check firewall, proxy, DNS resolution for Azure endpoints |
+| `azcmagent` exit code **17** | Authentication failed | SP secret expired or wrong — regenerate in Azure Portal |
+| `azcmagent` exit code **18** | HTTP 4xx from Azure | Missing RBAC role or `Microsoft.HybridCompute` provider not registered |
+| `azcmagent` exit code **19** | Azure service transient error | Automatic retry with backoff (up to 2 retries) |
+| `azcmagent` exit code **20** | Machine already registered | Run `azcmagent disconnect --force-local-only` on target |
+| `azcmagent` exit code **23** | Invalid GUID format | GUID validation now catches this before onboarding |
 | Monitor window blank | State file not created yet | Wait for onboarding to start writing state |
 | TUI shows garbled characters | Console font issue | Use Consolas or Lucida Console font |
 | "Invalid server name(s) removed" | Server name failed validation | Use valid hostname (RFC 1123) or IPv4 address |
@@ -511,6 +528,7 @@ Invoke-Pester .\Tests\ArcMonitor.Tests.ps1 -Output Detailed
 | **Arc-enabled servers overview** | https://learn.microsoft.com/en-us/azure/azure-arc/servers/overview |
 | **Prerequisites** | https://learn.microsoft.com/en-us/azure/azure-arc/servers/prerequisites |
 | **Network requirements** | https://learn.microsoft.com/en-us/azure/azure-arc/servers/network-requirements |
+| **Troubleshoot agent onboarding** | https://learn.microsoft.com/en-us/azure/azure-arc/servers/troubleshoot-agent-onboard |
 | **Deployment options** | https://learn.microsoft.com/en-us/azure/azure-arc/servers/deployment-options |
 | **Manage agent** | https://learn.microsoft.com/en-us/azure/azure-arc/servers/manage-agent |
 | **Private Link** | https://learn.microsoft.com/en-us/azure/azure-arc/servers/private-link-security |
