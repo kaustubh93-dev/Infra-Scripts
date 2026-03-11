@@ -471,12 +471,17 @@ Pester tests are included in `Tests/ArcMonitor.Tests.ps1`. They validate:
 ### Running Tests
 
 ```powershell
-# Install Pester (if not already installed)
-Install-Module Pester -Force -Scope CurrentUser
+# Install Pester 5+ (Windows ships with 3.4.0 — must upgrade)
+Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck
+
+# Import Pester 5 explicitly (avoids loading the built-in 3.4.0)
+Import-Module Pester -MinimumVersion 5.0 -Force
 
 # Run all tests
 Invoke-Pester .\Tests\ArcMonitor.Tests.ps1 -Output Detailed
 ```
+
+> **Note**: Windows Server ships with Pester 3.4.0 which has incompatible syntax. The `-SkipPublisherCheck` flag is required because the built-in module is Microsoft-signed while the newer PSGallery version uses a different publisher. The test file auto-imports Pester 5+ at runtime.
 
 ---
 

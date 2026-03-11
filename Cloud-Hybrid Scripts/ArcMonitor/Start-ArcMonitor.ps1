@@ -843,6 +843,26 @@ function Start-InteractiveOnboarding {
         return
     }
 
+    # Step 4b: Validate GUID format (prevents azcmagent error code 23)
+    # Ref: https://learn.microsoft.com/en-us/azure/azure-arc/servers/troubleshoot-agent-onboard
+    $guidPattern = '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+    if ($ArcConfig.TenantId -notmatch $guidPattern) {
+        Write-Host ""
+        Write-Host "  ✖ TenantId is not a valid GUID: $($ArcConfig.TenantId)" -ForegroundColor Red
+        Write-Host "    Expected format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -ForegroundColor DarkGray
+        Write-Host "    This would cause azcmagent error code 23." -ForegroundColor DarkGray
+        Read-Host "  Press Enter to return to menu"
+        return
+    }
+    if ($ArcConfig.SubscriptionId -notmatch $guidPattern) {
+        Write-Host ""
+        Write-Host "  ✖ SubscriptionId is not a valid GUID: $($ArcConfig.SubscriptionId)" -ForegroundColor Red
+        Write-Host "    Expected format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -ForegroundColor DarkGray
+        Write-Host "    This would cause azcmagent error code 23." -ForegroundColor DarkGray
+        Read-Host "  Press Enter to return to menu"
+        return
+    }
+
     # Step 5: Confirm and proceed
     Write-Host ""
     Write-Host "  Ready to onboard $(@($reachable).Count) server(s) to Azure Arc:" -ForegroundColor White

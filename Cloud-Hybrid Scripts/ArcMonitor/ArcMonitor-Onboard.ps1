@@ -111,6 +111,12 @@ function Install-ArcAgentRemote {
         catch {
             $status.Error = $_.Exception.Message
         }
+        finally {
+            # Clean up downloaded installer script
+            if ($installScript -and (Test-Path $installScript)) {
+                Remove-Item $installScript -Force -ErrorAction SilentlyContinue
+            }
+        }
 
         return $status
     } -ArgumentList $AgentDownloadUrl, $ProxyServer -ErrorAction Stop
@@ -164,7 +170,21 @@ function Connect-ArcAgentRemote {
     $result = Invoke-Command -Session $Session -ScriptBlock {
         param($Sub, $RG, $Tenant, $Loc, $AppId, $Secret, $CloudEnv, $CorrId, $Proxy)
 
-        $status = @{ Connected = $false; AgentStatus = "Unknown"; Error = $null }
+        $status = @{ Connected = $false; AgentStatus = "Unknown"; Error = $null; ExitCode = $null }
+
+        # azcmagent exit code reference:
+        # https://learn.microsoft.com/en-us/azure/azure-arc/servers/troubleshoot-agent-onboard
+        $exitCodeMap = @{
+            1  = "Generic error — check %ProgramData%\AzureConnectedMachineAgent\Log\azcmagent.log"
+            2  = "Invalid command-line options — verify config values"
+            16 = "Network/transport error — check firewall, proxy, DNS (TCP 443)"
+            17 = "Authentication failed — SP secret expired/wrong, or Entra ID issue"
+            18 = "HTTP 4xx — wrong subscription, missing RBAC role, or Microsoft.HybridCompute not registered"
+            19 = "HTTP 5xx — transient Azure error, retry in a few minutes"
+            20 = "Resource already exists — run: azcmagent disconnect --force-local-only"
+            21 = "Request timeout — network latency, retry with backoff"
+            23 = "Invalid argument — TenantId/SubscriptionId not valid GUID format"
+        }
 
         try {
             $agentExe = "$env:ProgramW6432\AzureConnectedMachineAgent\azcmagent.exe"
@@ -176,22 +196,40 @@ function Connect-ArcAgentRemote {
                 return $status
             }
 
-            $connectArgs = @(
-                "connect",
-                "--service-principal-id", $AppId,
-                "--service-principal-secret", $Secret,
-                "--resource-group", $RG,
-                "--tenant-id", $Tenant,
-                "--location", $Loc,
-                "--subscription-id", $Sub,
-                "--cloud", $CloudEnv
-            )
+            # Pass SP secret via env var to avoid exposure in process listings
+            # Ref: https://learn.microsoft.com/en-us/azure/azure-arc/servers/onboard-service-principal
+            $env:IDENTITY_SECRET = $Secret
+            try {
+                $connectArgs = @(
+                    "connect",
+                    "--service-principal-id", $AppId,
+                    "--service-principal-secret", $env:IDENTITY_SECRET,
+                    "--resource-group", $RG,
+                    "--tenant-id", $Tenant,
+                    "--location", $Loc,
+                    "--subscription-id", $Sub,
+                    "--cloud", $CloudEnv
+                )
+                if ($CorrId) { $connectArgs += @("--correlation-id", $CorrId) }
+                if ($Proxy)  { $connectArgs += @("--proxy-url", $Proxy) }
 
-            if ($CorrId) { $connectArgs += @("--correlation-id", $CorrId) }
-            if ($Proxy)  { $connectArgs += @("--proxy-url", $Proxy) }
-
-            $output = & $agentExe @connectArgs 2>&1
-            $exitCode = $LASTEXITCODE
+                # Retry for transient errors (exit codes 16, 19, 21)
+                $retryableCodes = @(16, 19, 21)
+                for ($attempt = 0; $attempt -le 2; $attempt++) {
+                    $output = & $agentExe @connectArgs 2>&1
+                    $exitCode = $LASTEXITCODE
+                    $status.ExitCode = $exitCode
+                    if ($exitCode -eq 0) { break }
+                    if ($attempt -lt 2 -and $exitCode -in $retryableCodes) {
+                        Start-Sleep -Seconds (10 * ($attempt + 1))
+                        continue
+                    }
+                    break
+                }
+            }
+            finally {
+                Remove-Item Env:\IDENTITY_SECRET -ErrorAction SilentlyContinue
+            }
 
             if ($exitCode -eq 0) {
                 $status.Connected = $true
@@ -203,7 +241,8 @@ function Connect-ArcAgentRemote {
                 catch { $status.AgentStatus = "Connected" }
             }
             else {
-                $status.Error = "azcmagent connect exited with code $exitCode : $output"
+                $guidance = if ($exitCodeMap.ContainsKey($exitCode)) { $exitCodeMap[$exitCode] } else { "Unknown — check azcmagent.log" }
+                $status.Error = "azcmagent connect failed (exit $exitCode): $guidance`nOutput: $output"
             }
         }
         catch {
@@ -387,7 +426,7 @@ function Start-ArcOnboarding {
                 $prereqResult = Test-ArcPrerequisites -ComputerName $srv -Credential $Credential `
                                                       -ProxyServer $ArcConfig.ProxyServer
 
-                $s.Platform = if ($prereqResult.Platform.Platform) { $prereqResult.Platform.Platform } else { "Unknown" }
+                $s.Platform = if ($prereqResult.Platform -and $prereqResult.Platform.PSObject.Properties.Name -contains 'Platform') { $prereqResult.Platform.Platform } else { "Unknown" }
 
                 if ($prereqResult.OverallPass) {
                     $s.PreReq = "Succeeded"

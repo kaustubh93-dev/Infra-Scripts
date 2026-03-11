@@ -165,14 +165,19 @@ function Test-ArcPrerequisites {
     try {
         # ── Check 2: Platform Detection ──────────────────────────────────────────
         try {
-            $result.Platform = Get-TargetPlatform -Session $session
+            $platformResult = Get-TargetPlatform -Session $session
+            $result.Platform = $platformResult
+            $pName = if ($platformResult.PSObject.Properties.Name -contains 'Platform') { $platformResult.Platform } else { "Unknown" }
+            $pMfg  = if ($platformResult.PSObject.Properties.Name -contains 'Manufacturer') { $platformResult.Manufacturer } else { "Unknown" }
+            $pModel = if ($platformResult.PSObject.Properties.Name -contains 'Model') { $platformResult.Model } else { "Unknown" }
             $result.Checks["PlatformDetect"] = @{
                 Status = "Pass"
-                Detail = "$($result.Platform.Platform) ($($result.Platform.Manufacturer) / $($result.Platform.Model))"
+                Detail = "$pName ($pMfg / $pModel)"
             }
 
             # Auto-exclude Azure native VMs
-            if ($result.Platform.IsAzureVM) {
+            $isAzVM = if ($platformResult.PSObject.Properties.Name -contains 'IsAzureVM') { $platformResult.IsAzureVM } else { $false }
+            if ($isAzVM) {
                 $result.Checks["AzureVMExclusion"] = @{
                     Status = "Fail"
                     Detail = "Azure native VM detected — must NOT be onboarded to Arc"
@@ -191,14 +196,19 @@ function Test-ArcPrerequisites {
             param($ProxyServer)
             $checks = @{}
 
-            # 3. OS Version
+            # 3. OS Version + Server SKU validation
+            # Ref: https://learn.microsoft.com/en-us/azure/azure-arc/servers/prerequisites#supported-operating-systems
             $os = Get-CimInstance Win32_OperatingSystem
             $osVersion = [version]$os.Version
             $osName = $os.Caption
-            $supported = ($osVersion.Major -ge 10) -or ($osVersion.Major -eq 6 -and $osVersion.Minor -ge 3)
+            $isServerOS = ($os.ProductType -ge 2)  # 1=Workstation, 2=DC, 3=Server
+            $versionOk = ($osVersion.Major -ge 10) -or ($osVersion.Major -eq 6 -and $osVersion.Minor -ge 3)
+            $supported = $isServerOS -and $versionOk
             $checks["OSVersion"] = @{
-                Status = if ($supported) { "Pass" } else { "Fail" }
-                Detail = "$osName (Build $($os.Version))"
+                Status = if ($supported) { "Pass" } elseif (-not $isServerOS) { "Fail" } else { "Fail" }
+                Detail = if (-not $isServerOS) { "$osName — Client OS not supported (only Windows Server)" }
+                         elseif (-not $versionOk) { "$osName — OS version too old (Server 2012 R2+ required)" }
+                         else { "$osName (Build $($os.Version))" }
             }
 
             # 4. PowerShell Version
@@ -251,15 +261,53 @@ function Test-ArcPrerequisites {
                 Detail = if ($isAdmin) { "Running as Administrator" } else { "NOT running as Administrator" }
             }
 
-            # 8. Disk Space (C: drive, need at least 2GB)
-            $cDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+            # 8. Disk Space (system drive, need at least 2GB)
+            $sysDrive = if ($env:SystemDrive) { $env:SystemDrive } else { "C:" }
+            $cDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$sysDrive'"
             $freeGB = [Math]::Round($cDrive.FreeSpace / 1GB, 2)
             $checks["DiskSpace"] = @{
                 Status = if ($freeGB -ge 2) { "Pass" } else { "Fail" }
-                Detail = "$freeGB GB free on C:"
+                Detail = "$freeGB GB free on $sysDrive"
             }
 
-            # 9. Existing Arc Agent Check
+            # 8b. Clock Skew Check (>5 min drift breaks Kerberos/TLS/token auth → error 17)
+            # Ref: https://learn.microsoft.com/en-us/azure/azure-arc/servers/troubleshoot-agent-onboard
+            try {
+                $w32tmOutput = & w32tm /stripchart /computer:time.windows.com /dataonly /samples:1 2>&1
+                $skewMatch = [regex]::Match(($w32tmOutput | Out-String), '([+-]?\d+\.\d+)s')
+                if ($skewMatch.Success) {
+                    $skewSeconds = [Math]::Abs([double]$skewMatch.Groups[1].Value)
+                    $checks["ClockSkew"] = @{
+                        Status = if ($skewSeconds -lt 300) { "Pass" } else { "Fail" }
+                        Detail = "Clock skew: $([Math]::Round($skewSeconds, 1))s$(if ($skewSeconds -ge 300) {' — exceeds 5 min, will cause auth failures'})"
+                    }
+                } else {
+                    $checks["ClockSkew"] = @{ Status = "Warn"; Detail = "Could not measure clock skew (NTP unreachable?)" }
+                }
+            }
+            catch {
+                $checks["ClockSkew"] = @{ Status = "Warn"; Detail = "Clock skew check failed: $($_.Exception.Message)" }
+            }
+
+            # 8c. Pending Reboot Check (blocks MSI installs, service registration)
+            $rebootPending = $false
+            $rebootReasons = [System.Collections.Generic.List[string]]::new()
+            if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
+                $rebootPending = $true; $rebootReasons.Add("CBS")
+            }
+            $pfro = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+            if ($pfro.PendingFileRenameOperations) {
+                $rebootPending = $true; $rebootReasons.Add("PendingFileRename")
+            }
+            if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
+                $rebootPending = $true; $rebootReasons.Add("WindowsUpdate")
+            }
+            $checks["PendingReboot"] = @{
+                Status = if ($rebootPending) { "Warn" } else { "Pass" }
+                Detail = if ($rebootPending) { "Reboot pending ($($rebootReasons -join ', ')) — may block agent install" } else { "No pending reboot" }
+            }
+
+            # 9. Existing Arc Agent Check (with Disconnected/Expired handling)
             $agentPath = "$env:ProgramFiles\AzureConnectedMachineAgent\azcmagent.exe"
             $agentInstalled = Test-Path $agentPath
             $agentStatus = "NotInstalled"
@@ -273,9 +321,13 @@ function Test-ArcPrerequisites {
             $checks["ExistingAgent"] = @{
                 Status = if (-not $agentInstalled) { "Pass" }
                          elseif ($agentStatus -eq "Connected") { "Warn" }
+                         elseif ($agentStatus -eq "Disconnected") { "Warn" }
+                         elseif ($agentStatus -eq "Expired") { "Fail" }
                          else { "Pass" }
                 Detail = if (-not $agentInstalled) { "No existing agent — ready for fresh install" }
                          elseif ($agentStatus -eq "Connected") { "Agent already connected to Azure Arc" }
+                         elseif ($agentStatus -eq "Disconnected") { "Agent DISCONNECTED — will attempt reconnect" }
+                         elseif ($agentStatus -eq "Expired") { "Agent EXPIRED — must run: azcmagent disconnect --force-local-only, then reconnect" }
                          else { "Agent installed but status: $agentStatus" }
             }
 
@@ -300,6 +352,7 @@ function Test-ArcPrerequisites {
                 @{ Name = "Arc GBL (global)";    Host = "gbl.his.arc.azure.com";               Port = 443 }
                 @{ Name = "Guest Config";        Host = "guestconfiguration.azure.com";        Port = 443 }
                 @{ Name = "Guest Notify";        Host = "guestnotificationservice.azure.com";  Port = 443 }
+                @{ Name = "Service Bus";         Host = "servicebus.windows.net";              Port = 443 }
                 @{ Name = "Agent Download";      Host = "download.microsoft.com";              Port = 443 }
                 @{ Name = "Packages (Linux)";    Host = "packages.microsoft.com";              Port = 443 }
             )
@@ -326,14 +379,14 @@ function Test-ArcPrerequisites {
 
             # 12. Windows Services Required
             $requiredSvcs = @("WinRM", "W32Time")
-            $svcResults = @()
+            $svcResults = [System.Collections.Generic.List[string]]::new()
             $allSvcsOk = $true
             foreach ($svcName in $requiredSvcs) {
                 $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
                 if ($svc -and $svc.Status -eq "Running") {
-                    $svcResults += "$svcName : Running"
+                    $svcResults.Add("$svcName : Running")
                 } else {
-                    $svcResults += "$svcName : NOT Running"
+                    $svcResults.Add("$svcName : NOT Running")
                     $allSvcsOk = $false
                 }
             }
@@ -368,7 +421,7 @@ function Test-ArcPrerequisites {
             if ($result.Checks[$key].Status -eq "Warn") { $result.Warnings += $key }
         }
 
-        $result.OverallPass = ($result.FailedChecks.Count -eq 0)
+        $result.OverallPass = (@($result.FailedChecks).Count -eq 0)
     }
     finally {
         if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
@@ -442,10 +495,13 @@ function Show-PreReqResults {
         Write-Host "PASSED" -ForegroundColor Green
     } else {
         Write-Host "  [$server] " -NoNewline -ForegroundColor White
-        Write-Host "FAILED ($($Result.FailedChecks.Count) issue(s))" -ForegroundColor Red
+        Write-Host "FAILED ($(@($Result.FailedChecks).Count) issue(s))" -ForegroundColor Red
     }
 
-    if ($Result.Platform -and $Result.Platform.Platform) {
+    if ($Result.Platform -is [hashtable] -and $Result.Platform.Count -gt 0 -and $Result.Platform.ContainsKey('Platform')) {
+        Write-Host "  Platform: $($Result.Platform.Platform) | $($Result.Platform.Manufacturer) | $($Result.Platform.Model)" -ForegroundColor DarkGray
+    }
+    elseif ($Result.Platform -and $Result.Platform.PSObject.Properties.Name -contains 'Platform') {
         Write-Host "  Platform: $($Result.Platform.Platform) | $($Result.Platform.Manufacturer) | $($Result.Platform.Model)" -ForegroundColor DarkGray
     }
 
@@ -474,7 +530,7 @@ function Show-PreReqResults {
     Write-Host ""
 
     # Show remediation guidance for failed checks
-    if ($Result.FailedChecks.Count -gt 0) {
+    if (@($Result.FailedChecks).Count -gt 0) {
         Show-RemediationGuidance -FailedChecks $Result.FailedChecks -Checks $Result.Checks
     }
 }
@@ -703,8 +759,8 @@ function Repair-ArcPrerequisites {
 
     # Determine what can be auto-fixed
     $autoFixable = @("TLS12", "RequiredServices", "DiskSpace", "PSVersion", "DotNetVersion")
-    $fixable = $FailedChecks | Where-Object { $_ -in $autoFixable }
-    $notFixable = $FailedChecks | Where-Object { $_ -notin $autoFixable }
+    [string[]]$fixable = @($FailedChecks | Where-Object { $_ -in $autoFixable })
+    [string[]]$notFixable = @($FailedChecks | Where-Object { $_ -notin $autoFixable })
 
     if ($fixable.Count -eq 0) {
         Write-Host "    No auto-fixable issues found. Manual intervention required." -ForegroundColor Yellow
