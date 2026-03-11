@@ -18,9 +18,11 @@ $ArcConfig = @{
     CorrelationId  = ""                        # Optional — for tracking in Azure Arc logs
 
     # Service Principal (for at-scale / automated onboarding)
+    # SECURITY: Prefer loading secrets from DPAPI-encrypted file (ArcSPN-Credentials.xml)
+    #           or Azure Key Vault. Plaintext secrets here are for dev/test ONLY.
     ServicePrincipal = @{
         AppId  = "<YOUR-SP-APP-ID>"
-        Secret = "<YOUR-SP-SECRET>"            # Use Key Vault in production!
+        Secret = "<YOUR-SP-SECRET>"            # ⚠ Use Key Vault or Export-Clixml in production!
     }
 
     # Proxy (optional)
@@ -130,8 +132,32 @@ if ($env:CORRELATION_ID) {
     $ArcConnectArgs.Linux   += @("--correlation-id", $env:CORRELATION_ID)
 }
 
+# ─── Secure Credential Loader ────────────────────────────────────────────────
+# Attempts to load SP credentials from DPAPI-encrypted XML file (created by Setup Wizard).
+# Falls back to values in $ArcConfig if encrypted file is not available.
+$credXmlPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) "ArcSPN-Credentials.xml"
+if (Test-Path $credXmlPath) {
+    try {
+        $savedCred = Import-Clixml -Path $credXmlPath -ErrorAction Stop
+        if ($savedCred.AppId -and $savedCred.Secret) {
+            $ArcConfig.ServicePrincipal.AppId = $savedCred.AppId
+            # Decrypt SecureString to plain text only when needed
+            $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($savedCred.Secret)
+            $ArcConfig.ServicePrincipal.Secret = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+            $ServicePrincipalId           = $ArcConfig.ServicePrincipal.AppId
+            $ServicePrincipalClientSecret = $ArcConfig.ServicePrincipal.Secret
+            Write-Host "  ✓ Loaded SP credentials from encrypted store." -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Host "  ⚠ Could not load encrypted credentials: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "    Using values from ArcMonitor-Config.ps1 instead." -ForegroundColor DarkGray
+    }
+}
+
 # ─── Export ──────────────────────────────────────────────────────────────────────
-$Global:ArcMonitorConfig = @{
+$script:ArcMonitorConfig = @{
     Arc          = $ArcConfig
     AzureLocal   = $AzureLocalConfig
     VMware       = $VMwareConfig
@@ -140,5 +166,11 @@ $Global:ArcMonitorConfig = @{
     AgentURLs    = $AgentURLs
     ConnectArgs  = $ArcConnectArgs
 }
+
+# Clean up environment variables after export (minimize credential leakage window)
+# These will be re-read from $ArcConfig when needed
+Remove-Item Env:\SUBSCRIPTION_ID -ErrorAction SilentlyContinue
+Remove-Item Env:\RESOURCE_GROUP -ErrorAction SilentlyContinue
+Remove-Item Env:\TENANT_ID -ErrorAction SilentlyContinue
 
 Write-Host "  Arc Monitor configuration loaded." -ForegroundColor Green

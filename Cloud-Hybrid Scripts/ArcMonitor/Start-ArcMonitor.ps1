@@ -22,8 +22,16 @@ param(
     [int]$MaxPolls = 120
 )
 
-$Global:scriptPath = $MyInvocation.MyCommand.Definition
-$scriptRoot = Split-Path -Parent $scriptPath
+$script:scriptPath = $MyInvocation.MyCommand.Definition
+$scriptRoot = Split-Path -Parent $script:scriptPath
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# ─── Audit Transcript ───────────────────────────────────────────────────────────
+$transcriptDir = Join-Path $scriptRoot "Logs"
+if (-not (Test-Path $transcriptDir)) { New-Item -ItemType Directory -Path $transcriptDir -Force | Out-Null }
+$transcriptFile = Join-Path $transcriptDir "ArcMonitor_Transcript_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+try { Start-Transcript -Path $transcriptFile -Append -Force | Out-Null } catch {}
 
 # ─── Admin Elevation ────────────────────────────────────────────────────────────
 # Cannot use #Requires -RunAsAdministrator because it blocks before our code runs.
@@ -34,7 +42,7 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
         $pwshExe = if ($PSVersionTable.PSEdition -eq 'Core') { "pwsh" } else { "powershell" }
 
         # Rebuild the argument list to pass all parameters through
-        $argParts = @("-NoExit", "-ExecutionPolicy", "Bypass", "-File", "`"$scriptPath`"")
+        $argParts = @("-NoExit", "-ExecutionPolicy", "RemoteSigned", "-File", "`"$script:scriptPath`"")
         if ($Mode)    { $argParts += "-Mode"; $argParts += $Mode }
         if ($Targets) { $argParts += "-Targets"; $argParts += ($Targets | ForEach-Object { "`"$_`"" }) -join "," }
         if ($PollInterval -ne 60)  { $argParts += "-PollInterval"; $argParts += $PollInterval }
@@ -57,17 +65,35 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
     }
 }
 
+# ─── Input Validation ───────────────────────────────────────────────────────────
+
+function Test-ValidServerName {
+    <#
+    .SYNOPSIS
+        Validates a server name/IP is a safe, well-formed hostname or IPv4 address.
+    #>
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    # Allow valid hostnames (RFC 1123) and IPv4 addresses
+    $hostnamePattern = '^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$'
+    $ipv4Pattern = '^((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)$'
+    return ($Name -match $hostnamePattern -or $Name -match $ipv4Pattern)
+}
+
 # ─── Banner ─────────────────────────────────────────────────────────────────────
 
 function Show-Banner {
     Clear-Host
     Write-Host ""
-    Write-Host "     ___    ____  ______   __  _______  _   __________________  ____ " -ForegroundColor Cyan
-    Write-Host "    /   |  / __ \/ ____/  /  |/  / __ \/ | / /  _/_  __/ __ \/ __ \" -ForegroundColor Cyan
-    Write-Host "   / /| | / /_/ / /      / /|_/ / / / /  |/ // /  / / / / / / /_/ /" -ForegroundColor Cyan
-    Write-Host "  / ___ |/ _, _/ /___   / /  / / /_/ / /|  // /  / / / /_/ / _, _/ " -ForegroundColor Cyan
-    Write-Host " /_/  |_/_/ |_|\____/  /_/  /_/\____/_/ |_/___/ /_/  \____/_/ |_|  " -ForegroundColor Cyan
-    Write-Host "" 
+    Write-Host "  ████████                          ██████   ██████                      ███   █████                " -ForegroundColor Cyan
+    Write-Host "  ███▒▒▒▒▒███                       ▒▒██████ ██████                      ▒▒▒   ▒▒███               " -ForegroundColor Cyan
+    Write-Host " ▒███    ▒███  ████████   ██████     ▒███▒█████▒███   ██████  ████████   ████  ███████    ██████  ████████" -ForegroundColor Cyan
+    Write-Host " ▒███████████ ▒▒███▒▒███ ███▒▒███    ▒███▒▒███ ▒███  ███▒▒███▒▒███▒▒███ ▒▒███ ▒▒▒███▒    ███▒▒███▒▒███▒▒███" -ForegroundColor Cyan
+    Write-Host " ▒███▒▒▒▒▒███  ▒███ ▒▒▒ ▒███ ▒▒▒     ▒███ ▒▒▒  ▒███ ▒███ ▒███ ▒███ ▒███  ▒███   ▒███    ▒███ ▒███ ▒███ ▒▒▒" -ForegroundColor Cyan
+    Write-Host " ▒███    ▒███  ▒███     ▒███  ███    ▒███      ▒███ ▒███ ▒███ ▒███ ▒███  ▒███   ▒███ ███▒███ ▒███ ▒███" -ForegroundColor Cyan
+    Write-Host " █████   █████ █████    ▒▒██████     █████     █████▒▒██████  ████ █████ █████  ▒▒█████ ▒▒██████  █████" -ForegroundColor Cyan
+    Write-Host "▒▒▒▒▒   ▒▒▒▒▒ ▒▒▒▒▒      ▒▒▒▒▒▒     ▒▒▒▒▒     ▒▒▒▒▒  ▒▒▒▒▒▒  ▒▒▒▒ ▒▒▒▒▒ ▒▒▒▒▒    ▒▒▒▒▒   ▒▒▒▒▒▒  ▒▒▒▒▒" -ForegroundColor Cyan
+    Write-Host ""
     Write-Host "  Azure Arc Onboarding Monitor" -ForegroundColor White
     Write-Host "  Unified framework for onboarding servers to Azure Arc" -ForegroundColor DarkGray
     Write-Host "  Supports: VMware | Azure Local | Hyper-V | Physical | KVM | Nutanix" -ForegroundColor DarkGray
@@ -235,34 +261,34 @@ function Start-SetupWizard {
         }
     }
 
-    # Display and save credentials
+    # Display credentials (mask secret)
     if ($spAppId -and $spSecret) {
+        $maskedSecret = if ($spSecret.Length -gt 4) { ("*" * ($spSecret.Length - 4)) + $spSecret.Substring($spSecret.Length - 4) } else { "****" }
         Write-Host ""
         Write-Host "    ╔══════════════════════════════════════════════════════╗" -ForegroundColor Cyan
         Write-Host "    ║  SERVICE PRINCIPAL CREDENTIALS                      ║" -ForegroundColor Cyan
         Write-Host "    ╠══════════════════════════════════════════════════════╣" -ForegroundColor Cyan
         Write-Host "    ║  App ID : $($spAppId.PadRight(40))║" -ForegroundColor White
-        Write-Host "    ║  Secret : $($spSecret.Substring(0, [Math]::Min(38, $spSecret.Length)).PadRight(40))║" -ForegroundColor White
+        Write-Host "    ║  Secret : $($maskedSecret.Substring(0, [Math]::Min(40, $maskedSecret.Length)).PadRight(40))║" -ForegroundColor White
         Write-Host "    ║  Tenant : $($ctx.Tenant.Id.PadRight(40))║" -ForegroundColor White
         Write-Host "    ╚══════════════════════════════════════════════════════╝" -ForegroundColor Cyan
         Write-Host ""
 
-        $saveChoice = Read-Host "    Save credentials to file? (Y/N)"
+        # Save credentials securely using DPAPI encryption (user-scoped)
+        $saveChoice = Read-Host "    Save credentials securely (DPAPI-encrypted)? (Y/N)"
         if ($saveChoice -eq 'Y' -or $saveChoice -eq 'y') {
-            $credFile = Join-Path $scriptRoot "ArcSPN-Credentials.txt"
-            $credContent = @"
-# Azure Arc Service Principal Credentials
-# Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-# WARNING: Store securely — use Azure Key Vault in production!
-
-TenantId       = $($ctx.Tenant.Id)
-SubscriptionId = $($ctx.Subscription.Id)
-AppId          = $spAppId
-Secret         = $spSecret
-"@
-            $credContent | Out-File -FilePath $credFile -Encoding UTF8 -Force
-            Write-Host "    ✓ Credentials saved to: $credFile" -ForegroundColor Green
-            Write-Host "    ⚠ Delete this file after updating ArcMonitor-Config.ps1!" -ForegroundColor Red
+            $credFile = Join-Path $scriptRoot "ArcSPN-Credentials.xml"
+            $secureSecret = ConvertTo-SecureString $spSecret -AsPlainText -Force
+            $credObj = @{
+                TenantId       = $ctx.Tenant.Id
+                SubscriptionId = $ctx.Subscription.Id
+                AppId          = $spAppId
+                Secret         = $secureSecret
+                CreatedAt      = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            }
+            $credObj | Export-Clixml -Path $credFile -Force
+            Write-Host "    ✓ Credentials saved (DPAPI-encrypted): $credFile" -ForegroundColor Green
+            Write-Host "    ⚠ This file can only be decrypted by this user on this machine." -ForegroundColor Yellow
         }
     } elseif ($spAppId -and -not $spSecret) {
         Write-Host ""
@@ -560,7 +586,7 @@ if (`$env:CORRELATION_ID) {
 }
 
 # === Export ═══════════════════════════════════════════════════════════════════
-`$Global:ArcMonitorConfig = @{
+`$script:ArcMonitorConfig = @{
     Arc          = `$ArcConfig
     AzureLocal   = `$AzureLocalConfig
     VMware       = `$VMwareConfig
@@ -590,32 +616,112 @@ Write-Host "  Arc Monitor configuration loaded." -ForegroundColor Green
 function Test-ArcNetworkRequirements {
     <#
     .SYNOPSIS
-        Tests network connectivity to Azure Arc required endpoints.
+        Tests network connectivity to Azure Arc required endpoints from remote target servers.
+    .DESCRIPTION
+        Prompts for target server(s) and credentials, then runs endpoint reachability checks
+        REMOTELY on each target via Invoke-Command — verifying the targets can reach Azure.
     #>
-    param([string]$FromServer = "localhost")
+    [CmdletBinding()]
+    param()
 
-    Write-Host "`n  Testing Azure Arc network requirements..." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  ╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "  ║  AZURE ARC — REMOTE NETWORK CONNECTIVITY TEST              ║" -ForegroundColor Cyan
+    Write-Host "  ╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Tests run REMOTELY on target servers (not on this machine)." -ForegroundColor DarkGray
+    Write-Host "  Verifies each target can reach Azure Arc required endpoints." -ForegroundColor DarkGray
+    Write-Host ""
+
+    # Collect targets
+    Write-Host "  Enter target server names/IPs to test." -ForegroundColor Yellow
+    Write-Host "  (Comma-separated, or one per line. Enter blank line when done.)" -ForegroundColor DarkGray
+    Write-Host ""
+    [string[]]$servers = @()
+    while ($true) {
+        $serverInput = Read-Host "  Server(s)"
+        if (-not $serverInput) { break }
+        $parsed = $serverInput -split '[,;\s]+' | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() }
+        $servers += @($parsed)
+    }
+
+    if (@($servers).Count -eq 0) {
+        Write-Host "  No servers specified." -ForegroundColor Yellow
+        return
+    }
+    [string[]]$servers = @($servers | Select-Object -Unique)
+
+    # Get credentials
+    Write-Host ""
+    Write-Host "  Enter admin credentials for remote servers:" -ForegroundColor Cyan
+    $cred = Get-Credential -Message "Remote Server Admin"
+    if (-not $cred) {
+        Write-Host "  No credentials provided. Aborting." -ForegroundColor Red
+        return
+    }
+
     $endpoints = @(
         @{ Name = "Azure Resource Manager";   Host = "management.azure.com";              Port = 443 }
         @{ Name = "Azure AD / Entra ID";      Host = "login.microsoftonline.com";         Port = 443 }
+        @{ Name = "Entra ID (pas)";           Host = "pas.windows.net";                   Port = 443 }
         @{ Name = "Azure Arc HIS";            Host = "his.arc.azure.com";                 Port = 443 }
+        @{ Name = "Azure Arc GBL";            Host = "gbl.his.arc.azure.com";             Port = 443 }
         @{ Name = "Guest Configuration";      Host = "guestconfiguration.azure.com";      Port = 443 }
-        @{ Name = "Azure Arc Data";           Host = "gbl.his.arc.azure.com";             Port = 443 }
-        @{ Name = "Download (MS)";            Host = "aka.ms";                            Port = 443 }
+        @{ Name = "Guest Notification";       Host = "guestnotificationservice.azure.com"; Port = 443 }
+        @{ Name = "Download (MS)";            Host = "download.microsoft.com";            Port = 443 }
         @{ Name = "Packages (Microsoft)";     Host = "packages.microsoft.com";            Port = 443 }
     )
 
-    foreach ($ep in $endpoints) {
+    foreach ($srv in $servers) {
+        Write-Host ""
+        Write-Host "  ── $srv ──────────────────────────────────────────────" -ForegroundColor White
+
+        $session = $null
         try {
-            $result = Test-NetConnection -ComputerName $ep.Host -Port $ep.Port -WarningAction SilentlyContinue
-            if ($result.TcpTestSucceeded) {
-                Write-Host "    ✓ $($ep.Name.PadRight(28)) $($ep.Host)" -ForegroundColor Green
+            $sessionOpts = New-PSSessionOption -OpenTimeout 15000 -OperationTimeout 60000
+            $session = New-PSSession -ComputerName $srv -Credential $cred `
+                                     -SessionOption $sessionOpts -ErrorAction Stop
+
+            $remoteResults = Invoke-Command -Session $session -ScriptBlock {
+                param($Endpoints)
+                $results = @()
+                foreach ($ep in $Endpoints) {
+                    $reachable = $false
+                    try {
+                        $tcp = New-Object System.Net.Sockets.TcpClient
+                        $task = $tcp.ConnectAsync($ep.Host, $ep.Port)
+                        $ok = $task.Wait(5000)
+                        $reachable = ($ok -and $tcp.Connected)
+                        $tcp.Close(); $tcp.Dispose()
+                    }
+                    catch { $reachable = $false }
+                    $results += @{ Name = $ep.Name; Host = $ep.Host; Reachable = $reachable }
+                }
+                return $results
+            } -ArgumentList (,$endpoints) -ErrorAction Stop
+
+            $passCount = 0; $failCount = 0
+            foreach ($r in $remoteResults) {
+                if ($r.Reachable) {
+                    Write-Host "    ✓ $($r.Name.PadRight(28)) $($r.Host)" -ForegroundColor Green
+                    $passCount++
+                } else {
+                    Write-Host "    ✖ $($r.Name.PadRight(28)) $($r.Host) — BLOCKED" -ForegroundColor Red
+                    $failCount++
+                }
+            }
+            Write-Host ""
+            if ($failCount -eq 0) {
+                Write-Host "    All $passCount endpoint(s) reachable from $srv" -ForegroundColor Green
             } else {
-                Write-Host "    ✖ $($ep.Name.PadRight(28)) $($ep.Host) — BLOCKED" -ForegroundColor Red
+                Write-Host "    $passCount passed, $failCount BLOCKED from $srv" -ForegroundColor Yellow
             }
         }
         catch {
-            Write-Host "    ▲ $($ep.Name.PadRight(28)) $($ep.Host) — Cannot test" -ForegroundColor Yellow
+            Write-Host "    ✖ Cannot connect to $srv : $($_.Exception.Message)" -ForegroundColor Red
+        }
+        finally {
+            if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
         }
     }
     Write-Host ""
@@ -643,9 +749,9 @@ function Start-InteractiveOnboarding {
     Write-Host ""
 
     # Step 1: Collect target servers
-    $servers = @()
-    if ($PresetTargets -and $PresetTargets.Count -gt 0) {
-        $servers = $PresetTargets
+    [string[]]$servers = @()
+    if ($PresetTargets -and @($PresetTargets).Count -gt 0) {
+        [string[]]$servers = @($PresetTargets)
         Write-Host "  Target servers (from parameter): $($servers -join ', ')" -ForegroundColor White
     }
     else {
@@ -654,20 +760,29 @@ function Start-InteractiveOnboarding {
         Write-Host ""
 
         while ($true) {
-            $input = Read-Host "  Server(s)"
-            if (-not $input) { break }
-            $parsed = $input -split '[,;\s]+' | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() }
-            $servers += $parsed
+            $serverInput = Read-Host "  Server(s)"
+            if (-not $serverInput) { break }
+            $parsed = $serverInput -split '[,;\s]+' | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() }
+            $servers += @($parsed)
         }
     }
 
-    if ($servers.Count -eq 0) {
+    if (@($servers).Count -eq 0) {
         Write-Host "  No servers specified. Returning to menu." -ForegroundColor Yellow
         return
     }
 
-    # Deduplicate
-    $servers = $servers | Select-Object -Unique
+    # Deduplicate and validate
+    [string[]]$servers = @($servers | Select-Object -Unique)
+    [string[]]$invalidServers = @($servers | Where-Object { -not (Test-ValidServerName $_) })
+    if ($invalidServers.Count -gt 0) {
+        Write-Host "  ⚠ Invalid server name(s) removed: $($invalidServers -join ', ')" -ForegroundColor Yellow
+        [string[]]$servers = @($servers | Where-Object { Test-ValidServerName $_ })
+    }
+    if (@($servers).Count -eq 0) {
+        Write-Host "  No valid servers remaining." -ForegroundColor Red
+        return
+    }
     Write-Host ""
     Write-Host "  Targets ($($servers.Count)): $($servers -join ', ')" -ForegroundColor Cyan
 
@@ -675,8 +790,8 @@ function Start-InteractiveOnboarding {
     Write-Host ""
     Write-Host "  Checking reachability..." -ForegroundColor Yellow
     $reachResults = Test-ServerReachability -Servers $servers
-    $reachable = @()
-    $unreachable = @()
+    [string[]]$reachable = @()
+    [string[]]$unreachable = @()
 
     foreach ($r in $reachResults) {
         $icmpIcon = if ($r.ICMP) { "✓" } else { "✖" }
@@ -691,12 +806,12 @@ function Start-InteractiveOnboarding {
         else { $unreachable += $r.Server }
     }
 
-    if ($unreachable.Count -gt 0) {
+    if (@($unreachable).Count -gt 0) {
         Write-Host ""
-        Write-Host "  ▲ $($unreachable.Count) server(s) unreachable — will be skipped." -ForegroundColor Yellow
+        Write-Host "  ▲ $(@($unreachable).Count) server(s) unreachable — will be skipped." -ForegroundColor Yellow
     }
 
-    if ($reachable.Count -eq 0) {
+    if (@($reachable).Count -eq 0) {
         Write-Host "  ✖ No reachable servers. Check network/WinRM." -ForegroundColor Red
         return
     }
@@ -730,7 +845,7 @@ function Start-InteractiveOnboarding {
 
     # Step 5: Confirm and proceed
     Write-Host ""
-    Write-Host "  Ready to onboard $($reachable.Count) server(s) to Azure Arc:" -ForegroundColor White
+    Write-Host "  Ready to onboard $(@($reachable).Count) server(s) to Azure Arc:" -ForegroundColor White
     foreach ($s in $reachable) { Write-Host "    - $s" -ForegroundColor Cyan }
     Write-Host ""
     Write-Host "  Azure config:" -ForegroundColor DarkGray
@@ -763,6 +878,7 @@ function Start-InteractivePreCheck {
     #>
     param([string[]]$PresetTargets)
 
+    . "$scriptRoot\ArcMonitor-Config.ps1"
     . "$scriptRoot\ArcMonitor-PreReqCheck.ps1"
 
     Write-Host ""
@@ -771,28 +887,37 @@ function Start-InteractivePreCheck {
     Write-Host "  ╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
     Write-Host ""
 
-    $servers = @()
-    if ($PresetTargets -and $PresetTargets.Count -gt 0) {
-        $servers = $PresetTargets
+    [string[]]$servers = @()
+    if ($PresetTargets -and @($PresetTargets).Count -gt 0) {
+        [string[]]$servers = @($PresetTargets)
     }
     else {
         Write-Host "  Enter target server names/IPs to validate." -ForegroundColor Yellow
         Write-Host "  (Comma-separated, or one per line. Enter blank line when done.)" -ForegroundColor DarkGray
         Write-Host ""
         while ($true) {
-            $input = Read-Host "  Server(s)"
-            if (-not $input) { break }
-            $parsed = $input -split '[,;\s]+' | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() }
-            $servers += $parsed
+            $serverInput = Read-Host "  Server(s)"
+            if (-not $serverInput) { break }
+            $parsed = $serverInput -split '[,;\s]+' | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() }
+            $servers += @($parsed)
         }
     }
 
-    if ($servers.Count -eq 0) {
+    if (@($servers).Count -eq 0) {
         Write-Host "  No servers specified." -ForegroundColor Yellow
         return
     }
 
-    $servers = $servers | Select-Object -Unique
+    [string[]]$servers = @($servers | Select-Object -Unique)
+    [string[]]$invalidServers = @($servers | Where-Object { -not (Test-ValidServerName $_) })
+    if ($invalidServers.Count -gt 0) {
+        Write-Host "  ⚠ Invalid server name(s) removed: $($invalidServers -join ', ')" -ForegroundColor Yellow
+        [string[]]$servers = @($servers | Where-Object { Test-ValidServerName $_ })
+    }
+    if (@($servers).Count -eq 0) {
+        Write-Host "  No valid servers remaining." -ForegroundColor Red
+        return
+    }
     Write-Host ""
     Write-Host "  Enter admin credentials for remote servers:" -ForegroundColor Cyan
     $cred = Get-Credential -Message "Remote Server Admin"
@@ -837,7 +962,7 @@ function Show-Menu {
     Write-Host "         Create Service Principal, configure Azure identity"
     Write-Host ""
     Write-Host "    [4]  Test Network Connectivity" -ForegroundColor Yellow
-    Write-Host "         Verify Azure Arc endpoint reachability from THIS machine"
+    Write-Host "         Test Azure Arc endpoint reachability from REMOTE target servers"
     Write-Host ""
     Write-Host "    [Q]  Quit" -ForegroundColor DarkGray
     Write-Host ""

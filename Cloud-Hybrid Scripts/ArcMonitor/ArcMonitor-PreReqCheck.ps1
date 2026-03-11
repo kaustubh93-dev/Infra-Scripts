@@ -1,4 +1,5 @@
 ﻿#Requires -Version 5.1
+Set-StrictMode -Version Latest
 <#
 .SYNOPSIS
     Azure Arc — Remote Prerequisite Validation Module
@@ -101,8 +102,10 @@ function Test-ArcPrerequisites {
     .OUTPUTS
         Hashtable with check results, overall pass/fail, and platform info.
     #>
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$ComputerName,
 
         [Parameter(Mandatory)]
@@ -144,9 +147,13 @@ function Test-ArcPrerequisites {
     }
 
     # ── Establish Remote Session ─────────────────────────────────────────────────
+    # SECURITY: Prefer WinRM over HTTPS (port 5986) in production environments.
+    # Configure with: winrm quickconfig -transport:https
     $session = $null
+    $sessionOpts = New-PSSessionOption -OpenTimeout 30000 -OperationTimeout 60000
     try {
-        $session = New-PSSession -ComputerName $ComputerName -Credential $Credential -ErrorAction Stop
+        $session = New-PSSession -ComputerName $ComputerName -Credential $Credential `
+                                 -SessionOption $sessionOpts -ErrorAction Stop
     }
     catch {
         $result.Checks["RemoteSession"] = @{ Status = "Fail"; Detail = "WinRM session failed: $($_.Exception.Message)" }
@@ -297,7 +304,7 @@ function Test-ArcPrerequisites {
                 @{ Name = "Packages (Linux)";    Host = "packages.microsoft.com";              Port = 443 }
             )
 
-            $endpointResults = @()
+            $endpointResults = [System.Collections.Generic.List[string]]::new()
             $allEndpointsOk = $true
             foreach ($ep in $azureEndpoints) {
                 try {
@@ -309,7 +316,7 @@ function Test-ArcPrerequisites {
                 }
                 catch { $reachable = $false }
 
-                $endpointResults += "$($ep.Name): $(if ($reachable) {'OK'} else {'BLOCKED'})"
+                $endpointResults.Add("$($ep.Name): $(if ($reachable) {'OK'} else {'BLOCKED'})")
                 if (-not $reachable) { $allEndpointsOk = $false }
             }
             $checks["AzureEndpoints"] = @{
@@ -384,7 +391,7 @@ function Test-ServerReachability {
         [int]$TimeoutMs = 3000
     )
 
-    $results = @()
+    $results = [System.Collections.Generic.List[hashtable]]::new()
     foreach ($srv in $Servers) {
         $entry = @{ Server = $srv; ICMP = $false; WinRM = $false; Reachable = $false }
 
@@ -408,7 +415,7 @@ function Test-ServerReachability {
         catch { $entry.WinRM = $false }
 
         $entry.Reachable = ($entry.ICMP -or $entry.WinRM)
-        $results += $entry
+        $results.Add($entry)
     }
 
     return $results
@@ -532,7 +539,7 @@ function Show-RemediationGuidance {
                 Write-Host "      Fix    : Enable and configure WinRM on the target." -ForegroundColor White
                 Write-Host "      Run on target:" -ForegroundColor DarkGray
                 Write-Host "        Enable-PSRemoting -Force" -ForegroundColor Cyan
-                Write-Host "        Set-Item WSMan:\localhost\Client\TrustedHosts -Value '*' -Force" -ForegroundColor Cyan
+                Write-Host "        Set-Item WSMan:\localhost\Client\TrustedHosts -Value '<target-hostname>' -Force  # NEVER use '*'" -ForegroundColor Cyan
                 Write-Host "      Or on management server:" -ForegroundColor DarkGray
                 Write-Host "        Set-Item WSMan:\localhost\Client\TrustedHosts -Value '<target>' -Force" -ForegroundColor Cyan
                 Write-Host "      CanFix : PARTIAL (requires manual action on target)" -ForegroundColor Yellow
@@ -680,14 +687,17 @@ function Repair-ArcPrerequisites {
         Cannot fix: OS version, admin rights, firewall/endpoints, Azure VM exclusion.
         Ref: https://learn.microsoft.com/en-us/azure/azure-arc/servers/prerequisites
     #>
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$ComputerName,
 
         [Parameter(Mandatory)]
         [PSCredential]$Credential,
 
         [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string[]]$FailedChecks
     )
 
@@ -706,6 +716,11 @@ function Repair-ArcPrerequisites {
     foreach ($f in $fixable)    { Write-Host "      ✓ $f" -ForegroundColor Green }
     foreach ($nf in $notFixable) { Write-Host "      ✖ $nf (manual fix required)" -ForegroundColor Red }
     Write-Host ""
+
+    if (-not $PSCmdlet.ShouldProcess($ComputerName, "Apply auto-fixes: $($fixable -join ', ')")) {
+        return $false
+    }
+
     $confirm = Read-Host "    Apply auto-fixes to $ComputerName ? (Y/N)"
     if ($confirm -ne 'Y' -and $confirm -ne 'y') { return $false }
 
@@ -831,8 +846,10 @@ function Repair-ArcPrerequisites {
     if ($rebootNeeded) {
         Write-Host ""
         Write-Host "    ⚠ REBOOT REQUIRED on $ComputerName for TLS/registry changes to take effect." -ForegroundColor Red
+        Write-Host "    ⚠ WARNING: This will immediately restart the remote server!" -ForegroundColor Red
         $rebootNow = Read-Host "    Reboot $ComputerName now? (Y/N)"
-        if ($rebootNow -eq 'Y' -or $rebootNow -eq 'y') {
+        if (($rebootNow -eq 'Y' -or $rebootNow -eq 'y') -and $PSCmdlet.ShouldProcess($ComputerName, "Restart remote server")) {
+            Write-ArcLog "REBOOT initiated on $ComputerName by $($env:USERNAME)" -Level "WARN"
             try {
                 Restart-Computer -ComputerName $ComputerName -Credential $Credential -Force -ErrorAction Stop
                 Write-Host "    ✓ Reboot initiated. Wait 2-3 minutes then re-run prereq check." -ForegroundColor Green

@@ -66,8 +66,8 @@ while ($pollCount -lt $MaxPolls) {
     }
 
     # Build node status array
-    $allNodes  = @()
-    $allEvents = @()
+    $allNodes  = [System.Collections.Generic.List[hashtable]]::new()
+    $allEvents = [System.Collections.Generic.List[hashtable]]::new()
     $running = 0; $done = 0; $failed = 0
 
     foreach ($srv in $state.Servers) {
@@ -80,16 +80,16 @@ while ($pollCount -lt $MaxPolls) {
             Agent    = $srv.Agent
             HIMDS    = $srv.HIMDS
         }
-        $allNodes += $nodeHash
+        $allNodes.Add($nodeHash)
 
         # Collect events
         if ($srv.Events) {
             foreach ($evt in $srv.Events) {
-                $allEvents += @{
+                $allEvents.Add(@{
                     Node     = $evt.Node
                     Message  = $evt.Message
                     Severity = $evt.Severity
-                }
+                })
             }
         }
 
@@ -103,7 +103,7 @@ while ($pollCount -lt $MaxPolls) {
     }
 
     # Build download progress if available
-    $downloads = @()
+    $downloads = [System.Collections.Generic.List[hashtable]]::new()
     foreach ($srv in $state.Servers) {
         if ($srv.Install -eq "Downloading" -or $srv.Install -eq "Succeeded" -or $srv.Install -eq "InProgress") {
             $pct = switch ($srv.Install) {
@@ -112,12 +112,12 @@ while ($pollCount -lt $MaxPolls) {
                 "Succeeded"   { 100 }
                 default       { 0 }
             }
-            $downloads += @{
+            $downloads.Add(@{
                 Node    = $srv.Name.Substring(0, [Math]::Min(10, $srv.Name.Length))
                 Percent = $pct
                 SizeMB  = 0
                 Status  = $srv.Install
-            }
+            })
         }
     }
 

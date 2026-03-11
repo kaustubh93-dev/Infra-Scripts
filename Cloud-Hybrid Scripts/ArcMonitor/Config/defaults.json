@@ -1,0 +1,55 @@
+{
+    "_comment": "ArcMonitor defaults — thresholds, ports, timeouts, and URLs that were previously hardcoded.",
+    "network": {
+        "winrmPort": 5985,
+        "winrmHttpsPort": 5986,
+        "tcpConnectTimeoutMs": 5000,
+        "reachabilityTimeoutMs": 3000,
+        "endpointTestTimeoutMs": 5000,
+        "webRequestTimeoutSec": 120
+    },
+    "prerequisites": {
+        "minDiskSpaceGB": 2,
+        "minDotNetRelease": 394802,
+        "minDotNetVersion": "4.6.2",
+        "minPSMajorVersion": 5,
+        "supportedOSMinVersion": "6.3"
+    },
+    "monitor": {
+        "pollIntervalSeconds": 60,
+        "maxPolls": 120,
+        "monitorPollInterval": 3,
+        "monitorMaxPolls": 720,
+        "completionWaitSeconds": 30
+    },
+    "agentUrls": {
+        "windowsAgent": "https://gbl.his.arc.azure.com/azcmagent-windows",
+        "windowsAgentAlt": "https://aka.ms/azcmagent-windows",
+        "linuxAgent": "https://aka.ms/azcmagent",
+        "arcInstaller": "https://aka.ms/AzsHCIARCInstallerModule"
+    },
+    "azureDefaults": {
+        "defaultRegion": "eastus",
+        "defaultCloud": "AzureCloud",
+        "defaultResourceGroup": "rg-arc-onboarding",
+        "defaultAuthType": "principal"
+    },
+    "azureEndpoints": [
+        { "name": "Azure ARM",          "host": "management.azure.com",               "port": 443 },
+        { "name": "Entra ID (login)",   "host": "login.microsoftonline.com",          "port": 443 },
+        { "name": "Entra ID (pas)",     "host": "pas.windows.net",                    "port": 443 },
+        { "name": "Arc HIS (metadata)", "host": "his.arc.azure.com",                  "port": 443 },
+        { "name": "Arc GBL (global)",   "host": "gbl.his.arc.azure.com",              "port": 443 },
+        { "name": "Guest Config",       "host": "guestconfiguration.azure.com",       "port": 443 },
+        { "name": "Guest Notify",       "host": "guestnotificationservice.azure.com", "port": 443 },
+        { "name": "Agent Download",     "host": "download.microsoft.com",             "port": 443 },
+        { "name": "Packages (Linux)",   "host": "packages.microsoft.com",             "port": 443 }
+    ],
+    "logging": {
+        "logPath": ".\\ArcMonitor\\Logs",
+        "logFilePattern": "ArcMonitor_{date}.log",
+        "transcriptPattern": "ArcMonitor_Transcript_{datetime}.log",
+        "dateFormat": "yyyyMMdd",
+        "datetimeFormat": "yyyyMMdd_HHmmss"
+    }
+}

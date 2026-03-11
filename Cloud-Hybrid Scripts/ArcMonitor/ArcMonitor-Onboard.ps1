@@ -1,4 +1,5 @@
 ﻿#Requires -Version 5.1
+Set-StrictMode -Version Latest
 <#
 .SYNOPSIS
     Azure Arc — Unified Onboarding Script
@@ -36,10 +37,12 @@ function Install-ArcAgentRemote {
         Downloads and installs the agent via Invoke-Command on the remote target.
         Does NOT run locally — all operations are on the remote machine.
     #>
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [System.Management.Automation.Runspaces.PSSession]$Session,
 
+        [ValidateNotNullOrEmpty()]
         [string]$AgentDownloadUrl = "https://gbl.his.arc.azure.com/azcmagent-windows",
 
         [string]$ProxyServer = $null
@@ -77,6 +80,24 @@ function Install-ArcAgentRemote {
             Invoke-WebRequest @dlParams -ErrorAction Stop
             $status.Downloaded = $true
 
+            # Verify Authenticode signature before execution
+            $sig = Get-AuthenticodeSignature -FilePath $installScript -ErrorAction SilentlyContinue
+            if ($sig -and $sig.Status -eq 'Valid' -and $sig.SignerCertificate.Subject -match 'Microsoft') {
+                $status.SignatureValid = $true
+            } elseif ($sig -and $sig.Status -eq 'NotSigned') {
+                # Microsoft install scripts from aka.ms may not always be signed;
+                # warn but continue if downloaded from known Microsoft URL
+                if ($DownloadUrl -match '\.azure\.com|aka\.ms|microsoft\.com') {
+                    $status.SignatureValid = $false
+                    $status.SignatureWarning = "Script not Authenticode-signed but from trusted Microsoft domain"
+                } else {
+                    $status.Error = "Downloaded script is NOT signed and NOT from a known Microsoft URL. Aborting for safety."
+                    return $status
+                }
+            } else {
+                $status.SignatureValid = ($sig.Status -eq 'Valid')
+            }
+
             # Install the agent
             & $installScript
             if ($LASTEXITCODE -ne 0) {
@@ -104,26 +125,33 @@ function Connect-ArcAgentRemote {
     .SYNOPSIS
         Runs azcmagent connect on a remote target with Service Principal auth.
     #>
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [System.Management.Automation.Runspaces.PSSession]$Session,
 
         [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$SubscriptionId,
 
         [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$ResourceGroup,
 
         [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$TenantId,
 
         [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$Location,
 
         [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$SPAppId,
 
         [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$SPSecret,
 
         [string]$Cloud = "AzureCloud",
@@ -306,7 +334,7 @@ function Start-ArcOnboarding {
         }
     }
 
-    # Helper: write state to JSON file
+    # Helper: write state to JSON file (atomic write via temp + rename)
     $writeState = {
         param([string]$Msg, [bool]$IsComplete)
         $stateObj = @{
@@ -317,7 +345,9 @@ function Start-ArcOnboarding {
         foreach ($srv in $Servers) {
             $stateObj.Servers += $serverState[$srv]
         }
-        $stateObj | ConvertTo-Json -Depth 5 | Out-File -FilePath $stateFile -Encoding UTF8 -Force
+        $tempFile = "$stateFile.tmp"
+        $stateObj | ConvertTo-Json -Depth 5 | Out-File -FilePath $tempFile -Encoding UTF8 -Force
+        Move-Item -Path $tempFile -Destination $stateFile -Force
     }
 
     # Write initial state
@@ -330,7 +360,7 @@ function Start-ArcOnboarding {
     Write-Host ""
     Write-Host "  Launching monitor dashboard in separate window..." -ForegroundColor Cyan
 
-    $monitorArgs = "-ExecutionPolicy Bypass -File `"$monitorScript`" -StateFile `"$stateFile`" -PollInterval 3"
+    $monitorArgs = "-ExecutionPolicy RemoteSigned -File `"$monitorScript`" -StateFile `"$stateFile`" -PollInterval 3"
     Start-Process $pwshExe -ArgumentList $monitorArgs
     Start-Sleep -Seconds 2
 
@@ -532,13 +562,13 @@ function Start-ArcOnboarding {
 
     # ── Summary in main window ───────────────────────────────────────────────────
     $elapsed = (Get-Date) - $startTime
-    $doneCount   = ($Servers | Where-Object { $serverState[$_].Phase -eq "Done" }).Count
-    $failedCount = ($Servers | Where-Object { $serverState[$_].Phase -ne "Done" }).Count
+    $doneCount   = @($Servers | Where-Object { $serverState[$_].Phase -eq "Done" }).Count
+    $failedCount = @($Servers | Where-Object { $serverState[$_].Phase -ne "Done" }).Count
 
     Write-Host ""
     Write-Host "  ============================================================" -ForegroundColor Cyan
     Write-Host "  ONBOARDING COMPLETE" -ForegroundColor Cyan
-    Write-Host "  Total: $($Servers.Count) | Succeeded: $doneCount | Failed: $failedCount | Time: $($elapsed.ToString('mm\:ss'))" -ForegroundColor White
+    Write-Host "  Total: $(@($Servers).Count) | Succeeded: $doneCount | Failed: $failedCount | Time: $($elapsed.ToString('mm\:ss'))" -ForegroundColor White
     Write-Host "  ============================================================" -ForegroundColor Cyan
     Write-Host ""
 
@@ -552,13 +582,13 @@ function Start-ArcOnboarding {
 
     Write-Host ""
     Write-Host "  Monitor window shows live dashboard. It will close automatically." -ForegroundColor DarkGray
-    Write-ArcLog "Onboarding complete: $doneCount/$($Servers.Count) in $($elapsed.ToString('mm\:ss'))"
+    Write-ArcLog "Onboarding complete: $doneCount/$(@($Servers).Count) in $($elapsed.ToString('mm\:ss'))"
 
     # Build return
-    $onboardResults = @()
+    $onboardResults = [System.Collections.Generic.List[hashtable]]::new()
     foreach ($srv in $Servers) {
         $s = $serverState[$srv]
-        $onboardResults += @{
+        $onboardResults.Add(@{
             Server    = $srv
             Platform  = $s.Platform
             Installed = ($s.Install -eq "Succeeded")
@@ -566,7 +596,7 @@ function Start-ArcOnboarding {
             HIMDS     = ($s.HIMDS -eq "Running")
             Phase     = $s.Phase
             Error     = $s.Error
-        }
+        })
     }
     return $onboardResults
 }
