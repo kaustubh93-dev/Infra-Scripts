@@ -167,16 +167,16 @@ function Test-ArcPrerequisites {
         try {
             $platformResult = Get-TargetPlatform -Session $session
             $result.Platform = $platformResult
-            $pName = if ($platformResult.PSObject.Properties.Name -contains 'Platform') { $platformResult.Platform } else { "Unknown" }
-            $pMfg  = if ($platformResult.PSObject.Properties.Name -contains 'Manufacturer') { $platformResult.Manufacturer } else { "Unknown" }
-            $pModel = if ($platformResult.PSObject.Properties.Name -contains 'Model') { $platformResult.Model } else { "Unknown" }
+            $pName  = if ($platformResult['Platform'])     { $platformResult['Platform'] }     else { "Unknown" }
+            $pMfg   = if ($platformResult['Manufacturer']) { $platformResult['Manufacturer'] } else { "Unknown" }
+            $pModel = if ($platformResult['Model'])        { $platformResult['Model'] }        else { "Unknown" }
             $result.Checks["PlatformDetect"] = @{
                 Status = "Pass"
                 Detail = "$pName ($pMfg / $pModel)"
             }
 
             # Auto-exclude Azure native VMs
-            $isAzVM = if ($platformResult.PSObject.Properties.Name -contains 'IsAzureVM') { $platformResult.IsAzureVM } else { $false }
+            $isAzVM = if ($platformResult['IsAzureVM']) { $platformResult['IsAzureVM'] } else { $false }
             if ($isAzVM) {
                 $result.Checks["AzureVMExclusion"] = @{
                     Status = "Fail"
@@ -498,11 +498,8 @@ function Show-PreReqResults {
         Write-Host "FAILED ($(@($Result.FailedChecks).Count) issue(s))" -ForegroundColor Red
     }
 
-    if ($Result.Platform -is [hashtable] -and $Result.Platform.Count -gt 0 -and $Result.Platform.ContainsKey('Platform')) {
-        Write-Host "  Platform: $($Result.Platform.Platform) | $($Result.Platform.Manufacturer) | $($Result.Platform.Model)" -ForegroundColor DarkGray
-    }
-    elseif ($Result.Platform -and $Result.Platform.PSObject.Properties.Name -contains 'Platform') {
-        Write-Host "  Platform: $($Result.Platform.Platform) | $($Result.Platform.Manufacturer) | $($Result.Platform.Model)" -ForegroundColor DarkGray
+    if ($Result.Platform -and $Result.Platform['Platform']) {
+        Write-Host "  Platform: $($Result.Platform['Platform']) | $($Result.Platform['Manufacturer']) | $($Result.Platform['Model'])" -ForegroundColor DarkGray
     }
 
     Write-Host ""

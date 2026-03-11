@@ -426,7 +426,7 @@ function Start-ArcOnboarding {
                 $prereqResult = Test-ArcPrerequisites -ComputerName $srv -Credential $Credential `
                                                       -ProxyServer $ArcConfig.ProxyServer
 
-                $s.Platform = if ($prereqResult.Platform -and $prereqResult.Platform.PSObject.Properties.Name -contains 'Platform') { $prereqResult.Platform.Platform } else { "Unknown" }
+                $s.Platform = if ($prereqResult.Platform -and $prereqResult.Platform['Platform']) { $prereqResult.Platform['Platform'] } else { "Unknown" }
 
                 if ($prereqResult.OverallPass) {
                     $s.PreReq = "Succeeded"
