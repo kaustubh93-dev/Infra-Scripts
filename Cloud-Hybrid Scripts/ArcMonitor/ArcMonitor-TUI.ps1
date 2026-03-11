@@ -1,27 +1,18 @@
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Arc Bootstrap Monitor — TUI Rendering Engine
+    Arc Bootstrap Monitor - TUI Rendering Engine
 .DESCRIPTION
-    Provides the text-based dashboard UI with animated header, status tables,
-    progress bars, event panels, and auto-refresh for Azure Arc onboarding monitoring.
+    Renders the dashboard matching the ARC BOOTSTRAP MONITOR reference design.
+    Uses Unicode box-drawing for borders, colored backgrounds for progress bars.
 .NOTES
-    This module is consumed by all three monitor scripts (AzureLocal, VMware, OnPrem).
+    Requires UTF-8 BOM encoding and a TrueType console font (Consolas, Lucida Console).
 #>
 
-#region ── ANSI / Color Helpers ──────────────────────────────────────────────────
+# Force UTF-8 output for Unicode box-drawing characters
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-function Write-ColorText {
-    param(
-        [string]$Text,
-        [ConsoleColor]$Color = 'White',
-        [switch]$NoNewline
-    )
-    $prev = $Host.UI.RawUI.ForegroundColor
-    $Host.UI.RawUI.ForegroundColor = $Color
-    if ($NoNewline) { Write-Host $Text -NoNewline }
-    else { Write-Host $Text }
-    $Host.UI.RawUI.ForegroundColor = $prev
-}
+#region -- Color Helpers
 
 function Get-StatusColor {
     param([string]$Status)
@@ -35,8 +26,13 @@ function Get-StatusColor {
         'Install'      { 'Yellow' }
         'Downloading'  { 'Yellow' }
         'Registering'  { 'Yellow' }
+        'Fixing'       { 'Yellow' }
+        'Rechecking'   { 'Yellow' }
         'Pending'      { 'DarkYellow' }
+        'Waiting'      { 'DarkGray' }
         'NotStarted'   { 'Gray' }
+        'Ignored'      { 'DarkYellow' }
+        'Skipped'      { 'DarkGray' }
         'Failed'       { 'Red' }
         'Error'        { 'Red' }
         'Disconnected' { 'Red' }
@@ -47,30 +43,36 @@ function Get-StatusColor {
 
 #endregion
 
-#region ── Header ────────────────────────────────────────────────────────────────
+#region -- Animated Header
 
-$script:SpinnerFrames = @('—', '\', '|', '/')
-$script:SpinnerIndex  = 0
+$script:SpinnerChars = @([char]0x2014, '\', '|', '/')   # em-dash, backslash, pipe, slash
+$script:SpinIdx = 0
 
 function Show-AnimatedHeader {
     param(
         [string]$Title = "ARC BOOTSTRAP MONITOR",
         [string]$Subtitle = "",
-        [int]$Width = 80
+        [int]$Width = 78
     )
 
-    $script:SpinnerIndex = ($script:SpinnerIndex + 1) % $script:SpinnerFrames.Count
-    $spinner = $script:SpinnerFrames[$script:SpinnerIndex]
+    $script:SpinIdx = ($script:SpinIdx + 1) % $script:SpinnerChars.Count
+    $spin = $script:SpinnerChars[$script:SpinIdx]
 
-    $headerText = " $Title $spinner "
-    $pad = [Math]::Max(0, $Width - $headerText.Length - 4)
-    $leftPad  = [Math]::Floor($pad / 2)
-    $rightPad = [Math]::Ceiling($pad / 2)
+    $text = " $Title $spin "
+    $innerW = $Width - 2
+    $pad = $innerW - $text.Length
+    $lp = [Math]::Floor($pad / 2)
+    $rp = [Math]::Ceiling($pad / 2)
+
+    $topBot = ([string][char]0x2500) * $innerW          # horizontal line
+    $tl = [char]0x250C; $tr = [char]0x2510    # top-left, top-right corners
+    $bl = [char]0x2514; $br = [char]0x2518    # bottom-left, bottom-right corners
+    $vl = [char]0x2502                         # vertical line
 
     Write-Host ""
-    Write-Host ("  ┌" + ("─" * ($Width - 4)) + "┐") -ForegroundColor DarkCyan
-    Write-Host ("  │" + (" " * $leftPad) + $headerText + (" " * $rightPad) + "│") -ForegroundColor Cyan
-    Write-Host ("  └" + ("─" * ($Width - 4)) + "┘") -ForegroundColor DarkCyan
+    Write-Host "  $tl$topBot$tr" -ForegroundColor DarkCyan
+    Write-Host "  $vl$(' ' * $lp)$text$(' ' * $rp)$vl" -ForegroundColor Cyan
+    Write-Host "  $bl$topBot$br" -ForegroundColor DarkCyan
 
     if ($Subtitle) {
         Write-Host "  $Subtitle" -ForegroundColor DarkGray
@@ -80,7 +82,7 @@ function Show-AnimatedHeader {
 
 #endregion
 
-#region ── Stats Bar ─────────────────────────────────────────────────────────────
+#region -- Stats Bar
 
 function Show-StatsBar {
     param(
@@ -88,11 +90,11 @@ function Show-StatsBar {
         [TimeSpan]$Elapsed,
         [int]$CurrentPoll,
         [int]$MaxPoll,
-        [string]$Mode = "AzureLocal"  # AzureLocal | VMware | OnPrem
+        [string]$Mode = "AzureLocal"
     )
 
-    $elapsedStr = $Elapsed.ToString("hh\:mm\:ss")
-    $modeLabel = switch ($Mode) {
+    $el = $Elapsed.ToString("hh\:mm\:ss")
+    $ml = switch ($Mode) {
         'AzureLocal' { 'Azure Local' }
         'VMware'     { 'VMware vSphere' }
         'OnPrem'     { 'On-Prem Servers' }
@@ -101,28 +103,18 @@ function Show-StatsBar {
 
     Write-Host "  Nodes: " -NoNewline -ForegroundColor White
     Write-Host "$NodeCount" -NoNewline -ForegroundColor Cyan
-    Write-Host "  │  Elapsed: " -NoNewline -ForegroundColor White
-    Write-Host "$elapsedStr" -NoNewline -ForegroundColor Yellow
-    Write-Host "  │  Poll: " -NoNewline -ForegroundColor White
-    Write-Host "$CurrentPoll/$MaxPoll" -NoNewline -ForegroundColor Cyan
-    Write-Host "  │  Mode: " -NoNewline -ForegroundColor White
-    Write-Host "$modeLabel" -ForegroundColor Magenta
+    Write-Host "  |  Elapsed: " -NoNewline -ForegroundColor White
+    Write-Host "$el" -NoNewline -ForegroundColor Yellow
+    Write-Host "  |  Poll: " -NoNewline -ForegroundColor White
+    Write-Host "$CurrentPoll/$MaxPoll" -ForegroundColor Cyan
     Write-Host ""
 }
 
 #endregion
 
-#region ── Status Table ──────────────────────────────────────────────────────────
+#region -- Status Table
 
 function Show-StatusTable {
-    <#
-    .SYNOPSIS
-        Renders a formatted status table for node onboarding progress.
-    .PARAMETER Nodes
-        Array of hashtables: @{ Name; Bootstrap; Update; ArcReg; Agent; Download; ... }
-    .PARAMETER Columns
-        Array of column definitions: @{ Header; Key; Width }
-    #>
     param(
         [array]$Nodes,
         [array]$Columns
@@ -138,111 +130,118 @@ function Show-StatusTable {
         )
     }
 
-    # Header line
-    $headerLine = "  │ "
-    $separatorLine = "  │ "
+    $vl = [char]0x2502   # vertical line
+    $hl = [string][char]0x2500   # horizontal line
+
+    # Build separator
+    $sep = "  "
+    foreach ($col in $Columns) { $sep += "$($hl * ($col.Width + 2))" }
+
+    # Header
+    Write-Host $sep -ForegroundColor DarkGray
+    $hdr = "  "
     foreach ($col in $Columns) {
-        $headerLine    += $col.Header.PadRight($col.Width) + "│ "
-        $separatorLine += ("─" * $col.Width) + "│ "
+        $hdr += " $($col.Header.PadRight($col.Width)) $vl"
     }
-
-    $topBorder = "  ┌─" + (($Columns | ForEach-Object { "─" * $_.Width + "┬─" }) -join "") 
-    $topBorder = $topBorder.TrimEnd("┬─") + "┐"
-
-    Write-Host $separatorLine -ForegroundColor DarkGray
-    Write-Host $headerLine -ForegroundColor White
-    Write-Host $separatorLine -ForegroundColor DarkGray
+    Write-Host $hdr -ForegroundColor White
+    Write-Host $sep -ForegroundColor DarkGray
 
     # Data rows
     foreach ($node in $Nodes) {
-        Write-Host "  │ " -NoNewline -ForegroundColor DarkGray
+        $row = "  "
         foreach ($col in $Columns) {
-            $val = if ($node[$col.Key]) { $node[$col.Key] } else { "────" }
+            $val = if ($node[$col.Key]) { [string]$node[$col.Key] } else { "----" }
             $color = if ($col.Key -eq "Name") { 'White' } else { Get-StatusColor $val }
-            $padded = $val.PadRight($col.Width)
-            Write-Host $padded -NoNewline -ForegroundColor $color
-            Write-Host "│ " -NoNewline -ForegroundColor DarkGray
+            # Can't mix colors in one Write-Host, so output cell by cell
+            Write-Host " " -NoNewline
+            Write-Host "$($val.PadRight($col.Width))" -NoNewline -ForegroundColor $color
+            Write-Host " $vl" -NoNewline -ForegroundColor DarkGray
         }
         Write-Host ""
     }
-    Write-Host $separatorLine -ForegroundColor DarkGray
+    Write-Host $sep -ForegroundColor DarkGray
     Write-Host ""
 }
 
 #endregion
 
-#region ── Progress Bars ─────────────────────────────────────────────────────────
+#region -- Download Progress Bars
 
 function Show-DownloadProgress {
-    <#
-    .SYNOPSIS
-        Renders download progress bars for each node.
-    .PARAMETER Downloads
-        Array of hashtables: @{ Node; Percent; SizeMB; Status }
-    #>
     param(
         [array]$Downloads,
-        [int]$BarWidth = 30
+        [int]$BarWidth = 25
     )
 
-    Write-Host "  ┌─ " -NoNewline -ForegroundColor DarkYellow
+    # Section header with box border
+    $hl = [string][char]0x2500
+    $tl = [char]0x250C; $tr = [char]0x2510
+    $bl = [char]0x2514; $br = [char]0x2518
+    $vl = [char]0x2502
+
+    $boxW = 72
+    Write-Host "  $tl " -NoNewline -ForegroundColor DarkYellow
     Write-Host "DOWNLOAD PROGRESS" -NoNewline -ForegroundColor Yellow
-    Write-Host (" " + "─" * 50) -ForegroundColor DarkYellow
-    Write-Host ""
+    Write-Host " $($hl * ($boxW - 22))$tr" -ForegroundColor DarkYellow
+    Write-Host "  $vl" -ForegroundColor DarkYellow
 
     foreach ($dl in $Downloads) {
         $pct = [Math]::Min(100, [Math]::Max(0, $dl.Percent))
         $filled = [Math]::Floor($BarWidth * $pct / 100)
         $empty  = $BarWidth - $filled
 
-        $bar = ("█" * $filled) + ("░" * $empty)
-        $barColor = if ($pct -eq 100) { 'Green' } elseif ($pct -gt 50) { 'Yellow' } else { 'DarkYellow' }
         $statusColor = Get-StatusColor $dl.Status
+        $label = "  $vl  $($dl.Node):".PadRight(14)
 
-        $label = "  $($dl.Node):".PadRight(10)
-        Write-Host "$label[" -NoNewline -ForegroundColor White
-        Write-Host $bar -NoNewline -ForegroundColor $barColor
+        Write-Host "$label [" -NoNewline -ForegroundColor White
+
+        # Green background filled portion (matching the screenshot's solid green bar)
+        if ($filled -gt 0) {
+            Write-Host (" " * $filled) -NoNewline -ForegroundColor Black -BackgroundColor Green
+        }
+        # Dark empty portion
+        if ($empty -gt 0) {
+            Write-Host (" " * $empty) -NoNewline -ForegroundColor DarkGray -BackgroundColor Black
+        }
+
         Write-Host "] " -NoNewline -ForegroundColor White
         Write-Host "$($pct.ToString().PadLeft(3))%" -NoNewline -ForegroundColor Cyan
         Write-Host " $($dl.SizeMB.ToString('N2')) MB" -NoNewline -ForegroundColor Gray
         Write-Host "  $($dl.Status)" -ForegroundColor $statusColor
     }
+
+    Write-Host "  $vl" -ForegroundColor DarkYellow
+    Write-Host "  $bl$($hl * $boxW)$br" -ForegroundColor DarkYellow
     Write-Host ""
 }
 
 #endregion
 
-#region ── Events Panel ──────────────────────────────────────────────────────────
+#region -- Events Panel
 
 function Show-EventsPanel {
-    <#
-    .SYNOPSIS
-        Renders the events/alerts panel.
-    .PARAMETER Events
-        Array of hashtables: @{ Node; Message; Severity }
-        Severity: Info | Warning | Error | Critical
-    #>
     param(
         [array]$Events
     )
 
-    Write-Host "  ┌─ " -NoNewline -ForegroundColor DarkRed
+    $hl = [string][char]0x2500
+    $tl = [char]0x250C; $tr = [char]0x2510
+    $bl = [char]0x2514; $br = [char]0x2518
+    $vl = [char]0x2502
+
+    $boxW = 72
+    Write-Host "  $tl " -NoNewline -ForegroundColor DarkRed
     Write-Host "EVENTS" -NoNewline -ForegroundColor Red
-    Write-Host (" " + "─" * 62) -ForegroundColor DarkRed
-    Write-Host ""
+    Write-Host " $($hl * ($boxW - 11))$tr" -ForegroundColor DarkRed
+    Write-Host "  $vl" -ForegroundColor DarkRed
 
     if ($Events.Count -eq 0) {
-        Write-Host "    No events." -ForegroundColor DarkGray
+        Write-Host "  $vl  No events." -ForegroundColor DarkGray
     }
     else {
         foreach ($evt in $Events) {
-            $icon = switch ($evt.Severity) {
-                'Info'     { '○' }
-                'Warning'  { '▲' }
-                'Error'    { '✖' }
-                'Critical' { '◆' }
-                default    { '●' }
-            }
+            Write-Host "  $vl  " -NoNewline -ForegroundColor DarkRed
+            Write-Host "$($evt.Node): " -NoNewline -ForegroundColor White
             $color = switch ($evt.Severity) {
                 'Info'     { 'Cyan' }
                 'Warning'  { 'Yellow' }
@@ -250,16 +249,18 @@ function Show-EventsPanel {
                 'Critical' { 'Magenta' }
                 default    { 'White' }
             }
-            Write-Host "    $icon $($evt.Node): " -NoNewline -ForegroundColor White
             Write-Host $evt.Message -ForegroundColor $color
         }
     }
+
+    Write-Host "  $vl" -ForegroundColor DarkRed
+    Write-Host "  $bl$($hl * $boxW)$br" -ForegroundColor DarkRed
     Write-Host ""
 }
 
 #endregion
 
-#region ── Summary / Footer ──────────────────────────────────────────────────────
+#region -- Summary and Footer
 
 function Show-Summary {
     param(
@@ -272,7 +273,7 @@ function Show-Summary {
     if ($Succeeded -gt 0) { Write-Host "  $Succeeded Succeeded" -ForegroundColor Cyan }
     if ($Failed -gt 0)    { Write-Host "  $Failed Failed" -ForegroundColor Red }
     Write-Host ""
-    Write-Host ("  " + "─" * 76) -ForegroundColor DarkGray
+    Write-Host ("  " + (([string][char]0x2500) * 76)) -ForegroundColor DarkGray
 }
 
 function Show-Footer {
@@ -283,41 +284,33 @@ function Show-Footer {
     Write-Host ""
     Write-Host "  Last refresh: " -NoNewline -ForegroundColor DarkGray
     Write-Host "$now" -NoNewline -ForegroundColor White
-    Write-Host "  │  Next: " -NoNewline -ForegroundColor DarkGray
+    Write-Host "  |  Next: " -NoNewline -ForegroundColor DarkGray
     Write-Host "${NextRefreshSeconds}s" -NoNewline -ForegroundColor Yellow
-    Write-Host "  │  Ctrl+C to exit" -ForegroundColor DarkGray
+    Write-Host "  |  Ctrl+C to exit" -ForegroundColor DarkGray
 }
 
 #endregion
 
-#region ── Full Dashboard Render ─────────────────────────────────────────────────
+#region -- Full Dashboard Render
 
-function Render-ArcDashboard {
-    <#
-    .SYNOPSIS
-        Renders the complete Arc Bootstrap Monitor dashboard.
-    .PARAMETER State
-        Hashtable with keys: Title, Subtitle, Mode, Nodes, Columns, Downloads, Events,
-                             NodeCount, Elapsed, CurrentPoll, MaxPoll, Running, Succeeded, Failed
-    #>
+function Show-ArcDashboard {
     param([hashtable]$State)
 
     Clear-Host
 
-    Show-AnimatedHeader `
-        -Title    ($State.Title    ?? "ARC BOOTSTRAP MONITOR") `
-        -Subtitle ($State.Subtitle ?? "")
+    $titleVal    = if ($State.Title)    { $State.Title }    else { "ARC BOOTSTRAP MONITOR" }
+    $subtitleVal = if ($State.Subtitle) { $State.Subtitle } else { "" }
+
+    Show-AnimatedHeader -Title $titleVal -Subtitle $subtitleVal
 
     Show-StatsBar `
         -NodeCount   $State.NodeCount `
         -Elapsed     $State.Elapsed `
         -CurrentPoll $State.CurrentPoll `
         -MaxPoll     $State.MaxPoll `
-        -Mode        ($State.Mode ?? "AzureLocal")
+        -Mode        $(if ($State.Mode) { $State.Mode } else { "AzureLocal" })
 
-    Show-StatusTable `
-        -Nodes   $State.Nodes `
-        -Columns $State.Columns
+    Show-StatusTable -Nodes $State.Nodes -Columns $State.Columns
 
     if ($State.Downloads -and $State.Downloads.Count -gt 0) {
         Show-DownloadProgress -Downloads $State.Downloads
@@ -327,17 +320,19 @@ function Render-ArcDashboard {
         Show-EventsPanel -Events $State.Events
     }
 
-    Show-Summary `
-        -Running   ($State.Running   ?? 0) `
-        -Succeeded ($State.Succeeded ?? 0) `
-        -Failed    ($State.Failed    ?? 0)
+    $runVal  = if ($State.Running)   { $State.Running }   else { 0 }
+    $sucVal  = if ($State.Succeeded) { $State.Succeeded } else { 0 }
+    $failVal = if ($State.Failed)    { $State.Failed }    else { 0 }
 
-    Show-Footer -NextRefreshSeconds ($State.NextRefreshSeconds ?? 60)
+    Show-Summary -Running $runVal -Succeeded $sucVal -Failed $failVal
+
+    $refreshVal = if ($State.NextRefreshSeconds) { $State.NextRefreshSeconds } else { 60 }
+    Show-Footer -NextRefreshSeconds $refreshVal
 }
 
 #endregion
 
-#region ── Logging ───────────────────────────────────────────────────────────────
+#region -- Logging
 
 function Write-ArcLog {
     param(
@@ -345,12 +340,19 @@ function Write-ArcLog {
         [string]$Level = "INFO",
         [string]$LogPath = ".\ArcMonitor\Logs"
     )
-    if (-not (Test-Path $LogPath)) { New-Item -ItemType Directory -Path $LogPath -Force | Out-Null }
-    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logFile = Join-Path $LogPath "ArcMonitor_$(Get-Date -Format 'yyyyMMdd').log"
-    "$ts [$Level] $Message" | Add-Content -Path $logFile
+    try {
+        if (-not (Test-Path $LogPath)) {
+            New-Item -ItemType Directory -Path $LogPath -Force -ErrorAction Stop | Out-Null
+        }
+        $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $logFile = Join-Path $LogPath "ArcMonitor_$(Get-Date -Format 'yyyyMMdd').log"
+        "$ts [$Level] $Message" | Add-Content -Path $logFile -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "ArcMonitor logging failed: $($_.Exception.Message)"
+    }
 }
 
 #endregion
 
-Write-Host "✓ TUI Engine loaded." -ForegroundColor Green
+Write-Host "  TUI Engine loaded." -ForegroundColor Green

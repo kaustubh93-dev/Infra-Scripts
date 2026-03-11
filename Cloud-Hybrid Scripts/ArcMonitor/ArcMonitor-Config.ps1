@@ -1,9 +1,10 @@
-<#
+﻿<#
 .SYNOPSIS
     Arc Monitor Configuration Module
 .DESCRIPTION
     Centralized configuration for Azure Arc Bootstrap Monitor.
     Edit this file to match your environment before running any monitor scripts.
+    Values can also be set via the Setup Wizard: .\Start-ArcMonitor.ps1 -Mode Setup
 #>
 
 # ─── Azure Identity ────────────────────────────────────────────────────────────
@@ -13,6 +14,8 @@ $ArcConfig = @{
     ResourceGroup  = "rg-arc-onboarding"
     Location       = "eastus"
     Cloud          = "AzureCloud"              # AzureCloud | AzureUSGovernment | AzureChinaCloud
+    AuthType       = "principal"               # principal | token | interactive
+    CorrelationId  = ""                        # Optional — for tracking in Azure Arc logs
 
     # Service Principal (for at-scale / automated onboarding)
     ServicePrincipal = @{
@@ -23,6 +26,20 @@ $ArcConfig = @{
     # Proxy (optional)
     ProxyServer = $null                        # e.g. "http://proxy.corp.local:8080"
 }
+
+# ─── Set environment variables for onboarding scripts ───────────────────────────
+# These env vars are used by the Azure Arc onboarding agent (azcmagent connect)
+$env:SUBSCRIPTION_ID = $ArcConfig.SubscriptionId
+$env:RESOURCE_GROUP  = $ArcConfig.ResourceGroup
+$env:TENANT_ID       = $ArcConfig.TenantId
+$env:LOCATION        = $ArcConfig.Location
+$env:AUTH_TYPE       = $ArcConfig.AuthType
+$env:CORRELATION_ID  = $ArcConfig.CorrelationId
+$env:CLOUD           = $ArcConfig.Cloud
+
+# Service Principal credentials (used by azcmagent connect --service-principal-id)
+$ServicePrincipalId           = $ArcConfig.ServicePrincipal.AppId
+$ServicePrincipalClientSecret = $ArcConfig.ServicePrincipal.Secret
 
 # ─── Azure Local (Azure Stack HCI) Nodes ───────────────────────────────────────
 $AzureLocalConfig = @{
@@ -79,9 +96,38 @@ $MonitorSettings = @{
 
 # ─── Agent Download URLs ─────────────────────────────────────────────────────────
 $AgentURLs = @{
-    WindowsAgent = "https://aka.ms/azcmagent-windows"
-    LinuxAgent   = "https://aka.ms/azcmagent"
-    ArcInstaller = "https://aka.ms/AzsHCIARCInstallerModule"
+    WindowsAgent    = "https://gbl.his.arc.azure.com/azcmagent-windows"
+    WindowsAgentAlt = "https://aka.ms/azcmagent-windows"
+    LinuxAgent      = "https://aka.ms/azcmagent"
+    ArcInstaller    = "https://aka.ms/AzsHCIARCInstallerModule"
+}
+
+# ─── Onboarding Command Template ────────────────────────────────────────────────
+# This is the azcmagent connect command used by all monitor scripts.
+# Changing it here changes the command everywhere.
+$ArcConnectArgs = @{
+    Windows = @(
+        "--service-principal-id", $ServicePrincipalId,
+        "--service-principal-secret", $ServicePrincipalClientSecret,
+        "--resource-group", $env:RESOURCE_GROUP,
+        "--tenant-id", $env:TENANT_ID,
+        "--location", $env:LOCATION,
+        "--subscription-id", $env:SUBSCRIPTION_ID,
+        "--cloud", $env:CLOUD
+    )
+    Linux = @(
+        "--service-principal-id", $ServicePrincipalId,
+        "--service-principal-secret", $ServicePrincipalClientSecret,
+        "--resource-group", $env:RESOURCE_GROUP,
+        "--tenant-id", $env:TENANT_ID,
+        "--location", $env:LOCATION,
+        "--subscription-id", $env:SUBSCRIPTION_ID,
+        "--cloud", $env:CLOUD
+    )
+}
+if ($env:CORRELATION_ID) {
+    $ArcConnectArgs.Windows += @("--correlation-id", $env:CORRELATION_ID)
+    $ArcConnectArgs.Linux   += @("--correlation-id", $env:CORRELATION_ID)
 }
 
 # ─── Export ──────────────────────────────────────────────────────────────────────
@@ -92,6 +138,7 @@ $Global:ArcMonitorConfig = @{
     OnPrem       = $OnPremConfig
     Monitor      = $MonitorSettings
     AgentURLs    = $AgentURLs
+    ConnectArgs  = $ArcConnectArgs
 }
 
-Write-Host "✓ Arc Monitor configuration loaded." -ForegroundColor Green
+Write-Host "  Arc Monitor configuration loaded." -ForegroundColor Green
