@@ -216,7 +216,26 @@ function Write-DiagWarning {
     #>
     param([string]$Text)
     # Forward to the built-in warning cmdlet to preserve expected behavior
-    Microsoft.PowerShell.Utility\Write-Warning -Message $Text
+    $safeText = Protect-DiagMessage -Message $Text
+    Microsoft.PowerShell.Utility\Write-Warning -Message $safeText
+    if ($safeText -ne $Text) { Write-Verbose "[WARNING FULL] $Text" }
+}
+
+function Protect-DiagMessage {
+    <#
+    .SYNOPSIS
+        Redacts potentially sensitive information from diagnostic messages
+    .PARAMETER Message
+        The message to sanitize
+    #>
+    param([string]$Message)
+    # Redact UNC paths (\\server\share)
+    $Message = $Message -replace '\\\\[^\s\\]+\\[^\s\\]+', '\\\\***\***'
+    # Redact email addresses
+    $Message = $Message -replace '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '***@***'
+    # Redact domain\user patterns
+    $Message = $Message -replace '(?<=[^\w])([A-Z][A-Z0-9]+)\\([A-Za-z0-9._-]+)(?=[^\w]|$)', '$1\***'
+    return $Message
 }
 
 function Write-DiagError {
@@ -227,7 +246,9 @@ function Write-DiagError {
         The error message to display
     #>
     param([string]$Text)
-    Write-Host "[ERROR] $($Text)" -ForegroundColor Red
+    $safeText = Protect-DiagMessage -Message $Text
+    Write-Host "[ERROR] $safeText" -ForegroundColor Red
+    if ($safeText -ne $Text) { Write-Verbose "[ERROR FULL] $Text" }
 }
 
 function Write-Info {
@@ -350,6 +371,12 @@ function Test-PathValid {
     )
     
     if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+    
+    # Security: Reject path traversal, injection, and non-rooted paths
+    if ($Path -match '\.\.' -or $Path -match '[\$\(\)&\|;`]' -or $Path -match '^\s*\\\\[^\\]+\\[^\\]+') {
+        Write-DiagError "Path rejected for security: contains traversal, special characters, or UNC path"
         return $false
     }
     
@@ -764,6 +791,12 @@ function Invoke-TSSCommand {
     #>
     param(
         [Parameter(Mandatory = $true)]
+        [ValidateScript({
+            if ($_ -match '[&|;`\$\(\)\{\}]') {
+                throw "TSS command contains forbidden shell metacharacters: $($_ -replace '[\w\s\-\\/:.,=]', '*')"
+            }
+            $true
+        })]
         [string]$Command
     )
     
@@ -818,7 +851,7 @@ function Invoke-TSSCommand {
         
         # Execute TSS command — single-string ArgumentList preserves quoted paths in $Command
         Write-Info "Executing: powershell -File '$tssScript' $Command"
-        $tssArgString = "-NoProfile -ExecutionPolicy Bypass -File `"$tssScript`" $Command"
+        $tssArgString = "-NoProfile -ExecutionPolicy RemoteSigned -File `"$tssScript`" $Command"
         $proc = Start-Process -FilePath "powershell.exe" `
             -ArgumentList $tssArgString `
             -Wait -NoNewWindow -PassThru
@@ -4785,7 +4818,7 @@ function Test-SecurityAuthentication {
     # Logon as a Service Policy
     Write-Section "Logon as a Service Policy"
     try {
-        $tmpFile = Join-Path $env:TEMP "secedit_export_$(Get-Random).cfg"
+        $tmpFile = Join-Path $env:TEMP "secedit_export_$([System.Guid]::NewGuid().ToString('N')).cfg"
         try {
             $null = secedit /export /cfg $tmpFile /quiet 2>&1
             if (Test-Path $tmpFile) {
@@ -5912,6 +5945,8 @@ function Test-TLSConfiguration {
     
     Write-Info ""
     Write-Info "--- Quick Fix Commands ---"
+    Write-DiagWarning "IMPORTANT: The commands below are for REFERENCE ONLY. They are NOT auto-executed."
+    Write-DiagWarning "Review each command carefully before running manually. Registry changes require a system restart."
     Write-Host @"
 
 To disable TLS 1.0 and 1.1 (RECOMMENDED):
@@ -7755,6 +7790,8 @@ function Start-TroubleshootingTool {
         # Stop transcript logging if it was enabled
         if ($EnableLogging -and $transcriptPath) {
             try {
+                Write-DiagWarning "NOTE: Transcript log may contain sensitive data (security policies, account names, event details)."
+                Write-Info "  Review and redact before sharing: $transcriptPath"
                 Stop-Transcript
                 Write-Success "Transcript saved to: $($transcriptPath)"
             }
