@@ -848,15 +848,20 @@ function Invoke-TSSCommand {
     try {
         # Change to TSS directory safely
         Push-Location $script:TSSPath
-        
-        # Execute TSS command — single-string ArgumentList preserves quoted paths in $Command
-        Write-Info "Executing: powershell -File '$tssScript' $Command"
-        $tssArgString = "-NoProfile -ExecutionPolicy RemoteSigned -File `"$tssScript`" $Command"
+
+        # Execute TSS via -Command "& '<script>' <args>" instead of -File.
+        # TSS.ps1 resolves its helper modules using $PSScriptRoot / $MyInvocation.InvocationName,
+        # which behaves differently under -File and causes "There are no traces to start" errors
+        # for -Xperf scenarios. Using & '<script>' matches how the user runs TSS manually.
+        # See GitHub issues #2 and #3.
+        Write-Info "Executing: powershell -Command `"& '$tssScript' $Command`""
+        $tssArgString = "-NoProfile -ExecutionPolicy RemoteSigned -Command `"& '$tssScript' $Command; exit `$LASTEXITCODE`""
         $proc = Start-Process -FilePath "powershell.exe" `
             -ArgumentList $tssArgString `
             -Wait -NoNewWindow -PassThru
         if ($proc.ExitCode -ne 0) {
             Write-DiagWarning "TSS process exited with code: $($proc.ExitCode)"
+            Write-Info "If TSS reported 'There are no traces to start', verify your TSS version supports the requested -Xperf scenario and that xperf.exe is present under '$($script:TSSPath)\BinArch64\'."
         }
         
         Write-Success "TSS command completed"
@@ -2291,9 +2296,28 @@ function Start-MemoryLogCollection {
     
     switch ($choice) {
         "1" {
-            Invoke-WithTSSCheck `
-                -TSSCommand "-Xperf Memory" `
-                -Description "Starting memory trace - You will need to manually stop with TSS.ps1 -Stop. Let trace run for 60 seconds to 3 minutes while memory is high"
+            if ($tssAvailable) {
+                Write-Info "Starting memory trace - You will need to manually stop with TSS.ps1 -Stop."
+                Write-Info "Let trace run for 60 seconds to 3 minutes while memory is high."
+                $logPath = Read-Host "Enter log folder path (e.g., D:\Data) or press Enter for default"
+                if ([string]::IsNullOrWhiteSpace($logPath)) { $logPath = $script:DefaultLogPath }
+                if (Test-PathValid -Path $logPath -CreateIfNotExist) {
+                    if ($script:ClusterEnv.IsClusterNode -and (Test-PathOnCSV -Path $logPath -CSVPaths $script:ClusterEnv.CSVPaths)) {
+                        Write-DiagWarning "WARNING: Path '$logPath' is on a Cluster Shared Volume!"
+                        Write-DiagWarning "Writing large traces to CSV can cause I/O storms affecting all cluster nodes."
+                        $csvConfirm = Get-ValidatedChoice -Prompt "Continue anyway? (Y/N)" -ValidChoices @("Y", "N")
+                        if ($csvConfirm -ne "Y") { return }
+                    }
+                    $confirm = Get-ValidatedChoice -Prompt "Start trace? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($confirm -eq "Y") {
+                        Invoke-TSSCommand -Command "-Xperf Memory -XperfMaxFileMB 4096 -LogFolderPath '$logPath'"
+                    }
+                }
+            }
+            else {
+                Write-DiagWarning "TSS is not available. Please install TSS (option 15) to use this trace."
+                Show-PerfmonCommand "Memory"
+            }
         }
         "2" {
             if ($tssAvailable) {
@@ -2312,7 +2336,7 @@ function Start-MemoryLogCollection {
                     }
                     $confirm = Get-ValidatedChoice -Prompt "Start trace? (Y/N)" -ValidChoices @("Y", "N")
                     if ($confirm -eq "Y") {
-                        Invoke-TSSCommand -Command "-Xperf Memory -XperfMaxFileMB 4096 -StopWaitTimeInSec 300 -LogFolderPath $logPath"
+                        Invoke-TSSCommand -Command "-Xperf Memory -XperfMaxFileMB 4096 -StopWaitTimeInSec 300 -LogFolderPath '$logPath'"
                     }
                 }
             }
@@ -2340,7 +2364,7 @@ function Start-MemoryLogCollection {
                     }
                     $confirm = Get-ValidatedChoice -Prompt "Start trace? (Y/N)" -ValidChoices @("Y", "N")
                     if ($confirm -eq "Y") {
-                        Invoke-TSSCommand -Command "-Xperf Memory -WaitEvent HighMemory:90 -StopWaitTimeInSec 300 -LogFolderPath $logPath"
+                        Invoke-TSSCommand -Command "-Xperf Memory -WaitEvent HighMemory:90 -StopWaitTimeInSec 300 -LogFolderPath '$logPath'"
                     }
                 }
             }
@@ -3043,9 +3067,28 @@ function Start-CPULogCollection {
     
     switch ($choice) {
         "1" {
-            Invoke-WithTSSCheck `
-                -TSSCommand "-Xperf CPU" `
-                -Description "Starting CPU trace - You can manually stop with TSS.ps1 -Stop. Run for 60 seconds to 3 minutes while CPU is high (>88%)"
+            if ($tssAvailable) {
+                Write-Info "Starting CPU trace - You can manually stop with TSS.ps1 -Stop."
+                Write-Info "Run for 60 seconds to 3 minutes while CPU is high (>88%)."
+                $logPath = Read-Host "Enter log folder path (e.g., D:\Data) or press Enter for default"
+                if ([string]::IsNullOrWhiteSpace($logPath)) { $logPath = $script:DefaultLogPath }
+                if (Test-PathValid -Path $logPath -CreateIfNotExist) {
+                    if ($script:ClusterEnv.IsClusterNode -and (Test-PathOnCSV -Path $logPath -CSVPaths $script:ClusterEnv.CSVPaths)) {
+                        Write-DiagWarning "WARNING: Path '$logPath' is on a Cluster Shared Volume!"
+                        Write-DiagWarning "Writing large traces to CSV can cause I/O storms affecting all cluster nodes."
+                        $csvConfirm = Get-ValidatedChoice -Prompt "Continue anyway? (Y/N)" -ValidChoices @("Y", "N")
+                        if ($csvConfirm -ne "Y") { return }
+                    }
+                    $confirm = Get-ValidatedChoice -Prompt "Start trace? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($confirm -eq "Y") {
+                        Invoke-TSSCommand -Command "-Xperf CPU -XperfMaxFileMB 4096 -LogFolderPath '$logPath'"
+                    }
+                }
+            }
+            else {
+                Write-DiagWarning "TSS is not available. Please install TSS (option 15) to use this trace."
+                Show-PerfmonCommand "CPU"
+            }
         }
         "2" {
             if ($tssAvailable) {
@@ -3064,7 +3107,7 @@ function Start-CPULogCollection {
                     }
                     $confirm = Get-ValidatedChoice -Prompt "Start trace? (Y/N)" -ValidChoices @("Y", "N")
                     if ($confirm -eq "Y") {
-                        Invoke-TSSCommand -Command "-Xperf CPU -XperfMaxFileMB 4096 -StopWaitTimeInSec 300 -LogFolderPath $logPath"
+                        Invoke-TSSCommand -Command "-Xperf CPU -XperfMaxFileMB 4096 -StopWaitTimeInSec 300 -LogFolderPath '$logPath'"
                     }
                 }
             }
@@ -3925,17 +3968,16 @@ function Test-ServicesHealth {
     # Disabled services that are typically needed
     Write-Section "Disabled Services (may need attention)"
     try {
-        $disabledSvcs = Get-Service -ErrorAction Stop | Where-Object {
+        $disabledSvcs = @(Get-Service -ErrorAction Stop | Where-Object {
             $_.StartType -eq "Disabled"
-        }
+        })
         
-        if ($disabledSvcs) {
+        if ($disabledSvcs.Count -gt 0) {
             Write-Info "  Found $($disabledSvcs.Count) disabled service(s):"
-            $disabledSvcs | Select-Object -First 15 | ForEach-Object {
-                Write-Info "    - $($_.DisplayName) ($($_.Name))"
-            }
-            if ($disabledSvcs.Count -gt 15) {
-                Write-Info "    ... and $($disabledSvcs.Count - 15) more"
+            # Issue #1: enumerate ALL disabled services so the file-save path captures the
+            # full list (previously truncated to 15 entries with "... and N more").
+            foreach ($svc in $disabledSvcs) {
+                Write-Info "    - $($svc.DisplayName) ($($svc.Name))"
             }
         }
         else {
