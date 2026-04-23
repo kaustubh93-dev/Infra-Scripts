@@ -23,6 +23,8 @@ A unified PowerShell framework for onboarding and monitoring Azure Arc-enabled s
 - [Logging](#logging)
 - [Security](#security)
 - [Testing](#testing)
+- [Parallel Processing](#parallel-processing)
+- [Excel Reports](#excel-reports)
 - [Troubleshooting](#troubleshooting)
 - [Microsoft Documentation](#microsoft-documentation)
 
@@ -90,17 +92,25 @@ The `rg-arc-onboarding` resource group showing onboarded Arc-enabled servers in 
 ```
 ArcMonitor/
 ├── Start-ArcMonitor.ps1          # Launcher + Setup Wizard + interactive menu
+├── ArcMonitor.psd1               # Module manifest (v1.0.0, 15 exported functions)
+├── ArcMonitor.psm1               # Root module loader
 ├── ArcMonitor-Config.ps1         # Azure identity, server lists, settings
 ├── ArcMonitor-TUI.ps1            # Dashboard rendering engine (Unicode box-drawing)
 ├── ArcMonitor-PreReqCheck.ps1    # Remote prerequisite validation + auto-fix
-├── ArcMonitor-Onboard.ps1        # Unified onboarding (all platforms)
+├── ArcMonitor-Onboard.ps1        # Unified onboarding + parallel checks + Excel export
 ├── ArcMonitor-MonitorWindow.ps1  # Standalone TUI (separate window, reads JSON)
+├── .build.ps1                    # Invoke-Build pipeline (Analyze → Test → Package)
 ├── Config/
 │   └── defaults.json             # Externalized thresholds, ports, timeouts, URLs
 ├── Tests/
-│   └── ArcMonitor.Tests.ps1      # Pester tests (validation, security baseline)
+│   └── ArcMonitor.Tests.ps1      # Pester 5 tests + PSScriptAnalyzer lint gate
+├── docs/
+│   └── help/                     # platyPS markdown help files
+│       ├── Test-ArcPrerequisites.md
+│       ├── Start-ArcOnboarding.md
+│       └── Export-ArcOnboardingReport.md
 ├── images/                       # Screenshots for documentation
-├── Logs/                         # Auto-created: daily logs, transcripts, state JSON
+├── Logs/                         # Auto-created: daily logs, transcripts, state JSON, Excel reports
 └── README.md                     # This file
 ```
 
@@ -469,24 +479,116 @@ The framework implements security hardening measures for enterprise environments
 
 ## Testing
 
-Pester tests are included in `Tests/ArcMonitor.Tests.ps1`. They validate:
+Pester 5 tests are included in `Tests/ArcMonitor.Tests.ps1` covering **7 test suites**:
 
-- **Input validation** — hostname/IP format acceptance and rejection
-- **Config integrity** — `defaults.json` structure, required fields, Microsoft domain URLs
-- **Security baseline** — no `ExecutionPolicy Bypass`, no `$Global:`, no TrustedHosts wildcards, `Set-StrictMode` present
+| Suite | What It Tests |
+|-------|---------------|
+| **Test-ValidServerName** | 9 tests — hostname/IP acceptance, rejects spaces, semicolons, invalid IPs |
+| **Config defaults.json** | 5 tests — structure, network settings, prereq thresholds, Azure endpoints |
+| **ArcMonitor-Config Security** | 3 tests — no plaintext secrets, no `$Global:`, DPAPI warning present |
+| **Script Security Baseline** | 4 tests — no `ExecutionPolicy Bypass`, no TrustedHosts wildcard, `Set-StrictMode` present |
+| **PSScriptAnalyzer Lint Gate** | 2 tests — zero Error-level violations, ≤5 unexpected warnings |
+| **GUID Validation** | 5 tests — valid/invalid/uppercase/placeholder/short GUID patterns |
+| **Azcmagent Exit Code Map** | 3 tests — exit code table exists, all 9 codes mapped, retry logic present |
 
 ### Running Tests
 
 ```powershell
-# Install Pester 5+ (Windows ships with 3.4.0 — must upgrade)
+# Install dependencies
 Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck
+Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
 
-# Import Pester 5 explicitly (avoids loading the built-in 3.4.0)
+# Run with Pester 5
 Import-Module Pester -MinimumVersion 5.0 -Force
-
-# Run all tests
 Invoke-Pester .\Tests\ArcMonitor.Tests.ps1 -Output Detailed
 ```
+
+### Build Pipeline (Invoke-Build)
+
+The `.build.ps1` file provides a full CI/CD pipeline:
+
+```powershell
+# Install Invoke-Build
+Install-Module InvokeBuild -Force -Scope CurrentUser
+
+# Run full pipeline: Clean → Analyze → Test → Package
+Invoke-Build
+
+# Run individual tasks
+Invoke-Build Analyze    # PSScriptAnalyzer lint
+Invoke-Build Test       # Pester 5 tests (NUnit XML output)
+Invoke-Build Package    # Copy module to output/ for distribution
+```
+
+| Task | Action |
+|------|--------|
+| `Clean` | Remove `output/` directory |
+| `Analyze` | PSScriptAnalyzer — fails on errors, warns on warnings |
+| `Test` | Pester 5 — NUnit XML results in `Tests/TestResults.xml` |
+| `Package` | Copy module files to `output/ArcMonitor/` for deployment |
+
+### Module Import
+
+ArcMonitor is now a proper PowerShell module:
+
+```powershell
+# Import as module
+Import-Module .\ArcMonitor.psd1
+
+# List exported functions
+Get-Command -Module ArcMonitor
+
+# Get help for any function
+Get-Help Test-ArcPrerequisites -Detailed
+Get-Help Start-ArcOnboarding -Examples
+Get-Help Export-ArcOnboardingReport -Full
+```
+
+> **Note**: The module exports 15 functions. Help documentation in `docs/help/` follows platyPS markdown format.
+
+---
+
+## Parallel Processing
+
+For large-scale onboarding, `Test-ArcPrerequisitesParallel` checks multiple servers concurrently:
+
+```powershell
+$cred = Get-Credential
+$results = Test-ArcPrerequisitesParallel -Servers "srv01","srv02","srv03","srv04","srv05" `
+                                          -Credential $cred -ThrottleLimit 5
+$results | Where-Object { $_.OverallPass } | ForEach-Object { $_.ComputerName }
+```
+
+| Feature | Detail |
+|---------|--------|
+| **PS 7+** | Uses `ForEach-Object -Parallel` (native) |
+| **PS 5.1** | Uses `Start-ThreadJob` (PSThreadJob module) |
+| **Fallback** | Sequential processing if no parallel module available |
+| **Throttle** | `-ThrottleLimit` parameter (default: 5 concurrent servers) |
+| **Thread-safe** | Results collected via `ConcurrentBag` |
+
+---
+
+## Excel Reports
+
+After onboarding completes, an **Excel report** is automatically generated (if ImportExcel is installed):
+
+```powershell
+# Install ImportExcel
+Install-Module ImportExcel -Force -Scope CurrentUser
+
+# Reports auto-generate after onboarding, or export manually:
+$results = Start-ArcOnboarding -Servers "srv01","srv02" -Credential $cred
+Export-ArcOnboardingReport -Results $results -Path ".\Reports\MyReport.xlsx"
+```
+
+| Feature | Detail |
+|---------|--------|
+| **Auto-export** | Generates after every onboarding run (if ImportExcel installed) |
+| **Formatting** | Auto-sized columns, bold header, frozen top row, auto-filter |
+| **Conditional coloring** | Green for "Done", red for "Failed" |
+| **Table style** | Medium6 Excel table style |
+| **Output path** | `Logs/ArcOnboarding_YYYYMMDD_HHmmss.xlsx` (default) |
 
 > **Note**: Windows Server ships with Pester 3.4.0 which has incompatible syntax. The `-SkipPublisherCheck` flag is required because the built-in module is Microsoft-signed while the newer PSGallery version uses a different publisher. The test file auto-imports Pester 5+ at runtime.
 

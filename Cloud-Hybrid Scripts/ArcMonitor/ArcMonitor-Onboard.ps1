@@ -399,7 +399,7 @@ function Start-ArcOnboarding {
     Write-Host ""
     Write-Host "  Launching monitor dashboard in separate window..." -ForegroundColor Cyan
 
-    $monitorArgs = "-ExecutionPolicy RemoteSigned -File `"$monitorScript`" -StateFile `"$stateFile`" -PollInterval 3"
+    $monitorArgs = "-ExecutionPolicy RemoteSigned -File `"$monitorScript`" -StateFile `"$stateFile`" -PollInterval $PollInterval"
     Start-Process $pwshExe -ArgumentList $monitorArgs
     Start-Sleep -Seconds 2
 
@@ -637,7 +637,157 @@ function Start-ArcOnboarding {
             Error     = $s.Error
         })
     }
+
+    # Auto-export Excel report if ImportExcel is available
+    if (Get-Module ImportExcel -ListAvailable -ErrorAction SilentlyContinue) {
+        try {
+            $reportPath = Export-ArcOnboardingReport -Results $onboardResults
+            Write-Host "  Excel report: $reportPath" -ForegroundColor Cyan
+        }
+        catch {
+            Write-Host "  ⚠ Excel export failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
     return $onboardResults
+}
+
+# ─── Parallel Prerequisite Check ─────────────────────────────────────────────────
+
+function Test-ArcPrerequisitesParallel {
+    <#
+    .SYNOPSIS
+        Runs prerequisite checks on multiple servers in parallel using thread jobs.
+    .DESCRIPTION
+        Uses PSThreadJob (or ForEach-Object -Parallel on PS 7+) to check
+        multiple servers concurrently. Returns results as they complete.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Servers,
+
+        [Parameter(Mandatory)]
+        [PSCredential]$Credential,
+
+        [string]$ProxyServer = $null,
+
+        [int]$ThrottleLimit = 5
+    )
+
+    $results = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        # PS 7+: native ForEach-Object -Parallel
+        $Servers | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+            $prereqFunc = ${function:Test-ArcPrerequisites}
+            $r = Test-ArcPrerequisites -ComputerName $_ -Credential $using:Credential -ProxyServer $using:ProxyServer
+            ($using:results).Add($r)
+        }
+    }
+    else {
+        # PS 5.1: use Start-ThreadJob if available, else fall back to sequential
+        $useThreadJobs = Get-Command Start-ThreadJob -ErrorAction SilentlyContinue
+        if ($useThreadJobs) {
+            $jobs = @()
+            foreach ($srv in $Servers) {
+                $jobs += Start-ThreadJob -ScriptBlock {
+                    param($Computer, $Cred, $Proxy, $ScriptRoot)
+                    . "$ScriptRoot\ArcMonitor-TUI.ps1"
+                    . "$ScriptRoot\ArcMonitor-Config.ps1"
+                    . "$ScriptRoot\ArcMonitor-PreReqCheck.ps1"
+                    Test-ArcPrerequisites -ComputerName $Computer -Credential $Cred -ProxyServer $Proxy
+                } -ArgumentList $srv, $Credential, $ProxyServer, $script:OnboardScriptRoot -ThrottleLimit $ThrottleLimit
+            }
+            $jobResults = $jobs | Wait-Job | Receive-Job
+            $jobs | Remove-Job -Force
+            foreach ($r in $jobResults) { $results.Add($r) }
+        }
+        else {
+            # Sequential fallback
+            foreach ($srv in $Servers) {
+                $r = Test-ArcPrerequisites -ComputerName $srv -Credential $Credential -ProxyServer $ProxyServer
+                $results.Add($r)
+            }
+        }
+    }
+
+    return @($results)
+}
+
+# ─── Excel Report Export ──────────────────────────────────────────────────────────
+
+function Export-ArcOnboardingReport {
+    <#
+    .SYNOPSIS
+        Exports onboarding results to a formatted Excel spreadsheet.
+    .DESCRIPTION
+        Creates an Excel workbook with onboarding results, conditional formatting,
+        and auto-sized columns. Requires the ImportExcel module.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Results,
+
+        [string]$Path
+    )
+
+    if (-not (Get-Module ImportExcel -ListAvailable)) {
+        Write-Warning "ImportExcel module not installed. Run: Install-Module ImportExcel -Force"
+        return
+    }
+    Import-Module ImportExcel -Force
+
+    if (-not $Path) {
+        $logDir = Join-Path $script:OnboardScriptRoot "Logs"
+        if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+        $Path = Join-Path $logDir "ArcOnboarding_$(Get-Date -Format 'yyyyMMdd_HHmmss').xlsx"
+    }
+
+    # Build report data
+    $reportData = foreach ($r in $Results) {
+        [PSCustomObject]@{
+            Server    = $r.Server
+            Platform  = $r.Platform
+            Installed = if ($r.Installed) { "Yes" } else { "No" }
+            Connected = if ($r.Connected) { "Yes" } else { "No" }
+            HIMDS     = if ($r.HIMDS) { "Running" } else { "Not Running" }
+            Status    = $r.Phase
+            Error     = if ($r.Error) { $r.Error.Substring(0, [Math]::Min(100, $r.Error.Length)) } else { "" }
+            Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        }
+    }
+
+    # Export with formatting
+    $excelParams = @{
+        Path          = $Path
+        WorksheetName = 'Onboarding Results'
+        AutoSize      = $true
+        AutoFilter    = $true
+        BoldTopRow    = $true
+        FreezeTopRow  = $true
+        TableStyle    = 'Medium6'
+    }
+
+    $reportData | Export-Excel @excelParams
+
+    # Add conditional formatting
+    $excel = Open-ExcelPackage -Path $Path
+    $ws = $excel.Workbook.Worksheets['Onboarding Results']
+    $lastRow = $ws.Dimension.End.Row
+
+    # Green for "Done", Red for "Failed"
+    Add-ConditionalFormatting -Worksheet $ws -Range "F2:F$lastRow" -RuleType Equal -ConditionValue "Done" `
+        -BackgroundColor ([System.Drawing.Color]::LightGreen)
+    Add-ConditionalFormatting -Worksheet $ws -Range "F2:F$lastRow" -RuleType Equal -ConditionValue "Failed" `
+        -BackgroundColor ([System.Drawing.Color]::LightCoral)
+
+    Close-ExcelPackage $excel
+
+    Write-Host "  ✓ Report exported: $Path" -ForegroundColor Green
+    Write-ArcLog "Report exported to $Path" -Level "INFO"
+    return $Path
 }
 
 Write-Host "  Unified onboarding module loaded." -ForegroundColor Green

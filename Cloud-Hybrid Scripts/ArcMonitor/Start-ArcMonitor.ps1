@@ -278,6 +278,8 @@ function Start-SetupWizard {
         $saveChoice = Read-Host "    Save credentials securely (DPAPI-encrypted)? (Y/N)"
         if ($saveChoice -eq 'Y' -or $saveChoice -eq 'y') {
             $credFile = Join-Path $scriptRoot "ArcSPN-Credentials.xml"
+            # Suppress PSScriptAnalyzer: plaintext-to-secure conversion is intentional here for DPAPI encryption
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '')]
             $secureSecret = ConvertTo-SecureString $spSecret -AsPlainText -Force
             $credObj = @{
                 TenantId       = $ctx.Tenant.Id

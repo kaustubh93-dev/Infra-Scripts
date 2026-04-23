@@ -12,6 +12,41 @@
 # Force UTF-8 output for Unicode box-drawing characters
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+#region -- Render Helpers
+
+function Write-PaddedHost {
+    <#
+    .SYNOPSIS
+        Write-Host with right-padding to console width. Overwrites stale content from previous frame.
+    #>
+    param(
+        [string]$Text = "",
+        [string]$ForegroundColor = "White",
+        [switch]$NoNewline
+    )
+    $width = [Math]::Max(1, [Console]::WindowWidth - 1)
+    $padded = if ($Text.Length -ge $width) { $Text.Substring(0, $width) } else { $Text.PadRight($width) }
+    if ($NoNewline) {
+        Write-Host $padded -ForegroundColor $ForegroundColor -NoNewline
+    } else {
+        Write-Host $padded -ForegroundColor $ForegroundColor
+    }
+}
+
+function Clear-RemainingLines {
+    <#
+    .SYNOPSIS
+        Clears lines from current cursor position to bottom of last known render area.
+    #>
+    param([int]$MaxLines = 5)
+    $blank = " " * ([Math]::Max(1, [Console]::WindowWidth - 1))
+    for ($i = 0; $i -lt $MaxLines; $i++) {
+        Write-Host $blank
+    }
+}
+
+#endregion
+
 #region -- Color Helpers
 
 function Get-StatusColor {
@@ -293,10 +328,20 @@ function Show-Footer {
 
 #region -- Full Dashboard Render
 
+# Render buffer for flicker-free differential updates
+$script:RenderFrame = 0
+
 function Show-ArcDashboard {
     param([hashtable]$State)
 
-    Clear-Host
+    # First frame: clear screen. Subsequent frames: reset cursor to top-left (no flicker)
+    if ($script:RenderFrame -eq 0) {
+        Clear-Host
+        [Console]::CursorVisible = $false
+    } else {
+        [Console]::SetCursorPosition(0, 0)
+    }
+    $script:RenderFrame++
 
     $titleVal    = if ($State.Title)    { $State.Title }    else { "ARC BOOTSTRAP MONITOR" }
     $subtitleVal = if ($State.Subtitle) { $State.Subtitle } else { "" }
@@ -328,6 +373,9 @@ function Show-ArcDashboard {
 
     $refreshVal = if ($State.NextRefreshSeconds) { $State.NextRefreshSeconds } else { 60 }
     Show-Footer -NextRefreshSeconds $refreshVal
+
+    # Clear any stale lines below the current render (e.g., if downloads section disappeared)
+    Clear-RemainingLines -MaxLines 8
 }
 
 #endregion

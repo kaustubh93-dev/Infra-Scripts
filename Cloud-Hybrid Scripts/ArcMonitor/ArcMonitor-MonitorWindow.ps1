@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Arc Monitor — Standalone TUI Dashboard (runs in its own window)
@@ -66,7 +66,7 @@ while ($pollCount -lt $MaxPolls) {
     }
 
     # Build node status array
-    $allNodes  = [System.Collections.Generic.List[hashtable]]::new()
+    $nodeList  = [System.Collections.Generic.List[hashtable]]::new()
     $allEvents = [System.Collections.Generic.List[hashtable]]::new()
     $running = 0; $done = 0; $failed = 0
 
@@ -80,7 +80,7 @@ while ($pollCount -lt $MaxPolls) {
             Agent    = $srv.Agent
             HIMDS    = $srv.HIMDS
         }
-        $allNodes.Add($nodeHash)
+        $nodeList.Add($nodeHash)
 
         # Collect events
         if ($srv.Events) {
@@ -131,7 +131,7 @@ while ($pollCount -lt $MaxPolls) {
         Elapsed      = $elapsed
         CurrentPoll  = $pollCount
         MaxPoll      = $MaxPolls
-        Nodes        = $allNodes
+        Nodes        = $nodeList
         Columns      = $columns
         Downloads    = $downloads
         Events       = $allEvents
@@ -157,6 +157,7 @@ while ($pollCount -lt $MaxPolls) {
         }
         Write-Host ""
         Write-Host "  This window will close in 30 seconds, or press any key..." -ForegroundColor DarkGray
+        [Console]::CursorVisible = $true
         $waitEnd = (Get-Date).AddSeconds(30)
         while ((Get-Date) -lt $waitEnd) {
             if ([Console]::KeyAvailable) { break }
@@ -167,3 +168,4 @@ while ($pollCount -lt $MaxPolls) {
 
     Start-Sleep -Seconds $PollInterval
 }
+

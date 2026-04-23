@@ -246,7 +246,7 @@ function Test-ArcPrerequisites {
             $tls12Client = $null
             try {
                 $tls12Client = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Client" -ErrorAction SilentlyContinue
-            } catch {}
+            } catch { $tls12Client = $null }
             $tlsEnabled = [Net.ServicePointManager]::SecurityProtocol -band [Net.SecurityProtocolType]::Tls12
             $tlsRegOk = (-not $tls12Client) -or ($tls12Client.Enabled -ne 0 -and $tls12Client.DisabledByDefault -ne 1)
             $checks["TLS12"] = @{
@@ -398,7 +398,7 @@ function Test-ArcPrerequisites {
             # 13. Proxy Configuration (if applicable)
             if ($ProxyServer) {
                 try {
-                    $proxyTest = Invoke-WebRequest -Uri "https://management.azure.com" `
+                    $null = Invoke-WebRequest -Uri "https://management.azure.com" `
                                                    -Proxy $ProxyServer -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
                     $checks["ProxyConfig"] = @{ Status = "Pass"; Detail = "Proxy $ProxyServer reachable to Azure" }
                 }

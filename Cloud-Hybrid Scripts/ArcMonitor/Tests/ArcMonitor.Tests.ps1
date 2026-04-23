@@ -37,7 +37,8 @@ if (Test-Path $script:StartScript) {
 Describe "Test-ValidServerName" {
     BeforeAll {
         if ($script:FunctionBlock) {
-            Invoke-Expression $script:FunctionBlock
+            $sb = [ScriptBlock]::Create($script:FunctionBlock)
+            . $sb
         } else {
             throw "Could not extract Test-ValidServerName from Start-ArcMonitor.ps1"
         }
@@ -157,5 +158,73 @@ Describe "Script Security Baseline" {
 
         $prereqContent = Get-Content (Join-Path $script:ProjectRoot "ArcMonitor-PreReqCheck.ps1") -Raw
         $prereqContent | Should -Match 'Set-StrictMode'
+    }
+}
+
+Describe "PSScriptAnalyzer — Lint Gate" {
+    BeforeAll {
+        if (-not (Get-Module PSScriptAnalyzer -ListAvailable)) {
+            Set-ItResult -Skipped -Because "PSScriptAnalyzer not installed"
+        }
+        Import-Module PSScriptAnalyzer -Force -ErrorAction SilentlyContinue
+    }
+
+    It "No Error-level violations in ArcMonitor scripts" {
+        $errors = Invoke-ScriptAnalyzer -Path $script:ProjectRoot -Recurse -Severity Error `
+                    -ExcludeRule PSAvoidUsingWriteHost, PSAvoidUsingConvertToSecureStringWithPlainText
+        @($errors).Count | Should -Be 0 -Because "PSScriptAnalyzer Error-level rules must pass: $($errors | ForEach-Object { "$($_.ScriptName):$($_.Line) $($_.RuleName)" })"
+    }
+
+    It "No Warning-level violations (excluding accepted patterns)" {
+        $warnings = Invoke-ScriptAnalyzer -Path $script:ProjectRoot -Recurse -Severity Warning `
+                      -ExcludeRule PSAvoidUsingWriteHost, PSUseSingularNouns, PSUseUsingScopeModifierInNewRunspaces, PSUseOutputTypeCorrectly
+        @($warnings).Count | Should -BeLessOrEqual 5 -Because "Unexpected warnings: $($warnings | ForEach-Object { "$($_.ScriptName):$($_.Line) $($_.RuleName)" })"
+    }
+}
+
+Describe "GUID Validation Logic" {
+    BeforeAll {
+        $script:guidPattern = '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+    }
+
+    It "Accepts valid GUID" {
+        "12345678-1234-1234-1234-123456789abc" -match $script:guidPattern | Should -Be $true
+    }
+
+    It "Accepts uppercase GUID" {
+        "ABCDEF01-2345-6789-ABCD-EF0123456789" -match $script:guidPattern | Should -Be $true
+    }
+
+    It "Rejects placeholder" {
+        "<YOUR-TENANT-ID>" -match $script:guidPattern | Should -Be $false
+    }
+
+    It "Rejects short string" {
+        "12345678-1234" -match $script:guidPattern | Should -Be $false
+    }
+
+    It "Rejects GUID with extra characters" {
+        "12345678-1234-1234-1234-123456789abcX" -match $script:guidPattern | Should -Be $false
+    }
+}
+
+Describe "Azcmagent Exit Code Map" {
+    BeforeAll {
+        $script:OnboardContent = Get-Content (Join-Path $script:ProjectRoot "ArcMonitor-Onboard.ps1") -Raw
+    }
+
+    It "Contains exit code lookup table" {
+        $script:OnboardContent | Should -Match 'exitCodeMap'
+    }
+
+    It "Maps known Microsoft error codes" {
+        foreach ($code in @(1, 2, 16, 17, 18, 19, 20, 21, 23)) {
+            $script:OnboardContent | Should -Match "$code\s*=" -Because "Exit code $code should be mapped"
+        }
+    }
+
+    It "Contains retry logic for transient errors" {
+        $script:OnboardContent | Should -Match 'retryableCodes'
+        $script:OnboardContent | Should -Match 'attempt'
     }
 }

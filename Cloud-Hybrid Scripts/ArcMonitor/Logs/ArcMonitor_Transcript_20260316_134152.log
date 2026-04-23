@@ -1,0 +1,51 @@
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20260316134152
+Username: FAREAST\v-kausha
+RunAs User: FAREAST\v-kausha
+Configuration Name: 
+Machine: HP-ELITE (Microsoft Windows NT 10.0.26200.0)
+Host Application: C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -NoExit -ExecutionPolicy RemoteSigned -File D:\Personal\Vs-dev-codebase\Infra-Scripts\Cloud-Hybrid Scripts\ArcMonitor\Start-ArcMonitor.ps1
+Process ID: 11728
+PSVersion: 5.1.26100.7462
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.7462
+BuildVersion: 10.0.26100.7462
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+
+  ████████                          ██████   ██████                      ███   █████
+  ███▒▒▒▒▒███                       ▒▒██████ ██████                      ▒▒▒   ▒▒███
+ ▒███    ▒███  ████████   ██████     ▒███▒█████▒███   ██████  ████████   ████  ███████    ██████  ████████
+ ▒███████████ ▒▒███▒▒███ ███▒▒███    ▒███▒▒███ ▒███  ███▒▒███▒▒███▒▒███ ▒▒███ ▒▒▒███▒    ███▒▒███▒▒███▒▒███
+ ▒███▒▒▒▒▒███  ▒███ ▒▒▒ ▒███ ▒▒▒     ▒███ ▒▒▒  ▒███ ▒███ ▒███ ▒███ ▒███  ▒███   ▒███    ▒███ ▒███ ▒███ ▒▒▒
+ ▒███    ▒███  ▒███     ▒███  ███    ▒███      ▒███ ▒███ ▒███ ▒███ ▒███  ▒███   ▒███ ███▒███ ▒███ ▒███
+ █████   █████ █████    ▒▒██████     █████     █████▒▒██████  ████ █████ █████  ▒▒█████ ▒▒██████  █████
+▒▒▒▒▒   ▒▒▒▒▒ ▒▒▒▒▒      ▒▒▒▒▒▒     ▒▒▒▒▒     ▒▒▒▒▒  ▒▒▒▒▒▒  ▒▒▒▒ ▒▒▒▒▒ ▒▒▒▒▒    ▒▒▒▒▒   ▒▒▒▒▒▒  ▒▒▒▒▒
+
+  Azure Arc Onboarding Monitor
+  Unified framework for onboarding servers to Azure Arc
+  Supports: VMware | Azure Local | Hyper-V | Physical | KVM | Nutanix
+
+  ========================================================================
+
+  SELECT MODE:
+
+    [1]  Onboard Servers to Azure Arc (Recommended)
+         Enter targets  ->  PreReq check  ->  Install  ->  Connect
+         Live TUI dashboard opens in a separate monitor window
+
+    [2]  PreReq Check Only
+         Validate remote servers without onboarding
+
+    [3]  Setup Wizard
+         Create Service Principal, configure Azure identity
+
+    [4]  Test Network Connectivity
+         Test Azure Arc endpoint reachability from REMOTE target servers
+
+    [Q]  Quit
+
