@@ -855,9 +855,18 @@ function Invoke-TSSCommand {
         # for -Xperf scenarios. Using & '<script>' matches how the user runs TSS manually.
         # See GitHub issues #2 and #3.
         Write-Info "Executing: powershell -Command `"& '$tssScript' $Command`""
-        $tssArgString = "-NoProfile -ExecutionPolicy RemoteSigned -Command `"& '$tssScript' $Command; exit `$LASTEXITCODE`""
+        # Pass ArgumentList as an array so .NET quotes each element correctly.
+        # A single-string ArgumentList that embeds quotes gets re-tokenized by
+        # the native command-line splitter, producing parser errors like
+        # "Unexpected token '-NewSession'" inside the child powershell.exe.
+        $innerCommand = "& '$tssScript' $Command; exit `$LASTEXITCODE"
+        $tssArgList = @(
+            '-NoProfile',
+            '-ExecutionPolicy', 'RemoteSigned',
+            '-Command', $innerCommand
+        )
         $proc = Start-Process -FilePath "powershell.exe" `
-            -ArgumentList $tssArgString `
+            -ArgumentList $tssArgList `
             -Wait -NoNewWindow -PassThru
         if ($proc.ExitCode -ne 0) {
             Write-DiagWarning "TSS process exited with code: $($proc.ExitCode)"
@@ -1431,14 +1440,31 @@ function Test-NetworkConfiguration {
         foreach ($adpt in $activeAdapters) {
             try {
                 $driverInfo = Get-NetAdapter -Name $adpt.Name -ErrorAction Stop
-                $driverVersion = $driverInfo.DriverVersion
-                $driverDate = $driverInfo.DriverDate
-                $driverDesc = $driverInfo.DriverDescription
+                $driverVersion  = $driverInfo.DriverVersion
+                $driverDateRaw  = $driverInfo.DriverDate
+                $driverDesc     = $driverInfo.DriverDescription
                 $driverProvider = $driverInfo.DriverProvider
 
                 Write-Info "  $($adpt.Name):"
                 Write-Info "    Driver: $driverDesc"
                 Write-Info "    Version: $driverVersion | Provider: $driverProvider"
+
+                # DriverDate may come back as [DateTime], string, or $null depending on
+                # the Windows build / driver INF. Coerce defensively so a single bad
+                # value doesn't blow away the whole adapter's output.
+                $driverDate = $null
+                if ($driverDateRaw) {
+                    if ($driverDateRaw -is [datetime]) {
+                        $driverDate = $driverDateRaw
+                    }
+                    else {
+                        [datetime]$parsed = [datetime]::MinValue
+                        if ([datetime]::TryParse([string]$driverDateRaw, [ref]$parsed)) {
+                            $driverDate = $parsed
+                        }
+                    }
+                }
+
                 if ($driverDate) {
                     $driverAge = ((Get-Date) - $driverDate).Days
                     Write-Info "    Date: $($driverDate.ToString('yyyy-MM-dd')) ($driverAge days old)"
@@ -1446,12 +1472,23 @@ function Test-NetworkConfiguration {
                         Write-DiagWarning "    WARNING: Driver is over 2 years old - consider updating"
                     }
                 }
-                if ($driverDesc -like "*vmxnet3*" -and $driverVersion -lt "1.8") {
-                    Write-DiagWarning "    vmxnet3 driver is outdated - upgrade to latest VMware Tools"
+                elseif ($driverDateRaw) {
+                    Write-Info "    Date: $driverDateRaw (unparseable - age unknown)"
+                }
+                else {
+                    Write-Info "    Date: (not reported by driver)"
+                }
+
+                # Use [version] comparison; string compare ('1.10' -lt '1.8' is $true) is wrong.
+                if ($driverDesc -like "*vmxnet3*") {
+                    [version]$verObj = $null
+                    if ([version]::TryParse([string]$driverVersion, [ref]$verObj) -and $verObj -lt [version]'1.8') {
+                        Write-DiagWarning "    vmxnet3 driver is outdated - upgrade to latest VMware Tools"
+                    }
                 }
             }
             catch {
-                Write-DiagWarning "  Could not retrieve driver info for $($adpt.Name)"
+                Write-DiagWarning "  Could not retrieve driver info for $($adpt.Name): $($_.Exception.Message)"
             }
         }
     }
