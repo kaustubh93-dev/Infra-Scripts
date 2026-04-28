@@ -710,13 +710,22 @@ function Set-TSSPath {
     Write-Header "TSS Path Configuration"
     Write-Info "Current TSS Path: $($script:TSSPath)"
     Write-Info ""
-    Write-Info "TSS (TroubleShootingScript) is required for automated log collection."
-    Write-Info "Download TSS from:"
-    Write-Info "  - https://aka.ms/getTSS"
-    Write-Info "  - https://aka.ms/getTSSlite"
-    Write-Info "  - https://cesdiagtools.blob.core.windows.net/windows/TSS.zip"
+    Write-Info "TSS (TroubleShootingScript) is the Microsoft-signed toolset used for"
+    Write-Info "automated log collection (ETW, network traces, SDP reports, etc.)."
     Write-Info ""
-    
+    Write-Info "Download (official):"
+    Write-Info "  - https://aka.ms/getTSS                    (TSS.zip - recommended)"
+    Write-Info ""
+    Write-Info "Documentation:"
+    Write-Info "  - https://learn.microsoft.com/troubleshoot/windows-client/windows-tss/introduction-to-troubleshootingscript-toolset-tss"
+    Write-Info ""
+    Write-Info "Tips:"
+    Write-Info "  - Default extraction path is C:\TSS"
+    Write-Info "  - After install, run:  .\TSS.ps1 -Update           (self-update to latest)"
+    Write-Info "  - For unattended runs, append:  -AcceptEula"
+    Write-Info "  - If blocked: Get-ChildItem -Recurse -Path C:\TSS\*.ps* | Unblock-File -Confirm:\$false"
+    Write-Info ""
+
     $userPath = Read-Host "Enter the full path to TSS folder (or press Enter to keep current path)"
     
     if ([string]::IsNullOrWhiteSpace($userPath)) {
@@ -754,17 +763,15 @@ function Test-TSSAvailable {
     #>
     if ([string]::IsNullOrWhiteSpace($script:TSSPath)) {
         Write-DiagWarning "TSS path not configured"
-        Write-Info "Please configure TSS path from the main menu (option 8)"
-        Write-Info "Download TSS from:"
-        Write-Info "  - https://aka.ms/getTSS"
-        Write-Info "  - https://aka.ms/getTSSlite"
-        Write-Info "  - https://cesdiagtools.blob.core.windows.net/windows/TSS.zip"
+        Write-Info "Please configure TSS path from the main menu (option 15)"
+        Write-Info "Download TSS from: https://aka.ms/getTSS  (default path: C:\TSS)"
+        Write-Info "Docs: https://learn.microsoft.com/troubleshoot/windows-client/windows-tss/introduction-to-troubleshootingscript-toolset-tss"
         return $false
     }
     
     if (-not (Test-Path $script:TSSPath -PathType Container)) {
         Write-DiagWarning "TSS directory not found at: $($script:TSSPath)"
-        Write-Info "Please update TSS path from the main menu (option 8)"
+        Write-Info "Please update TSS path from the main menu (option 15)"
         return $false
     }
     
@@ -775,7 +782,7 @@ function Test-TSSAvailable {
     }
     else {
         Write-DiagWarning "TSS.ps1 not found at: $($script:TSSPath)"
-        Write-Info "Please verify TSS installation or update path from the main menu (option 8)"
+        Write-Info "Please verify TSS installation or update path from the main menu (option 15)"
         return $false
     }
 }
@@ -801,7 +808,7 @@ function Invoke-TSSCommand {
     )
     
     if ([string]::IsNullOrWhiteSpace($script:TSSPath)) {
-        Write-DiagError "TSS path not configured. Please configure from main menu (option 8)"
+        Write-DiagError "TSS path not configured. Please configure from main menu (option 15)"
         return $false
     }
     
