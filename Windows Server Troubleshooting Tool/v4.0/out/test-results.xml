@@ -1,0 +1,130 @@
+﻿<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<test-results xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="nunit_schema_2.5.xsd" name="Pester" total="65" errors="0" failures="0" not-run="0" inconclusive="0" ignored="0" skipped="0" invalid="0" date="2026-04-29" time="15:23:47">
+  <environment cwd="D:\Personal\Vs-dev-codebase\Infra-Scripts\Windows Server Troubleshooting Tool\v4.0" clr-version="10.0.6" platform="Microsoft Windows 11 Pro|C:\WINDOWS|\Device\Harddisk0\Partition3" user="v-kausha" user-domain="FAREAST" nunit-version="2.5.8.0" os-version="10.0.26200" machine-name="HP-ELITE" />
+  <culture-info current-culture="en-IN" current-uiculture="en-GB" />
+  <test-suite type="TestFixture" name="Pester" executed="True" result="Success" success="True" time="182.2386" asserts="0" description="Pester">
+    <results>
+      <test-suite type="TestFixture" name="D:\Personal\Vs-dev-codebase\Infra-Scripts\Windows Server Troubleshooting Tool\v4.0\Tests\WSTT.Tests.ps1" executed="True" result="Success" success="True" time="182.2386" asserts="0" description="D:\Personal\Vs-dev-codebase\Infra-Scripts\Windows Server Troubleshooting Tool\v4.0\Tests\WSTT.Tests.ps1">
+        <results>
+          <test-suite type="TestFixture" name="WSTT module — manifest and import" executed="True" result="Success" success="True" time="0.7363" asserts="0" description="WSTT module — manifest and import">
+            <results>
+              <test-case description="has a valid manifest" name="WSTT module — manifest and import.has a valid manifest" time="0.4163" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="imports without errors" name="WSTT module — manifest and import.imports without errors" time="0.0451" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="exports the expected public surface" name="WSTT module — manifest and import.exports the expected public surface" time="0.1044" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="WSTT module — source files parse cleanly" executed="True" result="Success" success="True" time="1.8049" asserts="0" description="WSTT module — source files parse cleanly">
+            <results>
+              <test-case description="every Source/*.ps1 parses without errors" name="WSTT module — source files parse cleanly.every Source/*.ps1 parses without errors" time="0.197" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="has zero PSScriptAnalyzer Error-level findings under WSTT/" name="WSTT module — source files parse cleanly.has zero PSScriptAnalyzer Error-level findings under WSTT/" time="0.8548" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="WSTT module — Phase 0 foundation" executed="True" result="Success" success="True" time="3.7682" asserts="0" description="WSTT module — Phase 0 foundation">
+            <results>
+              <test-case description="Add-Finding appends an immutable record with required fields" name="WSTT module — Phase 0 foundation.Add-Finding appends an immutable record with required fields" time="0.1842" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Add-Finding rejects invalid Severity" name="WSTT module — Phase 0 foundation.Add-Finding rejects invalid Severity" time="0.0928" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Get-OSCapability returns an object with expected fields and is cached" name="WSTT module — Phase 0 foundation.Get-OSCapability returns an object with expected fields and is cached" time="1.6742" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="WSTT module — Export-FindingsToFile produces valid output" executed="True" result="Success" success="True" time="4.3825" asserts="0" description="WSTT module — Export-FindingsToFile produces valid output">
+            <results>
+              <test-case description="writes a parseable JSON envelope with schema=wstt-findings-v1" name="WSTT module — Export-FindingsToFile produces valid output.writes a parseable JSON envelope with schema=wstt-findings-v1" time="0.2199" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="writes NDJSON (one JSON object per line)" name="WSTT module — Export-FindingsToFile produces valid output.writes NDJSON (one JSON object per line)" time="0.1431" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="writes a CSV with required columns" name="WSTT module — Export-FindingsToFile produces valid output.writes a CSV with required columns" time="0.1127" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="writes a SARIF 2.1.0 document" name="WSTT module — Export-FindingsToFile produces valid output.writes a SARIF 2.1.0 document" time="0.1205" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="WSTT module — security baseline" executed="True" result="Success" success="True" time="4.681" asserts="0" description="WSTT module — security baseline">
+            <results>
+              <test-case description="no Source file uses ExecutionPolicy Bypass" name="WSTT module — security baseline.no Source file uses ExecutionPolicy Bypass" time="0.1006" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="no Source file uses $Global: scope" name="WSTT module — security baseline.no Source file uses $Global: scope" time="0.0969" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="no Source file accepts -Password as plain string" name="WSTT module — security baseline.no Source file accepts -Password as plain string" time="0.0856" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="WSTT module — DC-aware checks degrade gracefully on non-DC" executed="True" result="Success" success="True" time="4.859" asserts="0" description="WSTT module — DC-aware checks degrade gracefully on non-DC">
+            <results>
+              <test-case description="Test-ActiveDirectoryHealth returns without error on non-DC hosts" name="WSTT module — DC-aware checks degrade gracefully on non-DC.Test-ActiveDirectoryHealth returns without error on non-DC hosts" time="0.1618" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="WSTT module — Hyper-V check degrades gracefully when role missing" executed="True" result="Success" success="True" time="5.01" asserts="0" description="WSTT module — Hyper-V check degrades gracefully when role missing">
+            <results>
+              <test-case description="Test-HyperVHostHealth returns without error when Hyper-V not installed" name="WSTT module — Hyper-V check degrades gracefully when role missing.Test-HyperVHostHealth returns without error when Hyper-V not installed" time="0.1322" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="WSTT shim (WSTT.ps1) — sanity" executed="True" result="Success" success="True" time="5.1075" asserts="0" description="WSTT shim (WSTT.ps1) — sanity">
+            <results>
+              <test-case description="parses cleanly" name="WSTT shim (WSTT.ps1) — sanity.parses cleanly" time="0.0389" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="declares both #Requires -Version and -RunAsAdministrator" name="WSTT shim (WSTT.ps1) — sanity.declares both #Requires -Version and -RunAsAdministrator" time="0.0462" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="WSTT module — per-function shape (CmdletBinding + parses)" executed="True" result="Success" success="True" time="5.5475" asserts="0" description="WSTT module — per-function shape (CmdletBinding + parses)">
+            <results>
+              <test-suite type="ParameterizedTest" name="WSTT module — per-function shape (CmdletBinding + parses).&lt;_&gt; is exported and uses [CmdletBinding()]" executed="True" result="Success" success="True" time="0.4212" asserts="0" description="&lt;_&gt; is exported and uses [CmdletBinding()]">
+                <results>
+                  <test-case description="Test-ActiveDirectoryHealth is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-ActiveDirectoryHealth is exported and uses [CmdletBinding()]" time="0.0807" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-AdvancedStorageHealth is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-AdvancedStorageHealth is exported and uses [CmdletBinding()]" time="0.0151" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-AzureArcHybridHealth is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-AzureArcHybridHealth is exported and uses [CmdletBinding()]" time="0.0143" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-CertificateAndPKIHealth is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-CertificateAndPKIHealth is exported and uses [CmdletBinding()]" time="0.0152" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-CPUUsage is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-CPUUsage is exported and uses [CmdletBinding()]" time="0.0142" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-CrossCategoryHealth is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-CrossCategoryHealth is exported and uses [CmdletBinding()]" time="0.0148" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-DiskPerformance is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-DiskPerformance is exported and uses [CmdletBinding()]" time="0.0193" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-DNSHealth is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-DNSHealth is exported and uses [CmdletBinding()]" time="0.0178" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-EventLogHealth is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-EventLogHealth is exported and uses [CmdletBinding()]" time="0.0139" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-HyperVHostHealth is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-HyperVHostHealth is exported and uses [CmdletBinding()]" time="0.0143" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-IISHealth is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-IISHealth is exported and uses [CmdletBinding()]" time="0.0158" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-MemoryUsage is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-MemoryUsage is exported and uses [CmdletBinding()]" time="0.015" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-ModernSecurityPosture is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-ModernSecurityPosture is exported and uses [CmdletBinding()]" time="0.0157" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-NetworkConfiguration is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-NetworkConfiguration is exported and uses [CmdletBinding()]" time="0.0202" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-PatchingDepthAndLifecycle is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-PatchingDepthAndLifecycle is exported and uses [CmdletBinding()]" time="0.018" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-SecurityAuthentication is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-SecurityAuthentication is exported and uses [CmdletBinding()]" time="0.0165" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-Server2025FeatureAudit is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-Server2025FeatureAudit is exported and uses [CmdletBinding()]" time="0.0176" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-ServicesHealth is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-ServicesHealth is exported and uses [CmdletBinding()]" time="0.0256" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-TaskSchedulerHealth is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-TaskSchedulerHealth is exported and uses [CmdletBinding()]" time="0.0193" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-TLSConfiguration is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-TLSConfiguration is exported and uses [CmdletBinding()]" time="0.0187" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-WindowsUpdateStatus is exported and uses [CmdletBinding()]" name="WSTT module — per-function shape (CmdletBinding + parses).Test-WindowsUpdateStatus is exported and uses [CmdletBinding()]" time="0.0193" asserts="0" success="True" result="Success" executed="True" />
+                </results>
+              </test-suite>
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="WSTT module — per-function smoke (callable, contributes findings)" executed="True" result="Success" success="True" time="173.9418" asserts="0" description="WSTT module — per-function smoke (callable, contributes findings)">
+            <results>
+              <test-suite type="ParameterizedTest" name="WSTT module — per-function smoke (callable, contributes findings).&lt;_&gt; runs without throwing and contributes at least one finding" executed="True" result="Success" success="True" time="168.341" asserts="0" description="&lt;_&gt; runs without throwing and contributes at least one finding">
+                <results>
+                  <test-case description="Test-ActiveDirectoryHealth runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-ActiveDirectoryHealth runs without throwing and contributes at least one finding" time="0.0883" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-AdvancedStorageHealth runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-AdvancedStorageHealth runs without throwing and contributes at least one finding" time="6.2764" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-AzureArcHybridHealth runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-AzureArcHybridHealth runs without throwing and contributes at least one finding" time="0.0163" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-CertificateAndPKIHealth runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-CertificateAndPKIHealth runs without throwing and contributes at least one finding" time="2.3177" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-HyperVHostHealth runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-HyperVHostHealth runs without throwing and contributes at least one finding" time="0.0042" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-ModernSecurityPosture runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-ModernSecurityPosture runs without throwing and contributes at least one finding" time="14.1476" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-Server2025FeatureAudit runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-Server2025FeatureAudit runs without throwing and contributes at least one finding" time="6.7362" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-NetworkConfiguration runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-NetworkConfiguration runs without throwing and contributes at least one finding" time="43.7905" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-DNSHealth runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-DNSHealth runs without throwing and contributes at least one finding" time="0.7638" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-ServicesHealth runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-ServicesHealth runs without throwing and contributes at least one finding" time="1.9442" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-EventLogHealth runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-EventLogHealth runs without throwing and contributes at least one finding" time="1.507" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-WindowsUpdateStatus runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-WindowsUpdateStatus runs without throwing and contributes at least one finding" time="3.3218" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-TLSConfiguration runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-TLSConfiguration runs without throwing and contributes at least one finding" time="0.2734" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-TaskSchedulerHealth runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-TaskSchedulerHealth runs without throwing and contributes at least one finding" time="10.8721" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-IISHealth runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-IISHealth runs without throwing and contributes at least one finding" time="0.081" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-PatchingDepthAndLifecycle runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-PatchingDepthAndLifecycle runs without throwing and contributes at least one finding" time="4.5108" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-SecurityAuthentication runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-SecurityAuthentication runs without throwing and contributes at least one finding" time="0.6774" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-MemoryUsage runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-MemoryUsage runs without throwing and contributes at least one finding" time="16.7917" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-CPUUsage runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-CPUUsage runs without throwing and contributes at least one finding" time="40.2595" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-DiskPerformance runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-DiskPerformance runs without throwing and contributes at least one finding" time="11.256" asserts="0" success="True" result="Success" executed="True" />
+                  <test-case description="Test-CrossCategoryHealth runs without throwing and contributes at least one finding" name="WSTT module — per-function smoke (callable, contributes findings).Test-CrossCategoryHealth runs without throwing and contributes at least one finding" time="2.7051" asserts="0" success="True" result="Success" executed="True" />
+                </results>
+              </test-suite>
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="WSTT module — utility helpers" executed="True" result="Success" success="True" time="174.0955" asserts="0" description="WSTT module — utility helpers">
+            <results>
+              <test-case description="Test-WSTTCommand returns true for a built-in cmdlet" name="WSTT module — utility helpers.Test-WSTTCommand returns true for a built-in cmdlet" time="0.009" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Test-WSTTCommand returns false for a non-existent cmdlet" name="WSTT module — utility helpers.Test-WSTTCommand returns false for a non-existent cmdlet" time="0.1065" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Test-WSTTHasRole returns a boolean for a known optional feature name" name="WSTT module — utility helpers.Test-WSTTHasRole returns a boolean for a known optional feature name" time="0.0173" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Protect-DiagMessage redacts UNC paths and email addresses" name="WSTT module — utility helpers.Protect-DiagMessage redacts UNC paths and email addresses" time="0.0062" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+        </results>
+      </test-suite>
+    </results>
+  </test-suite>
+</test-results>

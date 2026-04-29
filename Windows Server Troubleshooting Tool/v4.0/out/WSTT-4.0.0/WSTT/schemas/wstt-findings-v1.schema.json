@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Infra-Scripts/wstt/schemas/wstt-findings-v1.schema.json",
+  "title": "WSTT Findings v1",
+  "description": "Structured diagnostic findings emitted by the Windows Server Troubleshooting Tool (WSTT) v4.0 export feature (Option 31). Used by JSON and (per-line) NDJSON outputs.",
+  "type": "object",
+  "required": ["schema", "meta", "endedUtc", "findings"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "wstt-findings-v1",
+      "description": "Schema identifier. Always 'wstt-findings-v1' for this version."
+    },
+    "meta": {
+      "type": "object",
+      "description": "Run metadata captured at module import time.",
+      "required": ["Schema", "Tool", "Version", "Host", "User", "StartedUtc", "PSVersion"],
+      "additionalProperties": true,
+      "properties": {
+        "Schema":     { "type": "string", "const": "wstt-findings-v1" },
+        "Tool":       { "type": "string", "const": "WSTT" },
+        "Version":    { "type": "string", "description": "WSTT module version (e.g., '4.0')." },
+        "Host":       { "type": "string", "description": "Originating computer name ($env:COMPUTERNAME)." },
+        "User":       { "type": "string", "description": "Originating user ($env:USERNAME)." },
+        "StartedUtc": { "type": "string", "format": "date-time" },
+        "PSVersion":  { "type": "string", "description": "PowerShell version that produced the run." }
+      }
+    },
+    "endedUtc": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC timestamp when the export envelope was serialised."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Ordered list of findings emitted during the run.",
+      "items": { "$ref": "#/$defs/finding" }
+    }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "required": ["TimestampUtc", "Severity", "Category", "Message", "Host"],
+      "additionalProperties": false,
+      "properties": {
+        "TimestampUtc": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO-8601 UTC timestamp when the finding was emitted."
+        },
+        "Severity": {
+          "type": "string",
+          "enum": ["INFO", "WARN", "ERROR", "FATAL", "NA"],
+          "description": "Severity of the finding. NA = not applicable on this OS/role."
+        },
+        "Category": {
+          "type": "string",
+          "description": "Logical group (e.g., 'Network', 'Security', 'Hyper-V', 'ActiveDirectory').",
+          "examples": [
+            "General", "Network", "Memory", "CPU", "Disk", "Services", "EventLog",
+            "DNS", "Security", "WindowsUpdate", "TLS", "IIS", "TaskScheduler",
+            "ActiveDirectory", "Hyper-V", "Storage", "ModernSecurity",
+            "Server2025", "PKI", "AzureArc", "Patching"
+          ]
+        },
+        "CheckId": {
+          "type": "string",
+          "description": "Stable identifier for the check that produced the finding (e.g., '22.3', '25.13'). Empty string if unmapped."
+        },
+        "Message": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable description of the finding."
+        },
+        "Data": {
+          "description": "Optional structured payload (object, array, or scalar) carrying check-specific evidence.",
+          "type": ["object", "array", "string", "number", "boolean", "null"]
+        },
+        "Host": {
+          "type": "string",
+          "description": "Computer name the finding pertains to (may differ from meta.Host in remoting mode)."
+        }
+      }
+    }
+  }
+}
