@@ -28,6 +28,7 @@
 .EXAMPLE
     .\WSTT_v3.0.ps1 -EnableLogging
 .NOTES
+    Author:   Kaustubh Sharma
     Version:  3.0
     Requires: Administrator privileges, PowerShell 5.1+
     Tested:   Windows Server 2019, 2022, 2025
@@ -86,12 +87,31 @@ param(
 
 #region Constants and Configuration
 # Threshold Constants (ReadOnly to prevent accidental reassignment)
-Set-Variable -Name MEMORY_CRITICAL_THRESHOLD -Value 90 -Option ReadOnly -Force
-Set-Variable -Name MEMORY_WARNING_THRESHOLD -Value 80 -Option ReadOnly -Force
-Set-Variable -Name CPU_CRITICAL_THRESHOLD -Value 90 -Option ReadOnly -Force
-Set-Variable -Name CPU_WARNING_THRESHOLD -Value 80 -Option ReadOnly -Force
-Set-Variable -Name DISK_CRITICAL_THRESHOLD -Value 90 -Option ReadOnly -Force
-Set-Variable -Name DISK_WARNING_THRESHOLD -Value 80 -Option ReadOnly -Force
+# ----------------------------------------------------------------------------
+# SCOM-aligned thresholds (Example Management Pack defaults, May 2026).
+# Source: Example SCOM team - monitoring is metric-driven (no Event-ID
+# correlation). WARNING tier is set to the SCOM alert trigger so WSTT triage
+# corroborates SCOM at the same threshold. CRITICAL tier (95%) acts as an
+# in-script red-flag above SCOM.
+#
+#   Metric              SCOM alert (WARNING)   In-script CRITICAL
+#   CPU                 85 %                   95 %
+#   Memory              85 %                   95 %
+#   Disk (system drive) 85 %                   95 %
+#   Disk (non-system)   90 %                   95 %
+# ----------------------------------------------------------------------------
+Set-Variable -Name MEMORY_CRITICAL_THRESHOLD          -Value 95 -Option ReadOnly -Force
+Set-Variable -Name MEMORY_WARNING_THRESHOLD           -Value 85 -Option ReadOnly -Force   # SCOM alert
+Set-Variable -Name CPU_CRITICAL_THRESHOLD             -Value 95 -Option ReadOnly -Force
+Set-Variable -Name CPU_WARNING_THRESHOLD              -Value 85 -Option ReadOnly -Force   # SCOM alert
+Set-Variable -Name DISK_SYSTEM_CRITICAL_THRESHOLD     -Value 95 -Option ReadOnly -Force
+Set-Variable -Name DISK_SYSTEM_WARNING_THRESHOLD      -Value 85 -Option ReadOnly -Force   # SCOM alert (system drive)
+Set-Variable -Name DISK_NONSYSTEM_CRITICAL_THRESHOLD  -Value 95 -Option ReadOnly -Force
+Set-Variable -Name DISK_NONSYSTEM_WARNING_THRESHOLD   -Value 90 -Option ReadOnly -Force   # SCOM alert (non-system drive)
+# Legacy aliases (mapped to non-system values) - retained for any external/test
+# consumers that still reference the original names.
+Set-Variable -Name DISK_CRITICAL_THRESHOLD            -Value 95 -Option ReadOnly -Force
+Set-Variable -Name DISK_WARNING_THRESHOLD             -Value 90 -Option ReadOnly -Force
 Set-Variable -Name DISK_LATENCY_CRITICAL_MS -Value 50 -Option ReadOnly -Force
 Set-Variable -Name DISK_LATENCY_WARNING_MS -Value 20 -Option ReadOnly -Force
 Set-Variable -Name DISK_LATENCY_ACCEPTABLE_MS -Value 10 -Option ReadOnly -Force
@@ -167,6 +187,25 @@ $script:KnownCriticalEventIDs = @{
         @{ Id = 1026; Desc = ".NET runtime error" }
     )
 }
+
+# WSFC Cluster Port Compliance — required ports for Windows Server Failover Clusters.
+# Source: "Service overview and network port requirements - Windows Server" (Microsoft Learn).
+# Trojan-overlap analysis and dynamic RPC range (49152-65535) are intentionally excluded.
+# Port = $null indicates a non-port protocol (e.g. ICMP Echo).
+$script:WSFC_REQUIRED_PORTS = @(
+    @{ Service = 'Cluster Service'; Protocol = 'UDP';   Port = 3343; Direction = 'Bidirectional'; Purpose = 'Cluster heartbeat / intra-cluster comms (DTLS-encrypted).' },
+    @{ Service = 'Cluster Service'; Protocol = 'TCP';   Port = 3343; Direction = 'Bidirectional'; Purpose = 'Required during node-join operations (cluster membership validation).' },
+    @{ Service = 'Cluster Service'; Protocol = 'ICMP';  Port = $null; Direction = 'Bidirectional'; Purpose = 'Add Node Wizard connectivity test (ICMP Echo Request).' },
+    @{ Service = 'Cluster Service'; Protocol = 'TCP';   Port = 445;  Direction = 'Bidirectional'; Purpose = 'SMB during cluster join, file-share witness, validation actions.' },
+    @{ Service = 'RPC Endpoint Mapper'; Protocol = 'TCP'; Port = 135; Direction = 'Bidirectional'; Purpose = 'RPC endpoint mapper for cluster management operations.' },
+    @{ Service = 'Cluster Administrator (NetBIOS Name)'; Protocol = 'UDP'; Port = 137; Direction = 'Bidirectional'; Purpose = 'NetBIOS name service (legacy cluster admin discovery).' },
+    @{ Service = 'SMB / NetBIOS Datagram'; Protocol = 'UDP'; Port = 138; Direction = 'Bidirectional'; Purpose = 'NetBIOS datagram service (legacy SMB over NetBIOS).' },
+    @{ Service = 'SMB / NetBIOS Session'; Protocol = 'TCP'; Port = 139; Direction = 'Bidirectional'; Purpose = 'NetBIOS session service (legacy SMB over NetBIOS).' },
+    @{ Service = 'WinRM (Cloud Witness)'; Protocol = 'TCP'; Port = 5985; Direction = 'Bidirectional'; Purpose = 'WinRM HTTP - required when configuring Azure-based cloud witness.' }
+)
+
+# RFC 1123 hostname OR IPv4 address regex - used to validate -TargetNode entries before any network I/O.
+$script:HOSTNAME_REGEX = '^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$|^(\d{1,3}\.){3}\d{1,3}$'
 #endregion
 
 #region Output and Display Functions
@@ -211,13 +250,19 @@ function Write-DiagWarning {
     <#
     .SYNOPSIS
         Displays a warning message
+    .DESCRIPTION
+        Writes "WARNING: <text>" in yellow to the host. We deliberately use
+        Write-Host (and not Write-Warning) so the literal "WARNING:" prefix
+        appears in stream-captured output (e.g. *>&1 | Out-String used by
+        Export-HTMLReport). The Warning stream's prefix is added by PowerShell's
+        console formatter only and is lost when the stream is captured to a
+        string, which previously stripped severity styling from the HTML report.
     .PARAMETER Text
         The warning message to display
     #>
     param([string]$Text)
-    # Forward to the built-in warning cmdlet to preserve expected behavior
     $safeText = Protect-DiagMessage -Message $Text
-    Microsoft.PowerShell.Utility\Write-Warning -Message $safeText
+    Write-Host "WARNING: $safeText" -ForegroundColor Yellow
     if ($safeText -ne $Text) { Write-Verbose "[WARNING FULL] $Text" }
 }
 
@@ -697,6 +742,522 @@ function Get-NonHeartbeatGateways {
 }
 #endregion
 
+#region WSFC Cluster Port Compliance
+# ----------------------------------------------------------------------------
+# Validates the network ports required by Windows Server Failover Clusters
+# (WSFC) from a single LOCAL node. Two evidence streams:
+#   (a) Live reachability  - TCP ConnectAsync / Test-Connection (ICMP) /
+#                            UdpClient best-effort to each peer node.
+#   (b) Firewall audit     - Local Windows Firewall rules (Get-NetFirewallRule
+#                            + Get-NetFirewallPortFilter) for inbound + outbound.
+#
+# Trojan-overlap analysis and dynamic RPC range (49152-65535) are intentionally
+# OUT OF SCOPE - excluded by design (per requirements review).
+# UDP results are reported as 'Inconclusive' (UDP is connectionless; a silent
+# port cannot be distinguished from an open one without an application-layer
+# probe).
+# ----------------------------------------------------------------------------
+
+function Test-WSFCPortReachability {
+    <#
+    .SYNOPSIS
+        Tests reachability of a single WSFC port against one peer node.
+    .PARAMETER TargetNode
+        Hostname or IP of the peer cluster node.
+    .PARAMETER PortDefinition
+        One entry from $script:WSFC_REQUIRED_PORTS (hashtable with Service/Protocol/Port).
+    .PARAMETER TimeoutMs
+        Connect timeout for TCP/UDP probes. ICMP uses Test-Connection -Count 2.
+    .OUTPUTS
+        PSCustomObject with reachability result.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$TargetNode,
+        [Parameter(Mandatory)][ValidateNotNull()][hashtable]$PortDefinition,
+        [int]$TimeoutMs = 2000
+    )
+
+    $result = [PSCustomObject]@{
+        TargetNode   = $TargetNode
+        Service      = $PortDefinition.Service
+        Protocol     = $PortDefinition.Protocol
+        Port         = $PortDefinition.Port
+        Status       = 'Fail'
+        DurationMs   = 0
+        ErrorMessage = ''
+    }
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        switch ($PortDefinition.Protocol) {
+            'TCP' {
+                $tcpClient = $null
+                try {
+                    $tcpClient = New-Object System.Net.Sockets.TcpClient
+                    $task = $tcpClient.ConnectAsync($TargetNode, [int]$PortDefinition.Port)
+                    if ($task.Wait($TimeoutMs) -and $tcpClient.Connected) {
+                        $result.Status = 'Pass'
+                    }
+                    else {
+                        $result.Status = 'Fail'
+                        $result.ErrorMessage = "TCP connect timed out after ${TimeoutMs}ms"
+                    }
+                }
+                finally {
+                    if ($tcpClient) {
+                        try { $tcpClient.Close() } catch {}
+                        try { $tcpClient.Dispose() } catch {}
+                    }
+                }
+            }
+            'UDP' {
+                # UDP is connectionless - we cannot definitively prove reachability
+                # without an application-layer response. Send a 1-byte probe and
+                # report Inconclusive regardless of send outcome.
+                $udpClient = $null
+                try {
+                    $udpClient = New-Object System.Net.Sockets.UdpClient
+                    $udpClient.Client.SendTimeout = $TimeoutMs
+                    $bytes = [byte[]](0)
+                    $null = $udpClient.Send($bytes, $bytes.Length, $TargetNode, [int]$PortDefinition.Port)
+                    $result.Status = 'Inconclusive'
+                    $result.ErrorMessage = 'UDP is connectionless - probe sent but no response expected'
+                }
+                catch {
+                    $result.Status = 'Inconclusive'
+                    $result.ErrorMessage = "UDP send failed: $($_.Exception.Message) (DNS/route/local firewall may be blocking outbound)"
+                }
+                finally {
+                    if ($udpClient) { try { $udpClient.Close() } catch {} }
+                }
+            }
+            'ICMP' {
+                try {
+                    if (Test-Connection -ComputerName $TargetNode -Count 2 -Quiet -ErrorAction Stop) {
+                        $result.Status = 'Pass'
+                    }
+                    else {
+                        $result.Status = 'Fail'
+                        $result.ErrorMessage = 'ICMP Echo timed out (firewall or host unreachable)'
+                    }
+                }
+                catch {
+                    $result.Status = 'Fail'
+                    $result.ErrorMessage = "ICMP test threw: $($_.Exception.Message)"
+                }
+            }
+            default {
+                $result.Status = 'Fail'
+                $result.ErrorMessage = "Unknown protocol '$($PortDefinition.Protocol)'"
+            }
+        }
+    }
+    catch {
+        $result.Status = 'Fail'
+        $result.ErrorMessage = $_.Exception.Message
+    }
+    finally {
+        $sw.Stop()
+        $result.DurationMs = [int]$sw.ElapsedMilliseconds
+    }
+
+    return $result
+}
+
+function Get-WSFCFirewallRuleStatus {
+    <#
+    .SYNOPSIS
+        Audits local Windows Firewall rules for a single WSFC port.
+    .DESCRIPTION
+        Verifies that an enabled Allow rule exists for both inbound and outbound,
+        and surfaces any enabled Block rules that match the same port. Requires
+        the NetSecurity module (present on Server 2012+ / Windows 8+).
+    .PARAMETER PortDefinition
+        One entry from $script:WSFC_REQUIRED_PORTS.
+    .OUTPUTS
+        PSCustomObject with firewall audit result.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNull()][hashtable]$PortDefinition
+    )
+
+    $result = [PSCustomObject]@{
+        Service           = $PortDefinition.Service
+        Protocol          = $PortDefinition.Protocol
+        Port              = $PortDefinition.Port
+        InboundAllow      = 'Unknown'
+        InboundRuleCount  = 0
+        OutboundAllow     = 'Unknown'
+        OutboundRuleCount = 0
+        BlockingRules     = 0
+        ErrorMessage      = ''
+    }
+
+    if (-not (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue)) {
+        $result.ErrorMessage = 'NetSecurity module not available on this host'
+        return $result
+    }
+
+    try {
+        # Build a port-matching scriptblock that handles both scalar string and string[] LocalPort values.
+        $portString = if ($null -ne $PortDefinition.Port) { "$($PortDefinition.Port)" } else { $null }
+
+        $matchingFilters = switch ($PortDefinition.Protocol) {
+            'ICMP' {
+                Get-NetFirewallPortFilter -ErrorAction Stop |
+                    Where-Object { $_.Protocol -eq 'ICMPv4' -and ($_.IcmpType -contains '8' -or $_.IcmpType -contains 'Any' -or $_.IcmpType -eq '8') }
+            }
+            default {
+                Get-NetFirewallPortFilter -Protocol $PortDefinition.Protocol -ErrorAction Stop |
+                    Where-Object { $_.LocalPort -eq $portString -or $_.LocalPort -contains $portString -or $_.LocalPort -eq 'Any' }
+            }
+        }
+
+        if (-not $matchingFilters) {
+            $result.InboundAllow = 'Fail'
+            $result.OutboundAllow = 'Fail'
+            $result.ErrorMessage = 'No firewall rules reference this port'
+            return $result
+        }
+
+        $matchingRules = @($matchingFilters | Get-NetFirewallRule -ErrorAction SilentlyContinue |
+            Where-Object { $_.Enabled -eq 'True' -or $_.Enabled -eq $true })
+
+        $inboundAllow  = @($matchingRules | Where-Object { $_.Direction -eq 'Inbound'  -and $_.Action -eq 'Allow' })
+        $outboundAllow = @($matchingRules | Where-Object { $_.Direction -eq 'Outbound' -and $_.Action -eq 'Allow' })
+        $blockRules    = @($matchingRules | Where-Object { $_.Action -eq 'Block' })
+
+        $result.InboundRuleCount  = $inboundAllow.Count
+        $result.OutboundRuleCount = $outboundAllow.Count
+        $result.BlockingRules     = $blockRules.Count
+        $result.InboundAllow      = if ($inboundAllow.Count -gt 0)  { 'Pass' } else { 'Fail' }
+        $result.OutboundAllow     = if ($outboundAllow.Count -gt 0) { 'Pass' } else { 'Fail' }
+    }
+    catch {
+        $result.ErrorMessage = "Firewall query failed: $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
+function Test-WSFCClusterPortCompliance {
+    <#
+    .SYNOPSIS
+        End-to-end WSFC cluster port compliance check (reachability + firewall audit).
+    .DESCRIPTION
+        Runs from a local node. Auto-discovers peer cluster nodes via
+        $script:ClusterEnv when available; otherwise prompts the user or
+        accepts -TargetNode. Trojan-port overlap and dynamic RPC range are
+        intentionally not tested.
+    .PARAMETER TargetNode
+        Optional explicit list of peer hostnames/IPs. Overrides auto-discovery.
+    .PARAMETER SkipReachability
+        Skip live network probes (firewall-only audit).
+    .PARAMETER SkipFirewallAudit
+        Skip local firewall-rule audit (reachability-only).
+    .PARAMETER ExportCsv
+        Write per-port CSV files under $script:DefaultLogPath.
+    .PARAMETER ExportHtml
+        Write a single dark-themed HTML report under $script:DefaultLogPath.
+    .EXAMPLE
+        Test-WSFCClusterPortCompliance -ExportCsv -ExportHtml
+    .EXAMPLE
+        Test-WSFCClusterPortCompliance -TargetNode 'node02','node03' -SkipFirewallAudit
+    #>
+    [CmdletBinding()]
+    param(
+        [string[]]$TargetNode,
+        [switch]$SkipReachability,
+        [switch]$SkipFirewallAudit,
+        [switch]$ExportCsv,
+        [switch]$ExportHtml
+    )
+
+    Write-Header "WSFC Cluster Port Compliance Check"
+    Write-Info "  Validates the network ports required by Windows Server Failover Clusters."
+    Write-Info "  Source: 'Service overview and network port requirements' (Microsoft Learn)."
+    Write-Info "  Trojan-port overlap and dynamic RPC range (49152-65535) are NOT tested."
+    Write-Host ""
+
+    # ---- Resolve peer nodes ------------------------------------------------
+    $peers = [System.Collections.Generic.List[string]]::new()
+    if ($TargetNode -and $TargetNode.Count -gt 0) {
+        foreach ($n in $TargetNode) {
+            if ($n -match $script:HOSTNAME_REGEX) { $peers.Add($n) }
+            else { Write-DiagWarning "  Skipping invalid target '$n' (not a valid hostname or IPv4 address)" }
+        }
+    }
+    elseif ($script:ClusterEnv -and $script:ClusterEnv.IsClusterNode -and $script:ClusterEnv.ClusterNodes) {
+        $localName = $env:COMPUTERNAME
+        foreach ($node in $script:ClusterEnv.ClusterNodes) {
+            $name = "$($node.Name)"
+            if ($name -and $name -ne $localName -and $name -match $script:HOSTNAME_REGEX) {
+                $peers.Add($name)
+            }
+        }
+        Write-Info "  Discovered $($peers.Count) peer cluster node(s) from cluster environment."
+    }
+    else {
+        Write-DiagWarning "  Local host is not a cluster member and no -TargetNode supplied."
+        $manual = Read-Host "  Enter peer node names (comma-separated) or press Enter to skip reachability"
+        if (-not [string]::IsNullOrWhiteSpace($manual)) {
+            foreach ($n in ($manual -split ',')) {
+                $trim = $n.Trim()
+                if ($trim -match $script:HOSTNAME_REGEX) { $peers.Add($trim) }
+                else { Write-DiagWarning "  Skipping invalid target '$trim'" }
+            }
+        }
+    }
+
+    if ($peers.Count -eq 0 -and -not $SkipReachability) {
+        Write-DiagWarning "  No valid peer nodes - reachability tests will be skipped."
+        $SkipReachability = [switch]::Present
+    }
+
+    # ---- Reachability tests ------------------------------------------------
+    $reachabilityResults = [System.Collections.Generic.List[object]]::new()
+    if (-not $SkipReachability) {
+        Write-Section "Live Reachability Probes"
+        foreach ($portDef in $script:WSFC_REQUIRED_PORTS) {
+            $portLabel = if ($null -ne $portDef.Port) { "$($portDef.Protocol)/$($portDef.Port)" } else { "$($portDef.Protocol)" }
+            foreach ($peer in $peers) {
+                $r = Test-WSFCPortReachability -TargetNode $peer -PortDefinition $portDef
+                $reachabilityResults.Add($r)
+                $line = "  [{0}] {1} -> {2,-22} : {3}" -f $portLabel, $env:COMPUTERNAME, $peer, $r.Status
+                switch ($r.Status) {
+                    'Pass'         { Write-Success     $line }
+                    'Inconclusive' { Write-Info        $line }
+                    default        { Write-DiagError   $line }
+                }
+                if ($r.ErrorMessage) { Write-Info "      $($r.ErrorMessage)" }
+            }
+        }
+    }
+    else {
+        Write-Info "  Reachability tests skipped."
+    }
+
+    # ---- Local firewall audit ---------------------------------------------
+    $firewallResults = [System.Collections.Generic.List[object]]::new()
+    if (-not $SkipFirewallAudit) {
+        Write-Section "Local Firewall Rule Audit ($env:COMPUTERNAME)"
+        foreach ($portDef in $script:WSFC_REQUIRED_PORTS) {
+            $r = Get-WSFCFirewallRuleStatus -PortDefinition $portDef
+            $firewallResults.Add($r)
+            $portLabel = if ($null -ne $portDef.Port) { "$($portDef.Protocol)/$($portDef.Port)" } else { "$($portDef.Protocol)" }
+            $line = "  [{0,-10}] {1,-40} In={2} ({3}) Out={4} ({5}) Block={6}" -f `
+                $portLabel, $portDef.Service, $r.InboundAllow, $r.InboundRuleCount, $r.OutboundAllow, $r.OutboundRuleCount, $r.BlockingRules
+            if ($r.InboundAllow -eq 'Pass' -and $r.OutboundAllow -eq 'Pass' -and $r.BlockingRules -eq 0) {
+                Write-Success $line
+            }
+            elseif ($r.InboundAllow -eq 'Unknown' -or $r.OutboundAllow -eq 'Unknown') {
+                Write-DiagWarning $line
+            }
+            else {
+                Write-DiagError $line
+            }
+            if ($r.ErrorMessage) { Write-Info "      $($r.ErrorMessage)" }
+        }
+    }
+    else {
+        Write-Info "  Firewall audit skipped."
+    }
+
+    # ---- Summary -----------------------------------------------------------
+    Show-WSFCPortSummaryTable -ReachabilityResults $reachabilityResults -FirewallResults $firewallResults -Peers $peers
+
+    # ---- Optional exports -------------------------------------------------
+    if ($ExportCsv) {
+        Export-WSFCPortReportToCsv -ReachabilityResults $reachabilityResults -FirewallResults $firewallResults
+    }
+    if ($ExportHtml) {
+        Export-WSFCPortReportToHtml -ReachabilityResults $reachabilityResults -FirewallResults $firewallResults -Peers $peers
+    }
+}
+
+function Show-WSFCPortSummaryTable {
+    <#
+    .SYNOPSIS
+        Renders the WSFC port compliance summary as console tables and an overall verdict.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$ReachabilityResults,
+        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$FirewallResults,
+        [System.Collections.Generic.List[string]]$Peers
+    )
+
+    Write-Header "Summary"
+
+    if ($ReachabilityResults.Count -gt 0) {
+        Write-Section "Reachability Matrix"
+        $ReachabilityResults |
+            Sort-Object Service, Protocol, Port, TargetNode |
+            Format-Table TargetNode, Service, Protocol, Port, Status, DurationMs -AutoSize |
+            Out-String -Width 200 |
+            ForEach-Object { Write-Host $_ }
+    }
+
+    if ($FirewallResults.Count -gt 0) {
+        Write-Section "Firewall Audit"
+        $FirewallResults |
+            Sort-Object Service, Protocol, Port |
+            Format-Table Service, Protocol, Port, InboundAllow, OutboundAllow, BlockingRules -AutoSize |
+            Out-String -Width 200 |
+            ForEach-Object { Write-Host $_ }
+    }
+
+    $reachFail = @($ReachabilityResults | Where-Object { $_.Status -eq 'Fail' }).Count
+    $reachPass = @($ReachabilityResults | Where-Object { $_.Status -eq 'Pass' }).Count
+    $reachIncon = @($ReachabilityResults | Where-Object { $_.Status -eq 'Inconclusive' }).Count
+    $fwFail = @($FirewallResults | Where-Object { $_.InboundAllow -eq 'Fail' -or $_.OutboundAllow -eq 'Fail' -or $_.BlockingRules -gt 0 }).Count
+    $fwPass = @($FirewallResults | Where-Object { $_.InboundAllow -eq 'Pass' -and $_.OutboundAllow -eq 'Pass' -and $_.BlockingRules -eq 0 }).Count
+
+    Write-Section "Overall Verdict"
+    Write-Info "  Reachability : Pass=$reachPass  Fail=$reachFail  Inconclusive=$reachIncon (UDP)"
+    Write-Info "  Firewall     : Pass=$fwPass  Fail=$fwFail"
+    if ($reachFail -eq 0 -and $fwFail -eq 0) {
+        Write-Success "  All required WSFC ports look compliant on $env:COMPUTERNAME."
+    }
+    else {
+        Write-DiagError "  $($reachFail + $fwFail) issue(s) detected - review the rows marked Fail above."
+    }
+}
+
+function Export-WSFCPortReportToCsv {
+    <#
+    .SYNOPSIS
+        Writes the WSFC port compliance results to two timestamped CSV files.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$ReachabilityResults,
+        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$FirewallResults
+    )
+
+    if (-not $script:DefaultLogPath -or -not (Test-Path $script:DefaultLogPath)) {
+        Write-DiagError "  CSV export skipped - $script:DefaultLogPath not initialised."
+        return
+    }
+
+    $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $reachPath = Join-Path $script:DefaultLogPath "WSFC_PortReachability_$ts.csv"
+    $fwPath    = Join-Path $script:DefaultLogPath "WSFC_FirewallAudit_$ts.csv"
+
+    try {
+        if ($ReachabilityResults.Count -gt 0) {
+            $ReachabilityResults | Export-Csv -Path $reachPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+            Write-Success "  Reachability CSV: $reachPath"
+        }
+        if ($FirewallResults.Count -gt 0) {
+            $FirewallResults | Export-Csv -Path $fwPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+            Write-Success "  Firewall audit CSV: $fwPath"
+        }
+    }
+    catch {
+        Write-DiagError "  CSV export failed: $($_.Exception.Message)"
+    }
+}
+
+function Export-WSFCPortReportToHtml {
+    <#
+    .SYNOPSIS
+        Writes a single dark-themed HTML report for WSFC port compliance.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$ReachabilityResults,
+        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$FirewallResults,
+        [System.Collections.Generic.List[string]]$Peers
+    )
+
+    if (-not $script:DefaultLogPath -or -not (Test-Path $script:DefaultLogPath)) {
+        Write-DiagError "  HTML export skipped - $script:DefaultLogPath not initialised."
+        return
+    }
+
+    $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $reportPath = Join-Path $script:DefaultLogPath "WSFC_PortCompliance_$ts.html"
+    $clusterName = if ($script:ClusterEnv -and $script:ClusterEnv.ClusterName) { $script:ClusterEnv.ClusterName } else { 'N/A (standalone)' }
+    $osCaption = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+
+    $enc = { param($v) [System.Net.WebUtility]::HtmlEncode("$v") }
+
+    $reachRowsHtml = if ($ReachabilityResults.Count -gt 0) {
+        ($ReachabilityResults | Sort-Object Service, Protocol, Port, TargetNode | ForEach-Object {
+            $cls = switch ($_.Status) { 'Pass' {'pass'} 'Inconclusive' {'warn'} default {'fail'} }
+            "<tr><td>$(& $enc $_.TargetNode)</td><td>$(& $enc $_.Service)</td><td>$(& $enc $_.Protocol)</td><td>$(& $enc $_.Port)</td><td class='$cls'>$(& $enc $_.Status)</td><td>$(& $enc $_.DurationMs) ms</td><td>$(& $enc $_.ErrorMessage)</td></tr>"
+        }) -join "`n"
+    } else { "<tr><td colspan='7'><i>Reachability tests were skipped.</i></td></tr>" }
+
+    $fwRowsHtml = if ($FirewallResults.Count -gt 0) {
+        ($FirewallResults | Sort-Object Service, Protocol, Port | ForEach-Object {
+            $inCls = if ($_.InboundAllow -eq 'Pass') {'pass'} elseif ($_.InboundAllow -eq 'Unknown') {'warn'} else {'fail'}
+            $outCls = if ($_.OutboundAllow -eq 'Pass') {'pass'} elseif ($_.OutboundAllow -eq 'Unknown') {'warn'} else {'fail'}
+            $blockCls = if ($_.BlockingRules -gt 0) {'fail'} else {'pass'}
+            "<tr><td>$(& $enc $_.Service)</td><td>$(& $enc $_.Protocol)</td><td>$(& $enc $_.Port)</td><td class='$inCls'>$(& $enc $_.InboundAllow) ($($_.InboundRuleCount))</td><td class='$outCls'>$(& $enc $_.OutboundAllow) ($($_.OutboundRuleCount))</td><td class='$blockCls'>$(& $enc $_.BlockingRules)</td><td>$(& $enc $_.ErrorMessage)</td></tr>"
+        }) -join "`n"
+    } else { "<tr><td colspan='7'><i>Firewall audit was skipped.</i></td></tr>" }
+
+    $peerCsv = if ($Peers -and $Peers.Count -gt 0) { ($Peers -join ', ') } else { '(none)' }
+
+    $html = @"
+<!DOCTYPE html>
+<html><head><meta charset='utf-8'>
+<title>WSFC Cluster Port Compliance - $(& $enc $env:COMPUTERNAME)</title>
+<style>
+ body { background:#1e1e1e; color:#e6e6e6; font-family:Segoe UI,Arial,sans-serif; margin:0; padding:24px; }
+ h1 { color:#4ec9b0; border-bottom:2px solid #4ec9b0; padding-bottom:6px; }
+ h2 { color:#9cdcfe; margin-top:28px; }
+ .meta { background:#252526; padding:12px 16px; border-left:4px solid #569cd6; margin:16px 0; }
+ .meta div { margin:2px 0; }
+ table { border-collapse:collapse; width:100%; margin-top:8px; background:#252526; }
+ th, td { border:1px solid #3c3c3c; padding:6px 10px; text-align:left; font-size:13px; }
+ th { background:#37373d; color:#9cdcfe; }
+ tr:nth-child(even) td { background:#2a2a2a; }
+ td.pass { color:#4ec9b0; font-weight:bold; }
+ td.fail { color:#f48771; font-weight:bold; }
+ td.warn { color:#dcdcaa; font-weight:bold; }
+ .footer { color:#888; margin-top:24px; font-size:11px; }
+</style></head><body>
+ <h1>WSFC Cluster Port Compliance Report</h1>
+ <div class='meta'>
+  <div><b>Local Node:</b> $(& $enc $env:COMPUTERNAME)</div>
+  <div><b>Cluster:</b> $(& $enc $clusterName)</div>
+  <div><b>Peers Probed:</b> $(& $enc $peerCsv)</div>
+  <div><b>OS:</b> $(& $enc $osCaption)</div>
+  <div><b>Generated:</b> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</div>
+ </div>
+ <h2>Live Reachability</h2>
+ <table><tr><th>Target Node</th><th>Service</th><th>Protocol</th><th>Port</th><th>Status</th><th>Duration</th><th>Notes</th></tr>
+ $reachRowsHtml
+ </table>
+ <h2>Local Firewall Audit</h2>
+ <table><tr><th>Service</th><th>Protocol</th><th>Port</th><th>Inbound (Allow rules)</th><th>Outbound (Allow rules)</th><th>Block Rules</th><th>Notes</th></tr>
+ $fwRowsHtml
+ </table>
+ <div class='footer'>
+  Generated by WSTT v3.0 - Test-WSFCClusterPortCompliance.<br>
+  Trojan-port overlap analysis and dynamic RPC range (49152-65535) are intentionally excluded from this report.
+ </div>
+</body></html>
+"@
+
+    try {
+        $html | Out-File -FilePath $reportPath -Encoding UTF8 -ErrorAction Stop
+        Write-Success "  HTML report: $reportPath"
+        Write-Info "  File size: $([math]::Round((Get-Item $reportPath).Length / 1KB, 1)) KB"
+        $open = Get-ValidatedChoice -Prompt "  Open report in browser? (Y/N)" -ValidChoices @("Y", "N")
+        if ($open -eq "Y") { Start-Process $reportPath }
+    }
+    catch {
+        Write-DiagError "  HTML export failed: $($_.Exception.Message)"
+    }
+}
+#endregion
+
 #region TSS Functions
 function Set-TSSPath {
     <#
@@ -925,7 +1486,16 @@ function Test-NetworkConfiguration {
     
     try {
         # Check RSS (Receive Side Scaling)
-        Write-Info "Checking RSS (Receive Side Scaling) status..."
+        # ------------------------------------------------------------
+        # RSS = spreads incoming network packets across MULTIPLE CPU cores
+        # instead of pinning all RX work to CPU 0. Without RSS, a 10 GbE NIC at
+        # full line rate will saturate one logical processor and drop packets
+        # while other cores sit idle. Critical on busy servers (DCs, file
+        # servers, RDS, Hyper-V hosts).
+        # ------------------------------------------------------------
+        Write-Section "RSS (Receive Side Scaling) Status"
+        Write-Info "  Description: Spreads inbound packet processing across multiple CPU cores."
+        Write-Info "               Disabled = single-core RX bottleneck on busy NICs (10 GbE+)."
         $adapters = Get-NetAdapterRss -ErrorAction Stop
         
         foreach ($adapter in $adapters) {
@@ -934,7 +1504,8 @@ function Test-NetworkConfiguration {
             }
             else {
                 Write-DiagWarning "RSS is DISABLED on $($adapter.Name)"
-                Write-Info "To enable RSS: Set-NetAdapterRss -Name '$($adapter.Name)' -Enabled `$true"
+                Write-Info "  Impact: Single-core RX bottleneck possible at high throughput."
+                Write-Info "  Remediation: Set-NetAdapterRss -Name '$($adapter.Name)' -Enabled `$true"
             }
         }
     }
@@ -943,7 +1514,19 @@ function Test-NetworkConfiguration {
     }
      
     # Ephemeral Port Usage (Port Exhaustion)
+    # ------------------------------------------------------------
+    # Every outbound TCP connection consumes one ephemeral port from the dynamic
+    # range (default 49152-65535 = 16384 ports). Sources of exhaustion:
+    # - Apps that open + close many short-lived connections without pooling
+    # - TIME_WAIT accumulation (default 4 min retention per closed socket)
+    # - SQL/IIS/proxy overload, monitoring agents polling endpoints
+    # When exhausted, new connections fail with WSAEADDRINUSE / 10048; symptoms
+    # include 'cannot reach DC' / RPC timeouts / random app outages.
+    # ------------------------------------------------------------
     Write-Section "TCP Ephemeral Ports"
+    Write-Info "  Description: Outbound TCP connections consume ephemeral ports. Exhaustion ="
+    Write-Info "               new connections fail with WSAEADDRINUSE (10048). Common cause:"
+    Write-Info "               apps not pooling + TIME_WAIT retention (default 4 minutes)."
     try {
         $tcpParams = Get-NetTCPSetting -SettingName "Internet" -ErrorAction Stop
         $maxPorts = $tcpParams.DynamicPortRangeNumberOfPorts
@@ -963,7 +1546,15 @@ function Test-NetworkConfiguration {
         Write-Info "  Max Dynamic Ports Available: $($maxPorts)"
         
         if ($maxPorts -gt 0 -and $ephemeralConnections -gt ($maxPorts * $PORT_EXHAUSTION_THRESHOLD)) {
-            Write-DiagError "  CRITICAL: Potential Port Exhaustion (Using >$($PORT_EXHAUSTION_THRESHOLD * 100)% of available ephemeral ports)"
+            Write-DiagError "  Potential Port Exhaustion (Using >$($PORT_EXHAUSTION_THRESHOLD * 100)% of available ephemeral ports)"
+            Write-Info "    Impact: New outbound TCP connections will start failing with 10048."
+            Write-Info "    Likely cause: An app opening many short-lived connections (no pooling),"
+            Write-Info "                  or a flood of TIME_WAIT sockets from a chatty client."
+            Write-Info "    Diagnosis: 'Get-NetTCPConnection | Group-Object State,OwningProcess |"
+            Write-Info "               Sort Count -Desc | Select -First 10' to find the offender."
+            Write-Info "    Remediation: Fix the app to pool connections; or expand the dynamic"
+            Write-Info "                 port range with: 'netsh int ipv4 set dynamicport tcp"
+            Write-Info "                 start=10000 num=55535'."
         }
         else {
             Write-Success "  Port usage is within acceptable range"
@@ -974,14 +1565,24 @@ function Test-NetworkConfiguration {
     }
 
     # Check VMQ (Virtual Machine Queue) Status
+    # ------------------------------------------------------------
+    # VMQ = hardware feature that lets a NIC deliver VM traffic directly to the
+    # right vSwitch queue, bypassing the host-CPU sort step. Great on 10 GbE+.
+    # KNOWN BAD: 1 GbE Broadcom NICs (NetXtreme I, BCM57xx series) have buggy
+    # VMQ implementations that drop packets randomly under load. Microsoft KB
+    # 2902166 explicitly recommends disabling VMQ on those NICs.
+    # ------------------------------------------------------------
     Write-Section "VMQ Status (Relevant for Hyper-V Hosts)"
+    Write-Info "  Description: Virtual Machine Queue accelerates VM traffic via NIC HW."
+    Write-Info "               KNOWN BAD on 1 GbE Broadcom NetXtreme - causes packet drops."
     try {
         $vmq = Get-NetAdapterVmq -ErrorAction SilentlyContinue
         if ($vmq) {
             foreach ($v in $vmq) {
                 Write-Info "  $($v.Name): VMQ Enabled: $($v.Enabled)"
                 if ($v.Enabled -eq $true) {
-                    Write-DiagWarning "    Note: If this is a 1Gbps Broadcom adapter, consider disabling VMQ to prevent packet drops."
+                    Write-DiagWarning "    Note: If this is a 1Gbps Broadcom adapter, consider disabling VMQ to prevent packet drops"
+                    Write-Info "      Remediation: Disable-NetAdapterVmq -Name '$($v.Name)' (per MS KB 2902166)."
                 }
             }
         }
@@ -994,7 +1595,17 @@ function Test-NetworkConfiguration {
     }
 
     # Check Network Adapter Advanced Properties
+    # ------------------------------------------------------------
+    # Buffer settings on the NIC driver govern how many packets the NIC can
+    # queue before dropping. Default values are tuned for desktops; servers
+    # under bursty load (file servers, AG primary, Hyper-V hosts) frequently
+    # need larger buffers (Small Rx Buffers = 8192, Rx Ring Size = 4096).
+    # Symptoms of undersized buffers: ReceivedDiscardedPackets > 0 (next section).
+    # ------------------------------------------------------------
     Write-Section "Network Adapter Buffer Settings"
+    Write-Info "  Description: NIC driver receive-side buffers. Defaults are tuned for"
+    Write-Info "               desktops; busy servers under bursty load may drop packets"
+    Write-Info "               unless buffers are raised (Small Rx=8192, Rx Ring=4096)."
     if ($activeAdapters) {
         foreach ($adapter in $activeAdapters) {
             Write-Info "`nAdapter: $($adapter.Name)"
@@ -1008,6 +1619,7 @@ function Test-NetworkConfiguration {
                     Write-Info "  Small Rx Buffers: $($currentValue)"
                     if ($currentValue -ne "8192") {
                         Write-DiagWarning "  Recommended value is 8192"
+                        Write-Info "    Remediation: Set-NetAdapterAdvancedProperty -Name '$($adapter.Name)' -RegistryKeyword '$($smallRxBuffer.RegistryKeyword)' -RegistryValue 8192"
                     }
                 }
                 
@@ -1018,7 +1630,13 @@ function Test-NetworkConfiguration {
                     Write-Info "  Rx Ring Size: $($currentValue)"
                     if ($currentValue -ne "4096") {
                         Write-DiagWarning "  Recommended value is 4096"
+                        Write-Info "    Remediation: Set-NetAdapterAdvancedProperty -Name '$($adapter.Name)' -RegistryKeyword '$($rxRingSize.RegistryKeyword)' -RegistryValue 4096"
                     }
+                }
+
+                if (-not $smallRxBuffer -and -not $rxRingSize) {
+                    Write-Info "  No tunable Rx buffer / ring size properties exposed by this driver"
+                    Write-Info "  (typical for synthetic / virtual NICs - nothing to tune here)."
                 }
             }
             catch [Microsoft.PowerShell.Cmdletization.Cim.CimJobException] {
@@ -1031,7 +1649,17 @@ function Test-NetworkConfiguration {
     }
     
     # Check Power Plan
+    # ------------------------------------------------------------
+    # Windows Server defaults to 'Balanced' power plan, which throttles CPU and
+    # NIC PCIe Active State Power Management. On any production server (esp.
+    # latency-sensitive workloads: SQL, RDS, real-time apps), this causes
+    # measurable latency hits and inconsistent network behaviour. Microsoft
+    # explicitly recommends 'High Performance' for SQL and Hyper-V hosts.
+    # ------------------------------------------------------------
     Write-Section "Power Plan"
+    Write-Info "  Description: 'Balanced' throttles CPU + PCIe ASPM, causing latency on"
+    Write-Info "               servers. Microsoft recommends 'High Performance' for SQL,"
+    Write-Info "               Hyper-V, RDS, and any latency-sensitive workload."
     try {
         $powerPlan = powercfg /getactivescheme
         if ($powerPlan -like "*High performance*") {
@@ -1039,8 +1667,9 @@ function Test-NetworkConfiguration {
         }
         else {
             Write-DiagWarning "Power Plan is NOT set to High Performance"
-            Write-Info "Current: $($powerPlan)"
-            Write-Info "To set High Performance: powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+            Write-Info "  Current: $($powerPlan)"
+            Write-Info "  Impact: CPU may downclock; NIC ASPM may inject 1-2 ms latency."
+            Write-Info "  Remediation: powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
         }
     }
     catch {
@@ -1048,7 +1677,17 @@ function Test-NetworkConfiguration {
     }
     
     # Network Statistics (reuses cached $activeAdapters)
+    # ------------------------------------------------------------
+    # Cumulative packet counters since adapter init. Useful for spotting:
+    # - Persistent error rates (errors / total packets > 0.001 is suspect)
+    # - Asymmetric in/out (one direction much busier than the other)
+    # - Adapters that aren't seeing traffic they should (mis-cabled, mis-VLAN'd)
+    # NOTE: counters reset on adapter reset/disable, so a low absolute number
+    # may simply mean the NIC was bounced recently.
+    # ------------------------------------------------------------
     Write-Section "Network Interface Statistics"
+    Write-Info "  Description: Cumulative packet counters since adapter init. Persistent"
+    Write-Info "               error rates or asymmetric send/receive volume = investigate."
     if ($activeAdapters) {
         foreach ($adpt in $activeAdapters) {
             try {
@@ -1068,18 +1707,39 @@ function Test-NetworkConfiguration {
         Write-DiagWarning "  No active adapters available"
     }
 
-    # Packet Discards (vmxnet3 alert) — reuses cached $activeAdapters
+    # Packet Discards (vmxnet3 alert) - reuses cached $activeAdapters
+    # ------------------------------------------------------------
+    # ReceivedDiscardedPackets / OutboundDiscardedPackets counters increment when
+    # a packet was received/queued but the OS or NIC had to drop it (full ring
+    # buffer, full host-side queue, malformed packet, no socket listening).
+    # Common causes:
+    # - vmxnet3 with default ring size on busy VMs (KNOWN ISSUE - bump to 4096)
+    # - VMQ enabled on buggy 1 GbE Broadcom
+    # - Sudden burst exceeded NIC buffer capacity
+    # - Application not draining sockets fast enough
+    # ------------------------------------------------------------
     Write-Section "Packet Discards"
+    Write-Info "  Description: Packets received/queued but dropped (full buffer, no socket,"
+    Write-Info "               or malformed). On vmxnet3 = bump ring size to 4096."
     if ($activeAdapters) {
+        $anyDiscards = $false
         foreach ($adpt in $activeAdapters) {
             try {
                 $stats = Get-NetAdapterStatistics -Name $adpt.Name -ErrorAction Stop
                 $discardIn = $stats.ReceivedDiscardedPackets
                 $discardOut = $stats.OutboundDiscardedPackets
                 if ($discardIn -gt 0 -or $discardOut -gt 0) {
+                    $anyDiscards = $true
                     Write-DiagWarning "  $($adpt.Name): Discards IN=$discardIn OUT=$discardOut"
                     if ($adpt.DriverDescription -like "*vmxnet3*") {
                         Write-DiagError "    vmxnet3 adapter with discards - check ring buffer size and driver version"
+                        Write-Info "      Remediation: Set-NetAdapterAdvancedProperty -Name '$($adpt.Name)' "
+                        Write-Info "                   -RegistryKeyword '*RxRingSize' -RegistryValue 4096"
+                        Write-Info "                   AND ensure latest VMware Tools (vmxnet3 driver >= 1.8)."
+                    }
+                    else {
+                        Write-Info "      Likely cause: Bursty traffic exceeding NIC ring buffer or app not"
+                        Write-Info "                    draining sockets. Investigate buffer settings (above)."
                     }
                 }
             }
@@ -1087,10 +1747,26 @@ function Test-NetworkConfiguration {
                 Write-Verbose "Could not check discards for $($adpt.Name): $($_.Exception.Message)"
             }
         }
+        if (-not $anyDiscards) {
+            Write-Success "  No packet discards detected on any active adapter"
+        }
+    }
+    else {
+        Write-Info "  No active adapters to check"
     }
 
-    # Port Reachability (self-telnet) — uses TcpClient with 2s timeout instead of Test-NetConnection
+    # Port Reachability (self-telnet) - uses TcpClient with 2s timeout instead of Test-NetConnection
+    # ------------------------------------------------------------
+    # Confirms which CRITICAL service ports are bound on localhost RIGHT NOW.
+    # 'Closed/Not listening' on a port the server is supposed to host = the
+    # service is stopped, crashed, or bound to a different interface only.
+    # 'OPEN' on an unexpected port = potential rogue listener / unwanted
+    # service started by an admin/agent/installer.
+    # ------------------------------------------------------------
     Write-Section "Port Reachability (localhost)"
+    Write-Info "  Description: Confirms which critical service ports are listening on"
+    Write-Info "               127.0.0.1. Closed = service down/misbound. OPEN unexpectedly"
+    Write-Info "               = rogue listener."
     foreach ($portDef in $script:CommonPorts) {
         try {
             $tcpClient = New-Object System.Net.Sockets.TcpClient
@@ -1112,7 +1788,21 @@ function Test-NetworkConfiguration {
     }
 
     # NIC Teaming / Dual MAC Detection
+    # ------------------------------------------------------------
+    # Two teaming technologies on Windows Server:
+    #   LBFO (Load Balancing & Failover) - legacy, deprecated in 2022/2025.
+    #     Modes: Static / SwitchIndependent / LACP
+    #     Algos: TransportPorts / IPAddresses / MacAddresses / Dynamic / HyperVPort
+    #   SET (Switch Embedded Teaming) - modern, integrated with vSwitch.
+    #
+    # Known bad combo: SwitchIndependent + AddressHash without switch-side
+    # awareness can cause inbound packets to come back on a different MAC than
+    # the source IP suggests, breaking some load balancers / firewalls.
+    # ------------------------------------------------------------
     Write-Section "NIC Teaming Configuration"
+    Write-Info "  Description: LBFO (legacy) or SET (modern) teaming. Watch for"
+    Write-Info "               SwitchIndependent + AddressHash combo - can cause asymmetric"
+    Write-Info "               return paths that break load balancers/firewalls."
     try {
         $teams = Get-NetLbfoTeam -ErrorAction SilentlyContinue
         if ($teams) {
@@ -1120,6 +1810,8 @@ function Test-NetworkConfiguration {
                 Write-Info "  [LBFO] Team: $($team.Name) - Mode: $($team.TeamingMode) - LB: $($team.LoadBalancingAlgorithm)"
                 if ($team.TeamingMode -eq "SwitchIndependent" -and $team.LoadBalancingAlgorithm -eq "AddressHash") {
                     Write-DiagWarning "    Dual MAC risk: SwitchIndependent + AddressHash may cause connectivity issues"
+                    Write-Info "      Remediation: Switch to 'Dynamic' load-balancing algorithm, or use LACP"
+                    Write-Info "                   teaming mode if the upstream switch supports it."
                 }
                 $members = Get-NetLbfoTeamMember -Team $team.Name -ErrorAction SilentlyContinue
                 foreach ($m in $members) {
@@ -1145,7 +1837,7 @@ function Test-NetworkConfiguration {
         }
     }
     catch {
-        # LBFO cmdlets missing (Server 2025+) — try SET
+        # LBFO cmdlets missing (Server 2025+) - try SET
         try {
             $setTeams = Get-NetSwitchTeam -ErrorAction SilentlyContinue
             if ($setTeams) {
@@ -1167,7 +1859,19 @@ function Test-NetworkConfiguration {
     }
 
     # WAN Heartbeat / Cluster Link Flapping
+    # ------------------------------------------------------------
+    # Failover-clustering events that indicate inter-node network problems:
+    #   1135 - 'Cluster node X was removed from the active failover cluster
+    #          membership.' = node lost heartbeat to cluster majority.
+    #   1129 - 'Cluster network interface for cluster node X on network Y is
+    #          unreachable.' = a specific cluster network went down.
+    # Even ONE per day is a serious red flag - they cause failovers, app
+    # disruption, and SQL AG re-sync churn.
+    # ------------------------------------------------------------
     Write-Section "WAN/Heartbeat Loss Events (last 24h)"
+    Write-Info "  Description: Failover Cluster Event 1135 = node removed from cluster"
+    Write-Info "               (heartbeat lost). Event 1129 = cluster network unreachable."
+    Write-Info "               Even one per day causes app failovers and AG re-syncs."
     try {
         $heartbeatEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -1180,6 +1884,11 @@ function Test-NetworkConfiguration {
             foreach ($evt in $heartbeatEvents) {
                 Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] EventID $($evt.Id): $(Get-EventSnippet -Event $evt -MaxLength 100)"
             }
+            Write-Info "    Likely cause: Switch port flap, cable seating, NIC driver issue, or"
+            Write-Info "                  network saturation pushing heartbeat past timeout."
+            Write-Info "    Remediation: Check switch port logs at corresponding timestamps;"
+            Write-Info "                 verify cluster network priorities (Get-ClusterNetwork);"
+            Write-Info "                 confirm dedicated heartbeat network is on a separate VLAN."
         }
         else {
             Write-Success "  No heartbeat loss events detected"
@@ -1192,7 +1901,18 @@ function Test-NetworkConfiguration {
     #region v3.0 Network Checks
 
     # 1. Default Gateway Reachability
+    # ------------------------------------------------------------
+    # The default gateway is the next hop for ALL traffic outside the local
+    # subnet. If unreachable, you keep local connectivity but lose everything
+    # else. We exclude cluster heartbeat NICs (which intentionally don't have
+    # a gateway) to avoid false positives. Latency thresholds:
+    #   < 5 ms : LAN-class - excellent
+    #   < 50 ms: WAN-class - normal
+    #   > 50 ms: investigate switch/firewall congestion
+    # ------------------------------------------------------------
     Write-Section "Default Gateway Reachability"
+    Write-Info "  Description: ICMP ping to each non-heartbeat default gateway. Unreachable"
+    Write-Info "               = no off-subnet connectivity. >50ms latency = LAN/WAN issue."
     try {
         $gateways = Get-NonHeartbeatGateways -HeartbeatAdapters $script:ClusterEnv.HeartbeatOnlyNICs
         if ($gateways) {
@@ -1212,15 +1932,21 @@ function Test-NetworkConfiguration {
                     }
                     else {
                         Write-DiagWarning "  Gateway $gwIP ($ifAlias): Reachable but HIGH latency (avg ${avgMs}ms)"
+                        Write-Info "    Likely cause: Saturated uplink, switch CPU overload, or QoS"
+                        Write-Info "                  policy delaying ICMP. Affects ALL off-subnet traffic."
                     }
                 }
                 catch {
-                    Write-DiagError "  Gateway $gwIP ($ifAlias): NOT Reachable!"
+                    Write-DiagError "  Gateway $gwIP ($ifAlias): NOT Reachable"
+                    Write-Info "    Impact: Server has lost off-subnet connectivity."
+                    Write-Info "    Remediation: Verify physical link, switch port, VLAN tag,"
+                    Write-Info "                 and that the gateway IP itself is up (ping from another host)."
                 }
             }
         }
         else {
             Write-DiagWarning "  No default gateway configured"
+            Write-Info "    Impact: Server cannot reach any IP outside its local subnet(s)."
         }
     }
     catch {
@@ -1228,7 +1954,18 @@ function Test-NetworkConfiguration {
     }
 
     # 2. Duplicate IP Detection
+    # ------------------------------------------------------------
+    # Two hosts with the same IP = chaos. Symptoms range from intermittent
+    # connectivity (ARP cache races) to total outage. Causes:
+    # - Static IP conflict with a DHCP-assigned host
+    # - Cloned VM that didn't get a sysprep IP reset
+    # - Misconfigured NIC team / SET assigning multiple MACs to one IP
+    # We detect by ARPing each local IP and counting unique MACs in the reply.
+    # ------------------------------------------------------------
     Write-Section "Duplicate IP Detection"
+    Write-Info "  Description: ARP each local IP and look for multiple MACs answering. >1"
+    Write-Info "               MAC = duplicate IP somewhere on the subnet (cloned VM, static"
+    Write-Info "               vs DHCP collision, misconfigured team)."
     try {
         $ipAddresses = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
             Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' }
@@ -1242,7 +1979,7 @@ function Test-NetworkConfiguration {
                 } | Select-Object -Unique
                 if ($uniqueMACs -and @($uniqueMACs).Count -gt 1) {
                     $duplicateFound = $true
-                    Write-DiagError "  DUPLICATE IP DETECTED: $($ip.IPAddress) has multiple MAC addresses!"
+                    Write-DiagError "  DUPLICATE IP DETECTED: $($ip.IPAddress) has multiple MAC addresses"
                     foreach ($mac in $uniqueMACs) {
                         Write-DiagWarning "    MAC: $mac"
                     }
@@ -1250,7 +1987,12 @@ function Test-NetworkConfiguration {
             }
             catch { }
         }
-        if (-not $duplicateFound) {
+        if ($duplicateFound) {
+            Write-Info "    Impact: Intermittent connectivity, random RDP/file/AD failures."
+            Write-Info "    Remediation: Identify the OTHER host (search DHCP leases, ARP tables"
+            Write-Info "                 on the upstream switch). Reconfigure one of the two."
+        }
+        else {
             Write-Success "  No duplicate IP addresses detected"
         }
     }
@@ -1259,7 +2001,19 @@ function Test-NetworkConfiguration {
     }
 
     # 3. Network Adapter Link Speed & Duplex
+    # ------------------------------------------------------------
+    # Half duplex on a physical adapter is ALWAYS bad - usually indicates a
+    # negotiation failure with the switch port (one side hardcoded, the other
+    # auto-negotiating). Symptoms: collisions, retransmissions, terrible
+    # throughput, intermittent timeouts. Almost always caused by a forced-speed
+    # config left over from a 100 Mbps era.
+    # 100 Mbps on a physical adapter on a modern (1 GbE+) network is also
+    # nearly always an autonegotiation failure or a bad cable.
+    # ------------------------------------------------------------
     Write-Section "Adapter Link Speed & Duplex"
+    Write-Info "  Description: Link speed and duplex per active adapter. HALF DUPLEX = severe"
+    Write-Info "               packet loss + retransmits. 100 Mbps on a physical adapter today"
+    Write-Info "               = autonegotiation failure or bad cable."
     if ($activeAdapters) {
         foreach ($adpt in $activeAdapters) {
             $linkSpeed = $adpt.LinkSpeed
@@ -1271,28 +2025,45 @@ function Test-NetworkConfiguration {
                     $duplexValue = $duplexProp.DisplayValue
                     Write-Info "    Duplex Setting: $duplexValue"
                     if ($duplexValue -like "*Half*") {
-                        Write-DiagError "    HALF DUPLEX detected - this causes severe packet loss and retransmissions!"
+                        Write-DiagError "    HALF DUPLEX detected - this causes severe packet loss and retransmissions"
+                        Write-Info "      Likely cause: Negotiation mismatch with switch port (one side hardcoded)."
+                        Write-Info "      Remediation: Set BOTH sides (server + switch port) to 'Auto', or BOTH to"
+                        Write-Info "                   the same hardcoded value (1000Mbps Full Duplex). Never mix."
                     }
                 }
             }
             catch { }
             if ($linkSpeed -match '100\s*(Mbps|M)' -and $adpt.DriverDescription -notlike '*Virtual*') {
-                Write-DiagWarning "    WARNING: 100 Mbps link speed on physical adapter - possible autonegotiation failure"
+                Write-DiagWarning "    100 Mbps link speed on physical adapter - possible autonegotiation failure"
+                Write-Info "      Remediation: Replace cable, check switch port speed config, swap NIC port."
             }
         }
     }
 
     # 4. TCP Chimney / Task Offload Status
+    # ------------------------------------------------------------
+    # Offload features push CPU work (checksum, segmentation, RSS, RSC) onto the
+    # NIC silicon. Modern NICs do this well. KNOWN PITFALLS:
+    #   Chimney Offload  : DEPRECATED, removed in newer Windows. If still ENABLED,
+    #                      can cause RPC/SMB hangs - always disable.
+    #   Task Offload     : if Disabled = CPU does ALL checksum work. CPU spike +
+    #                      throughput drop on busy servers.
+    #   RSC              : great for receive throughput; some old vSwitch + RSC
+    #                      combos cause TCP retransmissions on Hyper-V.
+    # ------------------------------------------------------------
     Write-Section "TCP Offload Settings"
+    Write-Info "  Description: NIC hardware offloads. Chimney = DEPRECATED, disable if on."
+    Write-Info "               Task Offload disabled = CPU does ALL checksum work (server-wide hit)."
     try {
         $offload = Get-NetOffloadGlobalSetting -ErrorAction Stop
-        # Chimney is deprecated/removed on newer OS — access safely
+        # Chimney is deprecated/removed on newer OS - access safely
         $chimneyValue = $offload | Select-Object -ExpandProperty Chimney -ErrorAction SilentlyContinue
         if ($null -ne $chimneyValue) {
             Write-Info "  Chimney Offload: $chimneyValue"
             if ($chimneyValue -eq 'Enabled') {
                 Write-DiagWarning "  TCP Chimney is ENABLED - deprecated; disable for stability"
-                Write-Info "  Disable: Set-NetOffloadGlobalSetting -Chimney Disabled"
+                Write-Info "    Impact: Can cause RPC / SMB hangs and intermittent app failures."
+                Write-Info "    Remediation: Set-NetOffloadGlobalSetting -Chimney Disabled"
             }
         }
         else {
@@ -1305,6 +2076,8 @@ function Test-NetworkConfiguration {
 
         if ($offload.TaskOffload -eq 'Disabled') {
             Write-DiagWarning "  Task Offload is DISABLED - CPU will handle all checksum/segmentation work"
+            Write-Info "    Impact: Higher CPU on busy NICs; throughput drop on 10 GbE+."
+            Write-Info "    Remediation: Set-NetOffloadGlobalSetting -TaskOffload Enabled (then reboot)."
         }
     }
     catch {
@@ -1321,6 +2094,7 @@ function Test-NetworkConfiguration {
                     $rxEnabled = $adapterOffload.UdpIPv4Checksum
                     if ($txEnabled -eq 'Disabled' -or $rxEnabled -eq 'Disabled') {
                         Write-DiagWarning "  $($adpt.Name): Some checksum offloads are DISABLED (TCP=$txEnabled, UDP=$rxEnabled)"
+                        Write-Info "    Remediation: Enable-NetAdapterChecksumOffload -Name '$($adpt.Name)'"
                     }
                 }
             }
@@ -1329,10 +2103,34 @@ function Test-NetworkConfiguration {
     }
 
     # 5. MTU / Jumbo Frames Consistency
+    # ------------------------------------------------------------
+    # Maximum Transmission Unit = largest single packet (in bytes) the link
+    # will carry without fragmentation. Default = 1500. Jumbo Frames = 9000
+    # (used in storage networks, vMotion, SMB Direct).
+    # CRITICAL: every device end-to-end MUST use the same MTU. A mismatch:
+    #   - Black-holes packets larger than the smallest hop's MTU
+    #   - Breaks path MTU discovery if ICMP Type 3 Code 4 is filtered
+    #   - Manifests as 'small files transfer fine, large hang/timeout'
+    # ------------------------------------------------------------
     Write-Section "MTU Configuration"
+    Write-Info "  Description: Max packet size per link. ALL devices end-to-end must match."
+    Write-Info "               Mismatch = packets > smallest MTU are black-holed (small"
+    Write-Info "               transfers OK, large ones hang)."
     try {
+        # Filter out loopback and tunnel pseudo-interfaces. Loopback reports
+        # NlMtu = 4294967295 which trips a false "INCONSISTENT MTU" warning.
+        # Also exclude 'Local Area Connection*' placeholders (Hyper-V auto-generated
+        # connectoid for the host-side vNIC; reports MTU=1300 by default and is not
+        # carrying any production traffic).
         $mtuSettings = Get-NetIPInterface -AddressFamily IPv4 -ErrorAction Stop |
-            Where-Object { $_.ConnectionState -eq 'Connected' } |
+            Where-Object {
+                $_.ConnectionState -eq 'Connected' -and
+                $_.InterfaceAlias -notlike '*Loopback*' -and
+                $_.InterfaceAlias -notlike '*isatap*' -and
+                $_.InterfaceAlias -notlike '*Teredo*' -and
+                $_.InterfaceAlias -notlike 'Local Area Connection*' -and
+                $_.NlMtu -gt 0 -and $_.NlMtu -lt 65536
+            } |
             Select-Object InterfaceAlias, NlMtu
         $mtuValues = @()
         foreach ($iface in $mtuSettings) {
@@ -1342,13 +2140,20 @@ function Test-NetworkConfiguration {
                 Write-Info "    Jumbo Frames enabled (MTU > 1500)"
             }
         }
-        $uniqueMTUs = $mtuValues | Select-Object -Unique
-        if (@($uniqueMTUs).Count -gt 1) {
+        $uniqueMTUs = @($mtuValues | Select-Object -Unique)
+        if ($uniqueMTUs.Count -gt 1) {
             Write-DiagWarning "  INCONSISTENT MTU values detected across interfaces: $($uniqueMTUs -join ', ')"
-            Write-Info "  MTU mismatch can cause fragmentation, black-holed packets, and path MTU discovery failures"
+            Write-Info "    Likely cause: Jumbo Frames enabled on a storage NIC but switch port"
+            Write-Info "                  or downstream device still at 1500."
+            Write-Info "    Remediation: Either enable Jumbo Frames consistently end-to-end, or"
+            Write-Info "                 set all NICs back to 1500: Set-NetIPInterface -InterfaceAlias"
+            Write-Info "                 '<name>' -NlMtuBytes 1500"
+        }
+        elseif ($uniqueMTUs.Count -eq 1) {
+            Write-Success "  MTU is consistent across all connected interfaces ($($uniqueMTUs[0]))"
         }
         else {
-            Write-Success "  MTU is consistent across all connected interfaces ($($uniqueMTUs[0]))"
+            Write-Info "  No physical IPv4 interfaces with MTU values found"
         }
     }
     catch {
@@ -1356,7 +2161,18 @@ function Test-NetworkConfiguration {
     }
 
     # 6. DNS Suffix & Search Order
+    # ------------------------------------------------------------
+    # Suffixes determine how single-label names (e.g. 'fileserver01') get
+    # resolved. If the suffix list is wrong, you get NXDOMAIN responses for
+    # internal names. Devolution = automatically appending parent domains.
+    # Per-NIC RegisterInDNS controls whether the host registers its IP into
+    # DNS for that interface; turning OFF on cluster heartbeat NICs prevents
+    # DNS from returning the heartbeat IP to clients (a common gotcha).
+    # ------------------------------------------------------------
     Write-Section "DNS Suffix Configuration"
+    Write-Info "  Description: Suffix list resolves single-label names. Per-NIC"
+    Write-Info "               RegisterInDNS=False on heartbeat NICs prevents clients from"
+    Write-Info "               getting the wrong IP back."
     try {
         $dnsGlobal = Get-DnsClientGlobalSetting -ErrorAction Stop
         Write-Info "  Primary DNS Suffix: $(if ($dnsGlobal.SuffixSearchList.Count -gt 0) { $dnsGlobal.SuffixSearchList -join ', ' } else { '(none)' })"
@@ -1381,7 +2197,16 @@ function Test-NetworkConfiguration {
     }
 
     # 7. WINS Configuration
+    # ------------------------------------------------------------
+    # WINS = legacy NetBIOS name resolution, deprecated since Server 2008.
+    # Should be EMPTY on modern environments. If WINS servers are configured:
+    # - They may be unreachable, slowing every NetBIOS lookup by ~750ms
+    # - Some apps still try WINS first before DNS
+    # Recommended: remove WINS entries entirely, force DNS-only resolution.
+    # ------------------------------------------------------------
     Write-Section "WINS Configuration"
+    Write-Info "  Description: Legacy NetBIOS name resolution. Should be EMPTY on modern envs."
+    Write-Info "               Stale entries can add ~750ms to every NetBIOS lookup."
     try {
         $winsConfigs = Get-CimInstance Win32_NetworkAdapterConfiguration -ErrorAction Stop |
             Where-Object { $_.IPEnabled -eq $true }
@@ -1400,13 +2225,30 @@ function Test-NetworkConfiguration {
         if (-not $winsFound) {
             Write-Info "  No WINS servers configured (normal for modern environments)"
         }
+        else {
+            Write-Info "    Remediation: If those WINS servers are no longer needed, clear them"
+            Write-Info "                 via the NIC properties (Advanced TCP/IP > WINS tab) or via"
+            Write-Info "                 'Set-DnsClientNrptRule' / netsh."
+        }
     }
     catch {
         Write-DiagWarning "  Could not check WINS configuration: $($_.Exception.Message)"
     }
 
     # 8. Proxy / WinHTTP Settings
+    # ------------------------------------------------------------
+    # Two separate proxy configs on Windows:
+    #   - WinHTTP (system / service-side)  -> used by Windows Update, Defender,
+    #                                          MMA/AMA, Azure Arc agent, sfc.
+    #   - WinINET / IE (per-user)           -> used by IE/Edge legacy, .NET WebClient.
+    # A stale or unreachable proxy here will SILENTLY break Windows Update,
+    # MS Defender signature downloads, Azure agent connectivity, and activation.
+    # ------------------------------------------------------------
     Write-Section "WinHTTP Proxy Configuration"
+    Write-Info "  Description: System-wide proxy used by Windows Update, Defender, MMA/AMA,"
+    
+    Write-Info "               and Azure Arc. Stale proxy here = silent breakage of all of"
+    Write-Info "               those at once."
     try {
         $proxyOutput = netsh winhttp show proxy 2>&1
         $proxyStr = ($proxyOutput | Out-String).Trim()
@@ -1419,7 +2261,10 @@ function Test-NetworkConfiguration {
                 $trimmed = $line.ToString().Trim()
                 if ($trimmed) { Write-Info "    $trimmed" }
             }
-            Write-Info "  Note: Proxy misconfiguration can block Windows Update, activation, and Azure agent connectivity"
+            Write-Info "    Likely impact: Mis-set proxy blocks Windows Update, Defender,"
+            Write-Info "                   activation, and Azure agent connectivity."
+            Write-Info "    Remediation: Verify proxy URL is reachable; reset with"
+            Write-Info "                 'netsh winhttp reset proxy' if no proxy is needed."
         }
         else {
             Write-Info "  $proxyStr"
@@ -1442,7 +2287,16 @@ function Test-NetworkConfiguration {
     catch { }
 
     # 9. Network Adapter Driver Version & Date
+    # ------------------------------------------------------------
+    # Old NIC drivers are a leading cause of Windows Server network bugs:
+    # - vmxnet3 < 1.8: known packet-drop bugs on busy VMs
+    # - Old Broadcom NetXtreme: VMQ packet loss (KB 2902166)
+    # - Old Intel NDIS6 drivers: missing modern offload paths
+    # Anything > 2 years old should be reviewed against vendor advisories.
+    # ------------------------------------------------------------
     Write-Section "Network Adapter Driver Information"
+    Write-Info "  Description: NIC driver vendor / version / age. Drivers > 2 years old ="
+    Write-Info "               investigate for known issues (vmxnet3 < 1.8, old Broadcom VMQ)."
     if ($activeAdapters) {
         foreach ($adpt in $activeAdapters) {
             try {
@@ -1475,8 +2329,29 @@ function Test-NetworkConfiguration {
                 if ($driverDate) {
                     $driverAge = ((Get-Date) - $driverDate).Days
                     Write-Info "    Date: $($driverDate.ToString('yyyy-MM-dd')) ($driverAge days old)"
-                    if ($driverAge -gt 730) {
-                        Write-DiagWarning "    WARNING: Driver is over 2 years old - consider updating"
+
+                    # Synthetic / paravirtualized NIC drivers ship with a
+                    # placeholder DriverDate in the INF (commonly 2006-06-21
+                    # for Microsoft synthetic drivers). The "real" version
+                    # is tied to Windows servicing, not to that date — so
+                    # suppress the >2-year warning for these adapters.
+                    $isSyntheticDriver = (
+                        ($driverProvider -eq 'Microsoft' -and (
+                            $driverDesc -like '*Hyper-V Network Adapter*' -or
+                            $driverDesc -like '*Hyper-V Virtual*' -or
+                            $driverDesc -like '*Loopback*'
+                        )) -or
+                        $driverDesc -like '*VMware*VMXNET*Loopback*' -or
+                        $driverDesc -like '*Microsoft Kernel Debug*'
+                    )
+
+                    if ($driverAge -gt 730 -and -not $isSyntheticDriver) {
+                        Write-DiagWarning "    Driver is over 2 years old - consider updating"
+                        Write-Info "      Remediation: Check vendor site ($driverProvider) for latest;"
+                        Write-Info "                   on VMware: update VMware Tools; on Hyper-V: WU."
+                    }
+                    elseif ($driverAge -gt 730 -and $isSyntheticDriver) {
+                        Write-Info "    (Synthetic/virtual NIC - INF DriverDate is a placeholder; age check skipped.)"
                     }
                 }
                 elseif ($driverDateRaw) {
@@ -1491,6 +2366,7 @@ function Test-NetworkConfiguration {
                     [version]$verObj = $null
                     if ([version]::TryParse([string]$driverVersion, [ref]$verObj) -and $verObj -lt [version]'1.8') {
                         Write-DiagWarning "    vmxnet3 driver is outdated - upgrade to latest VMware Tools"
+                        Write-Info "      Impact: Known packet-drop bug on busy VMs."
                     }
                 }
             }
@@ -1501,7 +2377,16 @@ function Test-NetworkConfiguration {
     }
 
     # 10. Network Binding Order
+    # ------------------------------------------------------------
+    # Per-adapter binding controls whether IPv4 / IPv6 are enabled on each NIC.
+    # Disabling IPv4 on the primary NIC will break essentially everything.
+    # Disabling IPv6 on a NIC sometimes done as 'hardening' but can break
+    # DirectAccess, Failover Clustering heartbeats, and some apps that prefer
+    # IPv6 by default (e.g. modern AD replication paths).
+    # ------------------------------------------------------------
     Write-Section "Network Binding Order"
+    Write-Info "  Description: Per-NIC IPv4/IPv6 binding state. Disabling IPv6 wholesale can"
+    Write-Info "               break DirectAccess, cluster heartbeats, and some AD paths."
     try {
         $bindings = Get-NetAdapterBinding -ErrorAction Stop |
             Where-Object { $_.ComponentID -eq 'ms_tcpip' } |
@@ -1517,6 +2402,8 @@ function Test-NetworkConfiguration {
             Where-Object { $_.ComponentID -eq 'ms_tcpip6' -and $_.Enabled -eq $false }
         if ($ipv6Bindings) {
             Write-Info "  Note: IPv6 is disabled on: $(($ipv6Bindings.Name) -join ', ')"
+            Write-Info "    Caution: Microsoft does NOT recommend disabling IPv6 - prefer the"
+            Write-Info "             DisabledComponents registry value over per-NIC unbind."
         }
     }
     catch {
@@ -1524,7 +2411,16 @@ function Test-NetworkConfiguration {
     }
 
     # 11. Firewall Rules Blocking Common Ports
+    # ------------------------------------------------------------
+    # Surfaces explicit BLOCK rules on the well-known service ports we care
+    # about (RDP, SMB, RPC, WinRM, etc). A BLOCK rule on, say, port 445 (SMB)
+    # will silently break file shares, GPO, AD authentication, etc - even if
+    # the OS thinks the firewall profile is 'OK'.
+    # ------------------------------------------------------------
     Write-Section "Firewall Rules on Common Ports"
+    Write-Info "  Description: Surfaces explicit BLOCK rules on critical service ports"
+    Write-Info "               (RDP, SMB, RPC, WinRM). Silent breakage source - profile may"
+    Write-Info "               look 'enabled OK' while a single block rule kills the service."
     try {
         foreach ($portDef in $script:CommonPorts) {
             $blockRules = Get-NetFirewallPortFilter -Protocol TCP -ErrorAction SilentlyContinue |
@@ -1538,6 +2434,8 @@ function Test-NetworkConfiguration {
                 foreach ($r in $blockRules) {
                     Write-DiagWarning "    Rule: '$($r.DisplayName)' Direction=$($r.Direction)"
                 }
+                Write-Info "    Remediation: Disable the rule with 'Disable-NetFirewallRule"
+                Write-Info "                 -DisplayName <name>' or remove with 'Remove-NetFirewallRule'."
             }
         }
         Write-Success "  Firewall rule check completed"
@@ -1547,11 +2445,22 @@ function Test-NetworkConfiguration {
     }
 
     # 12. RDMA / SMB Direct Status
+    # ------------------------------------------------------------
+    # SMB Direct (RDMA over Converged Ethernet / InfiniBand) gives near-zero
+    # CPU SMB throughput on storage networks. Only meaningful on dedicated
+    # storage NICs (RoCE, iWARP, IB). SMB Multichannel = multi-stream SMB
+    # over multiple NICs/queues; massive throughput win on 10 GbE+.
+    # ------------------------------------------------------------
     Write-Section "RDMA / SMB Direct Status"
+    Write-Info "  Description: RDMA and SMB Multichannel status. Major throughput / CPU"
+    Write-Info "               efficiency win on storage / Hyper-V live-migration networks."
     try {
         $smbConfig = Get-SmbClientConfiguration -ErrorAction Stop
         $smbMultichannel = $smbConfig.EnableMultiChannel
         Write-Info "  SMB Multichannel: $(if ($smbMultichannel) { 'Enabled' } else { 'Disabled' })"
+        if (-not $smbMultichannel) {
+            Write-Info "    Remediation: Set-SmbClientConfiguration -EnableMultiChannel `$true"
+        }
     }
     catch {
         Write-Info "  Could not check SMB client configuration"
@@ -1584,7 +2493,19 @@ function Test-NetworkConfiguration {
     catch { }
 
     # 13. TCP/IP Stack Parameters
+    # ------------------------------------------------------------
+    # AutoTuningLevel = how aggressively Windows scales the TCP receive window:
+    #   Disabled / HighlyRestricted = throughput cap on long-fat networks
+    #   Normal = default, fine for most workloads
+    #   Experimental = max scaling, occasionally breaks old middleboxes
+    # CongestionProvider = CUBIC / NewReno / DCTCP. CUBIC is modern default.
+    # KeepAliveTime > 2 hours = idle long-lived TCP sessions get killed by
+    # firewalls / NAT before keepalive triggers. Common LB / VPN footgun.
+    # ------------------------------------------------------------
     Write-Section "TCP/IP Stack Parameters"
+    Write-Info "  Description: TCP autotuning / congestion / KeepAlive. Disabled autotune"
+    Write-Info "               caps throughput on long-fat networks. KeepAlive > 2 hours ="
+    Write-Info "               firewall/NAT can drop idle long-lived sessions."
     try {
         $tcpGlobal = Get-NetTCPSetting -SettingName "Internet" -ErrorAction Stop
         Write-Info "  Auto-Tuning Level: $((Get-NetTCPSetting -SettingName Internet -ErrorAction SilentlyContinue).AutoTuningLevelLocal)"
@@ -1597,6 +2518,7 @@ function Test-NetworkConfiguration {
             Write-Info "  $autoTuningValue"
             if ($autoTuningValue -like "*disabled*") {
                 Write-DiagWarning "  TCP Auto-Tuning is DISABLED - this limits receive window scaling and throughput"
+                Write-Info "    Remediation: netsh int tcp set global autotuninglevel=normal"
             }
         }
     }
@@ -1612,6 +2534,8 @@ function Test-NetworkConfiguration {
             Write-Info "  TCP KeepAlive: $kaSeconds seconds"
             if ($kaSeconds -gt 7200) {
                 Write-DiagWarning "  KeepAlive > 2 hours - long-lived idle connections may be dropped by firewalls/load balancers"
+                Write-Info "    Remediation: Lower KeepAliveTime to 1800000 (30 min) for affected"
+                Write-Info "                 servers (RDS, SQL, Exchange) via the same registry value."
             }
         }
         else {
@@ -1640,7 +2564,22 @@ function Test-NetworkConfiguration {
     catch { }
 
     # 14. Network Adapter Error Events
+    # ------------------------------------------------------------
+    # System-log events that explicitly indicate NIC trouble. Whitelist of IDs
+    # we care about (avoid noise from unrelated providers reusing the same
+    # numeric ID). Decoded:
+    #   27   - 'Network adapter <name> has determined the link is not up' (NIC reset)
+    #   32   - 'A miniport encountered an error and was unable to load' (driver fail)
+    #   1073 - 'Network adapter link state has changed' (link flap)
+    #   4198 - DUPLICATE IP detected by TCPIP
+    #   4199 - DUPLICATE IP resolved by TCPIP
+    # We DO NOT filter by ProviderName here because these IDs are TCPIP /
+    # netbt / nic-driver specific (not reused by Perflib/Kernel-Power like
+    # IDs 2003 / 55 are). Still, we report counts grouped by ID + sample 5.
+    # ------------------------------------------------------------
     Write-Section "Network Adapter Error Events (last 7 days)"
+    Write-Info "  Description: NIC-related System events: link flaps, miniport errors,"
+    Write-Info "               duplicate IPs. Even a low count is worth investigating."
     try {
         $nicEventIds = @(27, 32, 1073, 4198, 4199)
         $nicEvents = Get-WinEvent -FilterHashtable @{
@@ -1665,6 +2604,12 @@ function Test-NetworkConfiguration {
             $nicEvents | Select-Object -First 5 | ForEach-Object {
                 Write-Info "    [$($_.TimeCreated.ToString('MM-dd HH:mm'))] EventID $($_.Id): $(Get-EventSnippet -Event $_ -MaxLength 100)"
             }
+            Write-Info "    Likely cause: Cable / SFP failure (Event 27/1073), driver bug or"
+            Write-Info "                  incompatible firmware (Event 32), or another host with"
+            Write-Info "                  the same IP (Event 4198)."
+            Write-Info "    Remediation: For 27/1073 = check switch port logs + replace cable/SFP."
+            Write-Info "                 For 32 = update NIC driver + firmware."
+            Write-Info "                 For 4198 = run the Duplicate IP Detection check (above)."
         }
         else {
             Write-Success "  No network adapter error events found"
@@ -1675,7 +2620,20 @@ function Test-NetworkConfiguration {
     }
 
     # 15. Routing Table Sanity Check
+    # ------------------------------------------------------------
+    # The IPv4 routing table determines next-hop for every destination. Common
+    # problems we surface:
+    #   - Multiple default gateways (0.0.0.0/0): causes asymmetric routing,
+    #     intermittent connectivity. Almost never desired on a server.
+    #   - Static/persistent routes: documents what an admin pinned manually.
+    #   - Same-metric conflicts: two interfaces 'tied' for the same dest =
+    #     Windows alternates packets between them = retransmissions, weird
+    #     application behaviour.
+    # ------------------------------------------------------------
     Write-Section "Routing Table Analysis"
+    Write-Info "  Description: IPv4 routing table sanity check. Multiple default gateways ="
+    Write-Info "               asymmetric routing. Same-metric ties = Windows alternates"
+    Write-Info "               packets between NICs (causes weird app behaviour)."
     try {
         $routes = Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop
 
@@ -1688,7 +2646,11 @@ function Test-NetworkConfiguration {
                 if ([string]::IsNullOrWhiteSpace($ifAlias)) { $ifAlias = "ifIndex $($dr.InterfaceIndex)" }
                 Write-DiagWarning "    $($dr.NextHop) via $ifAlias (metric $($dr.RouteMetric))"
             }
-            Write-Info "  Multiple default gateways can cause intermittent connectivity - remove extras or use route metrics"
+            Write-Info "    Likely cause: Two NICs both got a gateway from DHCP, OR an admin"
+            Write-Info "                  set a 2nd default route manually."
+            Write-Info "    Remediation: Remove extras: 'Remove-NetRoute -DestinationPrefix"
+            Write-Info "                 0.0.0.0/0 -InterfaceIndex <wrong-ifIndex>'. On heartbeat"
+            Write-Info "                 NICs, uncheck 'Default Gateway' in IPv4 properties."
         }
         elseif (@($defaultRoutes).Count -eq 1) {
             $dr = $defaultRoutes
@@ -1696,7 +2658,10 @@ function Test-NetworkConfiguration {
             Write-Success "  Single default gateway: $($dr.NextHop) via $ifAlias (metric $($dr.RouteMetric))"
         }
         else {
-            Write-DiagError "  NO default gateway configured!"
+            Write-DiagError "  NO default gateway configured"
+            Write-Info "    Impact: Server cannot reach any IP outside its local subnet(s)."
+            Write-Info "    Remediation: Set one via 'New-NetRoute -DestinationPrefix 0.0.0.0/0"
+            Write-Info "                 -NextHop <gateway-ip> -InterfaceIndex <primary-NIC>'."
         }
 
         # Check for persistent routes
@@ -1711,13 +2676,24 @@ function Test-NetworkConfiguration {
             }
         }
 
-        # Check for metric conflicts (same metric on different interfaces for same destination)
+        # Check for metric conflicts (same metric on different interfaces for same destination).
+        # NOTE: S2D / SMB Direct / SMB Multichannel intentionally place 2+ NICs on the
+        # SAME storage subnet so that SMB can stripe traffic across both. That produces
+        # broadcast (.255) + subnet routes that share metrics across interfaces - this
+        # is BY DESIGN, not a misconfig. Detect SMB/storage NIC names and skip those.
+        $smbAdapterIfIndices = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -match '(?i)SMB|Storage|Heartbeat|Cluster|vMotion|LiveMigration|RDMA|iSCSI'
+        } | Select-Object -ExpandProperty ifIndex)
         $metricConflicts = $routes | Group-Object DestinationPrefix |
             Where-Object { $_.Count -gt 1 } |
             ForEach-Object {
                 $metrics = $_.Group.RouteMetric | Select-Object -Unique
                 if (@($metrics).Count -eq 1 -and $_.Name -ne '255.255.255.255/32' -and $_.Name -ne '224.0.0.0/4') {
-                    $_
+                    # Skip if all conflicting routes are on storage/heartbeat NICs (S2D pattern).
+                    $conflictIfIndices = @($_.Group.InterfaceIndex | Select-Object -Unique)
+                    $allOnStorageNics = ($smbAdapterIfIndices.Count -gt 0) -and
+                        (($conflictIfIndices | Where-Object { $_ -notin $smbAdapterIfIndices }).Count -eq 0)
+                    if (-not $allOnStorageNics) { $_ }
                 }
             }
         if ($metricConflicts) {
@@ -1725,6 +2701,14 @@ function Test-NetworkConfiguration {
             foreach ($conflict in $metricConflicts | Select-Object -First 5) {
                 Write-DiagWarning "    $($conflict.Name): $($conflict.Count) routes with same metric"
             }
+            Write-Info "    Impact: Windows will alternate packets between the tied routes,"
+            Write-Info "            which can confuse stateful firewalls / load balancers."
+            Write-Info "    Remediation: Set distinct InterfaceMetric values via"
+            Write-Info "                 'Set-NetIPInterface -InterfaceIndex <ifIndex>"
+            Write-Info "                 -InterfaceMetric <higher-number-for-non-preferred>'."
+        }
+        elseif ($smbAdapterIfIndices.Count -gt 0) {
+            Write-Info "  (Same-subnet routes on SMB/storage NICs are expected for SMB Multichannel/S2D.)"
         }
     }
     catch {
@@ -1818,15 +2802,38 @@ function Test-MemoryUsage {
         Write-Info "Used Memory: $($usedMemGB) GB"
         Write-Info "Free Memory: $($freeMemGB) GB"
         Write-Info "Memory Usage: $($memUsagePercent)%"
-        
-        if ($memUsagePercent -gt $MEMORY_CRITICAL_THRESHOLD) {
-            Write-DiagError "CRITICAL: Memory usage above $($MEMORY_CRITICAL_THRESHOLD)%!"
+        Write-Info "  Description: Free Memory shown here is RAW free RAM only and does NOT"
+        Write-Info "               include the standby cache. The 'Available MBytes' counter"
+        Write-Info "               (Section 2 below) is the more accurate measure for the OS."
+        Write-Info "  Thresholds : SCOM alert at $($MEMORY_WARNING_THRESHOLD)% / in-script critical at $($MEMORY_CRITICAL_THRESHOLD)%."
+
+        # Cross-check raw 'used' % against the standby-cache-aware Available MBytes
+        # counter. Windows aggressively fills RAM with file cache (this is good
+        # behaviour - cache is instantly reclaimable). Reporting raw free as 'used'
+        # produces a permanent 85%+ alarm on small-RAM systems doing any I/O at all.
+        # Only escalate when BOTH the raw % AND the Available MBytes % cross the line.
+        $availPctOfTotal = $null
+        try {
+            $availMBVal = (Get-Counter '\Memory\Available MBytes' -ErrorAction Stop).CounterSamples.CookedValue
+            $totalMBVal = $totalMemGB * 1024
+            if ($totalMBVal -gt 0) { $availPctOfTotal = [math]::Round(($availMBVal / $totalMBVal) * 100, 1) }
+        }
+        catch { $availPctOfTotal = $null }
+
+        if ($memUsagePercent -gt $MEMORY_CRITICAL_THRESHOLD -and ($null -eq $availPctOfTotal -or $availPctOfTotal -lt 5)) {
+            Write-DiagError "Memory usage above $($MEMORY_CRITICAL_THRESHOLD)% - critical (SCOM alert at $($MEMORY_WARNING_THRESHOLD)%)"
+            Write-Info "    Remediation: Identify top consumers (table above), restart leaking"
+            Write-Info "                 services, add RAM, or expand the pagefile."
+        }
+        elseif ($memUsagePercent -gt $MEMORY_WARNING_THRESHOLD -and ($null -eq $availPctOfTotal -or $availPctOfTotal -lt 10)) {
+            Write-DiagWarning "Memory usage above $($MEMORY_WARNING_THRESHOLD)% - SCOM alert threshold (Available MBytes confirms low: $availPctOfTotal% of total)"
         }
         elseif ($memUsagePercent -gt $MEMORY_WARNING_THRESHOLD) {
-            Write-DiagWarning "WARNING: Memory usage above $($MEMORY_WARNING_THRESHOLD)%"
+            Write-Info "  Memory Usage % is high ($memUsagePercent%) but Available MBytes shows $availPctOfTotal% truly free - this is OS file cache and is reclaimable on demand. Not alerting."
+            Write-Success "Memory usage adequate when standby cache is included"
         }
         else {
-            Write-Success "Memory usage is within normal range"
+            Write-Success "Memory usage is within normal range (below SCOM $($MEMORY_WARNING_THRESHOLD)% alert)"
         }
     }
     catch {
@@ -1840,7 +2847,12 @@ function Test-MemoryUsage {
     $script:LastProcessAnalysis = Get-ProcessAnalysis
     $script:LastProcessAnalysisTime = Get-Date
     $processAnalysis = $script:LastProcessAnalysis
-    
+    Write-Info "  Description: Memory(MB) = current Working Set (resident RAM)."
+    Write-Info "               CPU(s) = TOTAL CPU SECONDS since the process started"
+    Write-Info "                        (CUMULATIVE lifetime, NOT current %CPU)."
+    Write-Info "               A process started at boot 30 days ago will show large CPU(s)"
+    Write-Info "               even if it is idle right now. For 'live' %CPU see CPU section."
+
     if ($processAnalysis) {
         $processAnalysis.ByMemory | Format-Table Name, 
         @{Label = "Memory(MB)"; Expression = { [math]::Round($_.WS / 1MB, 2) } },
@@ -1849,13 +2861,29 @@ function Test-MemoryUsage {
     }
     
     Write-Section "Committed Memory"
+    # ------------------------------------------------------------
+    # \Memory\% Committed Bytes In Use = (Commit Charge) / (Commit Limit).
+    # Commit Charge = total virtual memory the OS has promised to processes.
+    # Commit Limit  = physical RAM + total pagefile size.
+    # When this hits 100%, processes get OUT-OF-MEMORY errors regardless of free RAM.
+    # ------------------------------------------------------------
     try {
         $perfCounter = Get-Counter '\Memory\% Committed Bytes In Use' -ErrorAction Stop
         if ($perfCounter) {
             $committedPercent = [math]::Round($perfCounter.CounterSamples.CookedValue, 2)
             Write-Info "`nCommitted Bytes In Use: $($committedPercent)%"
+            Write-Info "  Description: % of (RAM + pagefile) currently promised to processes."
+            Write-Info "               At 100%, new allocations FAIL with out-of-memory."
             if ($committedPercent -gt $MEMORY_CRITICAL_THRESHOLD) {
-                Write-DiagError "CRITICAL: Committed bytes above $($MEMORY_CRITICAL_THRESHOLD)%!"
+                Write-DiagError "  Committed bytes above $($MEMORY_CRITICAL_THRESHOLD)% - critical (SCOM alert at $($MEMORY_WARNING_THRESHOLD)%)"
+                Write-Info "    Remediation: Increase pagefile (raises Commit Limit) or add RAM."
+                Write-Info "                 Restarting leaky processes drops Commit Charge fast."
+            }
+            elseif ($committedPercent -gt $MEMORY_WARNING_THRESHOLD) {
+                Write-DiagWarning "  Committed bytes above $($MEMORY_WARNING_THRESHOLD)% - SCOM alert threshold"
+            }
+            else {
+                Write-Success "  Commit charge within safe range (below SCOM $($MEMORY_WARNING_THRESHOLD)% alert)"
             }
         }
     }
@@ -1864,17 +2892,51 @@ function Test-MemoryUsage {
     }
 
     # NonPagedPool Usage
+    # ------------------------------------------------------------
+    # NonPaged Pool = kernel memory that MUST stay in physical RAM (cannot be paged
+    # to disk). Used by drivers, kernel structures, network buffers, ETW sessions,
+    # and filter drivers. Leaks here are dangerous because the OS cannot recover
+    # the memory by paging - exhaustion leads to bugcheck 0xC2 (BAD_POOL_CALLER) or
+    # general system instability.
+    # ------------------------------------------------------------
     Write-Section "Kernel Memory Pools"
     Write-Info "NonPaged Pool:"
     try {
         $npPool = Get-Counter '\Memory\Pool Nonpaged Bytes' -ErrorAction Stop
         $npMB = [math]::Round($npPool.CounterSamples.CookedValue / 1MB, 2)
         Write-Info "  NonPaged Pool: $npMB MB"
-        if ($npMB -gt $NONPAGED_POOL_CRITICAL_MB) {
-            Write-DiagError "  CRITICAL: NonPaged Pool >$($NONPAGED_POOL_CRITICAL_MB)MB - possible ETW buffer or driver leak"
+        Write-Info "    Description: Kernel memory that cannot be paged to disk (drivers,"
+        Write-Info "                 ETW buffers, network stack, filter drivers)."
+
+        # Auto-relax thresholds on cluster / Hyper-V hosts. Failover Clustering +
+        # Hyper-V + SMB Direct + S2D + EDR routinely consume 350-450 MB of NPP
+        # on a healthy node - the desktop-tuned 200/300 MB thresholds fire
+        # constantly with no real problem.
+        $npCriticalMB = $NONPAGED_POOL_CRITICAL_MB
+        $npWarningMB = $NONPAGED_POOL_WARNING_MB
+        $clusterRunning = (Get-Service -Name 'ClusSvc' -ErrorAction SilentlyContinue).Status -eq 'Running'
+        $hyperVRunning = (Get-Service -Name 'vmms' -ErrorAction SilentlyContinue).Status -eq 'Running'
+        if ($clusterRunning -or $hyperVRunning) {
+            $npCriticalMB = 800
+            $npWarningMB = 500
+            $roleNote = @()
+            if ($clusterRunning) { $roleNote += 'Failover Clustering' }
+            if ($hyperVRunning) { $roleNote += 'Hyper-V' }
+            Write-Info "    (Thresholds relaxed for $($roleNote -join ' + ') host: warn>$($npWarningMB)MB / critical>$($npCriticalMB)MB)"
         }
-        elseif ($npMB -gt $NONPAGED_POOL_WARNING_MB) {
-            Write-DiagWarning "  WARNING: NonPaged Pool elevated (>$($NONPAGED_POOL_WARNING_MB)MB)"
+
+        if ($npMB -gt $npCriticalMB) {
+            Write-DiagError "  NonPaged Pool >${npCriticalMB}MB - possible ETW buffer or driver leak (critical)"
+            Write-Info "    Likely culprits: Excessive ETW sessions (logman query -ets),"
+            Write-Info "                     buggy NIC/storage/AV drivers, oversized SMB pool."
+            Write-Info "    Remediation: Run 'poolmon.exe -p -P -b' (sort by NonPaged) to find"
+            Write-Info "                 the leaking driver tag, then update or disable that driver."
+        }
+        elseif ($npMB -gt $npWarningMB) {
+            Write-DiagWarning "  NonPaged Pool elevated (>${npWarningMB}MB)"
+        }
+        else {
+            Write-Success "  NonPaged Pool within normal range"
         }
     }
     catch {
@@ -1882,15 +2944,29 @@ function Test-MemoryUsage {
     }
 
     # Modified Page List (file cache pressure)
+    # ------------------------------------------------------------
+    # Modified Page List = pages whose contents have been changed in memory but
+    # have NOT yet been written back to disk. The lazy-writer flushes these to
+    # disk in the background. A LARGE modified list means writes are queueing
+    # faster than the disk can absorb them - usually disk bottleneck or write storm.
+    # ------------------------------------------------------------
     Write-Section "File Cache & Paging"
     Write-Info "Modified Page List:"
     try {
         $modPages = Get-Counter '\Memory\Modified Page List Bytes' -ErrorAction Stop
         $modGB = [math]::Round($modPages.CounterSamples.CookedValue / 1GB, 2)
         Write-Info "  Modified Page List: $modGB GB"
+        Write-Info "    Description: Dirty pages waiting to be flushed to disk. A growing"
+        Write-Info "                 list = disk cannot keep up with write rate."
         if ($modGB -gt $MODIFIED_PAGE_LIST_WARNING_GB) {
-            Write-DiagWarning "  WARNING: Large modified page list ($modGB GB) - file cache consuming RAM"
-            Write-Info "  Consider: Disable 'Large System Cache' or tune MaxCacheSizeInMB"
+            Write-DiagWarning "  Large modified page list ($modGB GB) - file cache consuming RAM"
+            Write-Info "    Likely cause: Slow disk subsystem, write-heavy workload (SQL, backup),"
+            Write-Info "                  or 'Large System Cache' enabled on a non-file-server."
+            Write-Info "    Remediation: Check disk latency (Section 'Disk'); disable Large System"
+            Write-Info "                 Cache; tune MaxCacheSizeInMB; or move workload to faster disk."
+        }
+        else {
+            Write-Success "  Modified Page List within normal range"
         }
     }
     catch {
@@ -1898,16 +2974,32 @@ function Test-MemoryUsage {
     }
 
     # Paging Spikes
+    # ------------------------------------------------------------
+    # \Memory\Pages/sec = HARD page faults + writes per second (pages read from
+    # OR written to DISK to resolve memory references). High = the OS is hitting
+    # disk to satisfy what should be RAM requests. Direct hit on app performance.
+    # NOTE: Includes BOTH reads (file cache) and writes (modified list) - use
+    # \Memory\Pages Input/sec for read-only view if needed.
+    # ------------------------------------------------------------
     Write-Info "`nPaging Activity:"
     try {
         $pagesPerSec = Get-Counter '\Memory\Pages/sec' -ErrorAction Stop
         $pps = [math]::Round($pagesPerSec.CounterSamples.CookedValue, 0)
         Write-Info "  Pages/sec: $pps"
+        Write-Info "    Description: Pages read from or written to DISK to satisfy memory"
+        Write-Info "                 references. Direct indicator of memory pressure hitting disk."
         if ($pps -gt $PAGING_CRITICAL_THRESHOLD) {
-            Write-DiagError "  CRITICAL: High paging activity (>$($PAGING_CRITICAL_THRESHOLD) pages/sec) - severe memory pressure"
+            Write-DiagError "  High paging activity (>$($PAGING_CRITICAL_THRESHOLD) pages/sec) - severe memory pressure (critical)"
+            Write-Info "    Impact: Application response time will degrade noticeably. Disk"
+            Write-Info "            queue depth and latency will spike (check Disk diagnostics)."
+            Write-Info "    Remediation: Add RAM, identify and stop runaway memory consumers,"
+            Write-Info "                 or move pagefile to a faster disk (SSD/NVMe)."
         }
         elseif ($pps -gt $PAGING_WARNING_THRESHOLD) {
-            Write-DiagWarning "  WARNING: Elevated paging activity (>$($PAGING_WARNING_THRESHOLD) pages/sec)"
+            Write-DiagWarning "  Elevated paging activity (>$($PAGING_WARNING_THRESHOLD) pages/sec)"
+        }
+        else {
+            Write-Success "  Paging activity within normal range"
         }
     }
     catch {
@@ -1940,6 +3032,12 @@ function Test-MemoryUsage {
     #region v3.0 Memory Checks
 
     # 1. Page File Configuration & Usage
+    # ------------------------------------------------------------
+    # The pagefile (pagefile.sys) backs the system commit limit and stores process
+    # memory paged out under pressure. CurrentUsage tells you how much is actually
+    # in use right now; PeakUsage shows the historical high since boot.
+    # A pagefile that is >70% used = the system has been UNDER MEMORY PRESSURE.
+    # ------------------------------------------------------------
     Write-Section "Page File Configuration & Usage"
     try {
         $pageFiles = Get-CimInstance Win32_PageFileUsage -ErrorAction Stop
@@ -1952,15 +3050,22 @@ function Test-MemoryUsage {
                 Write-Info "  $($pf.Name):"
                 Write-Info "    Size: $totalMB MB | Used: $usedMB MB ($usedPercent%) | Peak: $peakMB MB"
                 if ($usedPercent -gt $PAGEFILE_USAGE_CRITICAL_PERCENT) {
-                    Write-DiagError "    CRITICAL: Page file is >$($PAGEFILE_USAGE_CRITICAL_PERCENT)% full!"
+                    Write-DiagError "    Page file is >$($PAGEFILE_USAGE_CRITICAL_PERCENT)% full (critical)"
+                    Write-Info "      Impact: When pagefile fills, processes hit OUT-OF-MEMORY errors."
+                    Write-Info "      Remediation: Increase pagefile size, add RAM, or stop leaks."
                 }
                 elseif ($usedPercent -gt $PAGEFILE_USAGE_WARNING_PERCENT) {
-                    Write-DiagWarning "    WARNING: Page file usage above $($PAGEFILE_USAGE_WARNING_PERCENT)%"
+                    Write-DiagWarning "    Page file usage above $($PAGEFILE_USAGE_WARNING_PERCENT)% - watch for growth"
+                }
+                if ($peakMB -gt ($totalMB * 0.9)) {
+                    Write-DiagWarning "    Peak usage ($peakMB MB) reached >90% of allocation since boot"
+                    Write-Info "      => System has hit memory pressure at least once - investigate."
                 }
             }
         }
         else {
             Write-DiagWarning "  No page files found (system may crash under memory pressure!)"
+            Write-Info "    Remediation: Configure a system-managed pagefile via SystemPropertiesAdvanced."
         }
 
         # Check page file settings (system managed vs fixed)
@@ -1988,19 +3093,36 @@ function Test-MemoryUsage {
     }
 
     # 2. Available MBytes (more accurate than free memory)
+    # ------------------------------------------------------------
+    # \Memory\Available MBytes = Free + Standby + Zero page lists.
+    # This is the AUTHORITATIVE number for 'how much RAM can the OS hand out
+    # right now'. Always trust this over Task Manager's 'Free' figure.
+    # ------------------------------------------------------------
     Write-Section "Available Memory (includes reclaimable cache)"
     try {
         $availMB = Get-Counter '\Memory\Available MBytes' -ErrorAction Stop
         $availVal = [math]::Round($availMB.CounterSamples.CookedValue, 0)
         Write-Info "  Available MBytes: $availVal MB ($([math]::Round($availVal / 1024, 2)) GB)"
-        if ($availVal -lt $AVAILABLE_MB_CRITICAL) {
-            Write-DiagError "  CRITICAL: Available memory below $($AVAILABLE_MB_CRITICAL) MB!"
+        Write-Info "    Description: Free + standby + zero page lists. The TRUE measure of"
+        Write-Info "                 RAM the OS can immediately allocate to a new request."
+
+        # Use BOTH absolute MB and percentage thresholds. On small VMs (e.g. 3-4 GB)
+        # the 1024 MB absolute warning fires almost permanently even though the
+        # box has 25% free RAM. Trigger only when BOTH conditions agree, OR when
+        # absolute is dangerously low regardless of size.
+        $totalRamMB = [math]::Round((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory / 1MB, 0)
+        $availPct = if ($totalRamMB -gt 0) { [math]::Round(($availVal / $totalRamMB) * 100, 1) } else { 100 }
+
+        if ($availVal -lt 256 -or ($availPct -lt 5 -and $availVal -lt $AVAILABLE_MB_CRITICAL)) {
+            Write-DiagError "  Available memory critical: $availVal MB ($availPct% of $totalRamMB MB total)"
+            Write-Info "    Impact: OS will start aggressive WS trimming and eventually pageout."
+            Write-Info "    Remediation: Free RAM by stopping non-essential services or add RAM."
         }
-        elseif ($availVal -lt $AVAILABLE_MB_WARNING) {
-            Write-DiagWarning "  WARNING: Available memory below $($AVAILABLE_MB_WARNING) MB"
+        elseif ($availPct -lt 10 -and $availVal -lt $AVAILABLE_MB_WARNING) {
+            Write-DiagWarning "  Available memory low: $availVal MB ($availPct% of $totalRamMB MB total)"
         }
         else {
-            Write-Success "  Available memory is adequate"
+            Write-Success "  Available memory is adequate ($availVal MB / $availPct% of total)"
         }
     }
     catch {
@@ -2008,12 +3130,20 @@ function Test-MemoryUsage {
     }
 
     # 3. Memory Compression Ratio
+    # ------------------------------------------------------------
+    # Windows 10 / Server 2016+ compresses pages instead of paging them to disk
+    # when RAM is tight. The 'Memory Compression' process holds the compressed
+    # store. Active compression = system under memory pressure but avoiding disk
+    # I/O. >2 GB compressed = pressure is significant.
+    # ------------------------------------------------------------
     Write-Section "Memory Compression"
     try {
         $compressProc = Get-Process -Name "Memory Compression" -ErrorAction SilentlyContinue
         if ($compressProc) {
             $compressWS = [math]::Round($compressProc.WorkingSet64 / 1MB, 0)
             Write-Info "  Memory Compression process WS: $compressWS MB"
+            Write-Info "    Description: OS is compressing pages in RAM instead of paging"
+            Write-Info "                 to disk - active = real memory pressure."
             try {
                 $compressedBytes = Get-Counter '\Memory\Compression Store Size' -ErrorAction Stop
                 $compressedMB = [math]::Round($compressedBytes.CounterSamples.CookedValue / 1MB, 0)
@@ -2021,7 +3151,9 @@ function Test-MemoryUsage {
                     $ratio = [math]::Round($compressedMB / $compressWS, 2)
                     Write-Info "  Compressed Store: $compressedMB MB | Compression Ratio: ${ratio}:1"
                     if ($compressWS -gt 2048) {
-                        Write-DiagWarning "  WARNING: Over 2 GB of compressed memory - system is under significant memory pressure"
+                        Write-DiagWarning "  Over 2 GB of compressed memory - system under significant pressure"
+                        Write-Info "    Remediation: Add RAM. Compression is a stopgap - the OS is"
+                        Write-Info "                 burning CPU cycles to avoid the worse fate of disk paging."
                     }
                 }
             }
@@ -2031,6 +3163,8 @@ function Test-MemoryUsage {
         }
         else {
             Write-Info "  Memory Compression process not active"
+            Write-Info "    Description: No compression activity = OS has plenty of RAM"
+            Write-Info "                 OR the OS is older than Windows 10 / Server 2016."
         }
     }
     catch {
@@ -2038,7 +3172,19 @@ function Test-MemoryUsage {
     }
 
     # 4. Handle & Thread Count per Process
+    # ------------------------------------------------------------
+    # Handles = kernel object references (files, registry keys, events, sockets,
+    # mutexes, etc.). Each handle consumes a small amount of pool memory. Normal
+    # processes use a few thousand. >10,000 = potential leak. >50,000 = almost
+    # certainly leaking. The system-wide ceiling is ~16M, but individual processes
+    # crash long before that.
+    # Threads = units of execution. >500 in a single process is unusual outside
+    # of well-known multi-threaded apps (SQL Server, IIS w/ many app pools).
+    # ------------------------------------------------------------
     Write-Section "Handle & Thread Analysis"
+    Write-Info "  Description: A handle is a reference to a kernel object (file, socket,"
+    Write-Info "               registry key, etc.). Sustained growth indicates a code-level"
+    Write-Info "               leak - the process never closes objects it opened."
     Write-Info "Top Processes by Handle Count:"
     try {
         $handleProcs = Get-Process -ErrorAction Stop |
@@ -2075,17 +3221,57 @@ function Test-MemoryUsage {
         Write-DiagWarning "  Could not check thread counts"
     }
 
-    # 5. Paged Pool Usage
+    # 5. Paged Pool Usage  *** PRIMARY KERNEL LEAK INDICATOR ***
+    # ------------------------------------------------------------
+    # Paged Pool = kernel memory that CAN be paged to disk when needed. Used by
+    # filter drivers (AV/EDR/backup), the registry, file system cache structures,
+    # and many kernel data structures.
+    #
+    # Healthy:    < 300 MB on most servers
+    # Warning:    > 300 MB - investigate driver/AV behavior
+    # Critical:   > 400 MB - bugcheck risk imminent
+    #
+    # When paged pool exhausts, Windows blue-screens with one of:
+    #   0x0000002E  SESSION_POOL_EMPTY
+    #   0x0000003F  NO_MORE_SYSTEM_PTES
+    #   0x00000077  KERNEL_STACK_INPAGE_ERROR
+    #
+    # Common culprits (top 95% of cases):
+    #   - Antivirus/EDR filter drivers (Symantec srtsp/cyserver, McAfee, CrowdStrike)
+    #   - Backup agent file-system filters (Veeam, Commvault, Veritas)
+    #   - Storage filter drivers (third-party deduplication, anti-ransomware)
+    #   - Registry hive bloat from a chatty service
+    #
+    # Diagnosis: Run 'poolmon.exe -p -P -b' (sort by Paged, sort by Bytes).
+    # The top tag identifies the leaking driver. Look up the tag in pooltag.txt
+    # (in WDK) or with: findstr /s /i "TAG" %windir%\System32\drivers\*.sys
+    # ------------------------------------------------------------
     Write-Section "Paged Pool Usage"
     try {
         $pagedPool = Get-Counter '\Memory\Pool Paged Bytes' -ErrorAction Stop
         $ppMB = [math]::Round($pagedPool.CounterSamples.CookedValue / 1MB, 2)
         Write-Info "  Paged Pool: $ppMB MB"
+        Write-Info "    Description: Pageable kernel memory. Heavy users = filter drivers"
+        Write-Info "                 (AV/EDR/backup), registry hives, file cache structures."
         if ($ppMB -gt $PAGED_POOL_CRITICAL_MB) {
-            Write-DiagError "  CRITICAL: Paged Pool >$($PAGED_POOL_CRITICAL_MB)MB - risk of SESSION_POOL_EMPTY bugcheck"
+            Write-DiagError "  Paged Pool >$($PAGED_POOL_CRITICAL_MB)MB - risk of SESSION_POOL_EMPTY bugcheck (critical)"
+            Write-Info "    Impact: Server is at risk of BSOD. Bugchecks 0x2E / 0x3F / 0x77"
+            Write-Info "            are typical outcomes; correlated symptoms include Event 333"
+            Write-Info "            (registry hive flush failure) - check Section 10."
+            Write-Info "    Likely culprits: Antivirus filter (SRTSP/cyserver), backup agent,"
+            Write-Info "                     storage filter driver, or third-party EDR."
+            Write-Info "    Diagnosis: Run 'poolmon.exe -p -P -b' (from Windows WDK)."
+            Write-Info "               Press 'P' twice to sort by Paged. Top tag = the leak."
+            Write-Info "    Remediation:"
+            Write-Info "      1. Identify pool tag with poolmon, map to driver via pooltag.txt."
+            Write-Info "      2. Update or temporarily disable the suspect filter driver."
+            Write-Info "      3. Schedule a maintenance reboot to release the leaked pool."
+            Write-Info "      4. Open a vendor case if the leak persists after update."
         }
         elseif ($ppMB -gt $PAGED_POOL_WARNING_MB) {
-            Write-DiagWarning "  WARNING: Paged Pool elevated (>$($PAGED_POOL_WARNING_MB)MB)"
+            Write-DiagWarning "  Paged Pool elevated (>$($PAGED_POOL_WARNING_MB)MB)"
+            Write-Info "    Trend monitoring recommended. Re-run this check daily; if the"
+            Write-Info "    number keeps climbing across reboots, treat as a confirmed leak."
         }
         else {
             Write-Success "  Paged Pool is within normal range"
@@ -2096,15 +3282,29 @@ function Test-MemoryUsage {
     }
 
     # 6. System Cache Working Set
+    # ------------------------------------------------------------
+    # \Memory\Cache Bytes = the OS file system cache (cached file content + metadata).
+    # On file servers this is desirable (fast file reads). On application servers,
+    # an oversized cache STARVES applications of physical RAM and causes WS trimming.
+    # ------------------------------------------------------------
     Write-Section "System Cache Working Set"
     try {
         $cacheBytes = Get-Counter '\Memory\Cache Bytes' -ErrorAction Stop
         $cacheMB = [math]::Round($cacheBytes.CounterSamples.CookedValue / 1MB, 0)
         $cacheGB = [math]::Round($cacheBytes.CounterSamples.CookedValue / 1GB, 2)
         Write-Info "  System Cache: $cacheMB MB ($cacheGB GB)"
+        Write-Info "    Description: OS file system cache. Beneficial on file servers,"
+        Write-Info "                 problematic on app servers (steals RAM from apps)."
         if ($cacheGB -gt 4) {
-            Write-DiagWarning "  WARNING: Large system cache ($cacheGB GB) - may be starving user processes"
-            Write-Info "  On file servers, consider tuning LargeSystemCache registry key"
+            Write-DiagWarning "  Large system cache ($cacheGB GB) - may be starving user processes"
+            Write-Info "    Likely cause: 'Large System Cache' enabled, or heavy file-share workload."
+            Write-Info "    Remediation: For non-file-server roles, set:"
+            Write-Info "      HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+            Write-Info "      LargeSystemCache (DWORD) = 0  (favor application memory)"
+            Write-Info "      Then reboot. On file servers, tune MaxCacheSizeInMB instead."
+        }
+        else {
+            Write-Success "  System cache size within reasonable range"
         }
     }
     catch {
@@ -2112,7 +3312,24 @@ function Test-MemoryUsage {
     }
 
     # 7. Memory Leak Trend Detection (Private Bytes vs Working Set)
+    # ------------------------------------------------------------
+    # WS (Working Set)        = pages currently resident in physical RAM.
+    # Private Bytes           = total committed memory the process has allocated
+    #                           that is NOT shared with other processes.
+    # Virtual Bytes           = total VAS reserved by the process. On 64-bit this
+    #                           can be huge (TB range) without being a problem -
+    #                           reservation != commitment.
+    #
+    # Leak rule of thumb: if Private >> WS (by >500 MB), the process has allocated
+    # memory that has been PAGED OUT to disk - the OS deemed it inactive. That can
+    # be normal (idle process) or a sign of a slow leak.
+    # The DEFINITIVE leak signal is a steady upward trend in Private Bytes over
+    # hours/days with no workload increase. Sample this counter repeatedly.
+    # ------------------------------------------------------------
     Write-Section "Memory Leak Indicators (Private Bytes vs Working Set)"
+    Write-Info "  Description: WS = RAM-resident pages. Private = total committed memory."
+    Write-Info "               A large Private-WS gap means memory was paged out (idle OR leak)."
+    Write-Info "               True leak detection requires sampling Private Bytes over TIME."
     try {
         $topProcesses = Get-Process -ErrorAction Stop |
             Where-Object { $_.WorkingSet64 -gt 100MB } |
@@ -2129,13 +3346,26 @@ function Test-MemoryUsage {
             }
             Write-Info "  $($proc.Name) (PID $($proc.Id)): WS=${wsMB}MB Private=${privateMB}MB Virtual=${virtualMB}MB$indicator"
         }
+        Write-Info "  Note: Virtual Bytes in the TB range is NORMAL on 64-bit (address-space"
+        Write-Info "        reservation, not actual RAM). Focus on Private Bytes growth over time."
     }
     catch {
         Write-DiagWarning "  Could not perform leak trend analysis"
     }
 
     # 8. Standby List Breakdown
+    # ------------------------------------------------------------
+    # Standby cache = pages that were in working sets, were trimmed, but are
+    # still in RAM (not yet zeroed). They can be reclaimed instantly with no
+    # disk hit. Split by priority:
+    #   - Core (high priority)    : OS kernel data; reclaimed last
+    #   - Normal                  : typical app pages; reclaimed when needed
+    #   - Reserve (low priority)  : easily evicted; first to go
+    # The healthier the mix toward Reserve, the more headroom the OS has.
+    # ------------------------------------------------------------
     Write-Section "Standby Cache Breakdown"
+    Write-Info "  Description: Pages trimmed from working sets but still in RAM. Can be"
+    Write-Info "               reclaimed instantly (no disk I/O). Split by priority."
     try {
         $standbyCore = Get-Counter '\Memory\Standby Cache Core Bytes' -ErrorAction Stop
         $standbyNormal = Get-Counter '\Memory\Standby Cache Normal Priority Bytes' -ErrorAction Stop
@@ -2147,15 +3377,22 @@ function Test-MemoryUsage {
         $totalStandby = $coreMB + $normalMB + $reserveMB
 
         Write-Info "  Total Standby: $totalStandby MB ($([math]::Round($totalStandby / 1024, 2)) GB)"
-        Write-Info "    Core (high priority): $coreMB MB"
-        Write-Info "    Normal priority: $normalMB MB"
-        Write-Info "    Reserve (low priority, easily reclaimable): $reserveMB MB"
+        Write-Info "    Core (high priority): $coreMB MB    (kernel data; reclaimed last)"
+        Write-Info "    Normal priority: $normalMB MB       (typical apps)"
+        Write-Info "    Reserve (low priority): $reserveMB MB (easiest to reclaim)"
 
         if ($totalStandby -gt 0) {
             $reclaimablePercent = [math]::Round(($reserveMB / $totalStandby) * 100, 1)
             Write-Info "  Easily reclaimable: $reclaimablePercent% of standby cache"
             if ($reclaimablePercent -lt 20 -and $totalStandby -gt 2048) {
-                Write-DiagWarning "  Low reclaimable standby cache - high-priority file cache is consuming standby memory"
+                Write-DiagWarning "  Low reclaimable standby cache - high-priority file cache is dominating"
+                Write-Info "    Impact: When new memory demand arrives, OS has fewer 'free' pages,"
+                Write-Info "            forcing it to evict Normal/Core priority pages (slower)."
+                Write-Info "    Remediation: Reduce file-cache pressure (see Section 6 'System Cache')"
+                Write-Info "                 or run RAMMap.exe to identify what's holding standby pages."
+            }
+            else {
+                Write-Success "  Standby cache priority distribution is healthy"
             }
         }
     }
@@ -2218,7 +3455,21 @@ function Test-MemoryUsage {
         Write-DiagWarning "  Could not retrieve RAM hardware info: $($_.Exception.Message)"
     }
 
-    # 10. Resource Exhaustion Events (2004)
+    # 10. Resource Exhaustion Events (2004 / 333 / 2003)
+    # ------------------------------------------------------------
+    # Event ID reference (memory-related only):
+    #   2004  - Resource-Exhaustion-Detector  : Virtual memory low; OS identified top
+    #                                            committers. Indicates pagefile/RAM pressure.
+    #   333   - Application Popup / Kernel    : Registry hive flush failed (often caused
+    #                                            by paged-pool exhaustion or disk I/O issues).
+    #   2003  - Microsoft-Windows-Perflib     : Performance counter library failed to
+    #                                            load — usually a corrupt perfcounter or
+    #                                            low-memory condition during service start.
+    #
+    # IMPORTANT: Event ID 2003 is reused by MANY unrelated providers (e.g. SRTSP =
+    # Symantec Antivirus minifilter load, which is purely informational). We MUST
+    # filter by ProviderName so we don't raise false positives.
+    # ------------------------------------------------------------
     Write-Section "Resource Exhaustion Events (last 7 days)"
     try {
         $resExhaustEvents = Get-WinEvent -FilterHashtable @{
@@ -2228,53 +3479,143 @@ function Test-MemoryUsage {
         } -MaxEvents 10 -ErrorAction SilentlyContinue
 
         if ($resExhaustEvents) {
-            Write-DiagError "  FOUND $($resExhaustEvents.Count) resource exhaustion event(s)!"
+            Write-DiagError "  FOUND $($resExhaustEvents.Count) resource exhaustion event(s) (Event 2004)!"
+            Write-Info "    Description: Windows Resource-Exhaustion-Detector logged virtual"
+            Write-Info "                 memory low. The OS lists top committers in each event."
             foreach ($evt in $resExhaustEvents | Select-Object -First 5) {
                 Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] $(Get-EventSnippet -Event $evt -MaxLength 120)"
             }
-            Write-Info "  Event 2004 = virtual memory exhaustion - increase page file or add RAM"
+            Write-Info "  Remediation: Increase pagefile, add RAM, or terminate runaway committers."
         }
         else {
             Write-Success "  No resource exhaustion events (Event 2004)"
         }
 
-        # Also check for Event 333 (an LDR for memory low condition in older OS)
-        $lowMemEvents = Get-WinEvent -FilterHashtable @{
+        # ----- Event 333: Registry hive flush failure (paged-pool / disk pressure) -----
+        $event333 = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
-            Id        = 333, 2003
+            Id        = 333
             StartTime = (Get-Date).AddDays(-7)
-        } -MaxEvents 5 -ErrorAction SilentlyContinue
-        if ($lowMemEvents) {
-            Write-DiagWarning "  Also found $($lowMemEvents.Count) low-memory condition event(s) (333/2003)"
+        } -MaxEvents 10 -ErrorAction SilentlyContinue
+
+        if ($event333) {
+            Write-DiagWarning "  Found $($event333.Count) Event 333 (registry I/O / hive flush failure)"
+            Write-Info "    Description: An I/O initiated by the Registry failed unrecoverably."
+            Write-Info "                 Most common cause = paged-pool exhaustion (correlates with"
+            Write-Info "                 Section 9 'Paged Pool >400MB' alerts) or storage timeouts."
+            foreach ($evt in $event333 | Select-Object -First 3) {
+                Write-Info "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] $($evt.ProviderName) :: $(Get-EventSnippet -Event $evt -MaxLength 120)"
+            }
+        }
+        else {
+            Write-Success "  No Event 333 (registry hive flush failures)"
+        }
+
+        # ----- Event 2003: Perflib load failure (filtered to exclude AV/3rd-party noise) -----
+        # Whitelist of providers whose Event 2003 actually relates to memory/perf health.
+        $relevant2003Providers = @(
+            'Microsoft-Windows-Perflib',
+            'Perflib',
+            'Microsoft-Windows-Resource-Exhaustion-Detector'
+        )
+        $all2003 = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 2003
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 25 -ErrorAction SilentlyContinue
+
+        $relevant2003 = @($all2003 | Where-Object { $_.ProviderName -in $relevant2003Providers })
+        $ignored2003 = @($all2003 | Where-Object { $_.ProviderName -notin $relevant2003Providers })
+
+        if ($relevant2003.Count -gt 0) {
+            Write-DiagWarning "  Found $($relevant2003.Count) Event 2003 (Perflib failures - memory-related)"
+            Write-Info "    Description: Performance counter library failed to load. Often a sign"
+            Write-Info "                 of low memory at service-start or a corrupt perf counter."
+            foreach ($evt in $relevant2003 | Select-Object -First 3) {
+                Write-Info "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] $($evt.ProviderName) :: $(Get-EventSnippet -Event $evt -MaxLength 120)"
+            }
+            Write-Info "  Remediation: Run 'lodctr /R' to rebuild perfcounters; investigate memory pressure."
+        }
+        else {
+            Write-Success "  No memory-related Event 2003 (Perflib) entries"
+        }
+
+        if ($ignored2003.Count -gt 0) {
+            $sources = ($ignored2003 | Group-Object ProviderName | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', '
+            Write-Info "  (Ignored $($ignored2003.Count) unrelated Event 2003 from non-memory providers: $sources)"
+            Write-Info "    Note: Event ID 2003 is reused by many components (e.g. SRTSP = Symantec"
+            Write-Info "          AV minifilter load - purely informational, NOT a memory issue)."
         }
     }
     catch {
-        Write-Info "  Could not query resource exhaustion events"
+        Write-Info "  Could not query resource exhaustion events: $($_.Exception.Message)"
     }
 
     # 11. Working Set Trimming Rate
+    # ------------------------------------------------------------
+    # Counter reference:
+    #   \Memory\Transition Pages RePurposed/sec
+    #       Pages the Memory Manager pulled OFF a process's working set (or off
+    #       standby/modified lists) and handed to a different process. A SUSTAINED
+    #       high value means the OS is fighting to satisfy memory demand and is
+    #       evicting pages from running processes. Common triggers: a memory-hungry
+    #       process (SQL, Java, AV scan), low Available MBytes, or oversized file cache.
+    #
+    #   \Memory\Cache Faults/sec
+    #       Page faults where the requested page was NOT in the active working set
+    #       but was found in the standby cache (no disk hit yet). High values are a
+    #       leading indicator that file-cache pages are being evicted frequently —
+    #       usually the next stage is hard page faults to disk (real performance hit).
+    #
+    # Both counters are RATES (per second), so a single high spike is normal. Treat
+    # sustained values across multiple samples as the real signal.
+    # ------------------------------------------------------------
     Write-Section "Working Set Trimming Activity"
     try {
         $trimCounter = Get-Counter '\Memory\Transition Pages RePurposed/sec' -ErrorAction Stop
         $trimRate = [math]::Round($trimCounter.CounterSamples.CookedValue, 0)
         Write-Info "  Transition Pages Repurposed/sec: $trimRate"
+        Write-Info "    Description: Rate at which the OS is pulling pages OFF process"
+        Write-Info "                 working sets to satisfy other memory demands."
         if ($trimRate -gt $WS_TRIM_WARNING_THRESHOLD) {
-            Write-DiagWarning "  WARNING: High WS trimming rate (>$WS_TRIM_WARNING_THRESHOLD/sec) - OS is aggressively reclaiming memory"
+            Write-DiagWarning "  High WS trimming rate (>$WS_TRIM_WARNING_THRESHOLD/sec) - OS is aggressively reclaiming memory"
+            Write-Info "    Likely cause: Low Available MBytes, oversized file cache, or a memory-"
+            Write-Info "                  hungry process (check Section 'Top 10 Memory Consuming Processes')."
+            Write-Info "    Remediation: Identify top committers; add RAM; cap file cache; or"
+            Write-Info "                 restart the offending service."
+        }
+        else {
+            Write-Success "  WS trimming rate is normal (<= $WS_TRIM_WARNING_THRESHOLD/sec)"
         }
 
         $cacheFaults = Get-Counter '\Memory\Cache Faults/sec' -ErrorAction Stop
         $cacheFaultRate = [math]::Round($cacheFaults.CounterSamples.CookedValue, 0)
         Write-Info "  Cache Faults/sec: $cacheFaultRate"
+        Write-Info "    Description: Rate of page faults satisfied from the standby cache"
+        Write-Info "                 (not yet hitting disk). Leading indicator of disk paging."
         if ($cacheFaultRate -gt 5000) {
-            Write-DiagWarning "  WARNING: High cache fault rate - system cache is being evicted frequently"
+            Write-DiagWarning "  High cache fault rate (>5000/sec) - system cache is being evicted frequently"
+            Write-Info "    Impact: If this continues, expect '\Memory\Pages/sec' to climb and"
+            Write-Info "            disk read latency to spike (hard page faults)."
+            Write-Info "    Remediation: Same as WS trimming - reduce memory pressure or add RAM."
+        }
+        else {
+            Write-Success "  Cache fault rate is normal (<= 5000/sec)"
         }
     }
     catch {
-        Write-DiagWarning "  Could not check working set trimming"
+        Write-DiagWarning "  Could not check working set trimming: $($_.Exception.Message)"
     }
 
     # 12. Per-Process Private Bytes vs Working Set (top suspects)
+    # ------------------------------------------------------------
+    # Focused view of Section 7 - lists ONLY processes where Private Bytes
+    # exceeds Working Set by >200 MB. These are the strongest leak suspects
+    # because the OS has paged out a large amount of their committed memory.
+    # ------------------------------------------------------------
     Write-Section "Detailed Leak Analysis (Private >> Working Set)"
+    Write-Info "  Description: Processes whose Private Bytes exceeds Working Set by >200 MB."
+    Write-Info "               High Gap_MB = lots of committed memory has been paged to disk."
     try {
         $leakCandidates = Get-Process -ErrorAction Stop |
             Where-Object { $_.PrivateMemorySize64 -gt 200MB } |
@@ -2448,15 +3789,16 @@ function Test-CPUUsage {
         if ($cpuUsage) {
             $cpuPercent = [math]::Round($cpuUsage.CounterSamples.CookedValue, 2)
             Write-Info "Current CPU Usage: $($cpuPercent)%"
-            
+            Write-Info "  Thresholds : SCOM alert at $($CPU_WARNING_THRESHOLD)% / in-script critical at $($CPU_CRITICAL_THRESHOLD)%."
+
             if ($cpuPercent -gt $CPU_CRITICAL_THRESHOLD) {
-                Write-DiagError "CRITICAL: CPU usage above $($CPU_CRITICAL_THRESHOLD)%!"
+                Write-DiagError "CRITICAL: CPU usage above $($CPU_CRITICAL_THRESHOLD)%! (SCOM alert at $($CPU_WARNING_THRESHOLD)%)"
             }
             elseif ($cpuPercent -gt $CPU_WARNING_THRESHOLD) {
-                Write-DiagWarning "WARNING: CPU usage above $($CPU_WARNING_THRESHOLD)%"
+                Write-DiagWarning "WARNING: CPU usage above $($CPU_WARNING_THRESHOLD)% - SCOM alert threshold"
             }
             else {
-                Write-Success "CPU usage is within normal range"
+                Write-Success "CPU usage is within normal range (below SCOM $($CPU_WARNING_THRESHOLD)% alert)"
             }
         }
     }
@@ -2491,24 +3833,143 @@ function Test-CPUUsage {
     # Reuse cached process data only if fresh (< 2 minutes old), otherwise fetch new
     $cacheAge = if ($script:LastProcessAnalysisTime) { ((Get-Date) - $script:LastProcessAnalysisTime).TotalMinutes } else { 999 }
     $processAnalysis = if ($script:LastProcessAnalysis -and $cacheAge -lt 2) { $script:LastProcessAnalysis } else { Get-ProcessAnalysis }
-    
+    Write-Info "  Description: CPU(s) = TOTAL CPU SECONDS the process has consumed since it"
+    Write-Info "                        started. This is CUMULATIVE LIFETIME usage."
+    Write-Info "                        It is NOT the same as Task Manager's 'CPU' column,"
+    Write-Info "                        which shows INSTANTANEOUS percent in the last second."
+    Write-Info "               A long-running service (AV, monitoring, WMI host) often shows"
+    Write-Info "               thousands of CPU(s) even when the server is currently idle."
+    Write-Info "               => For a real 'right-now' view, see the snapshot table below."
+
     if ($processAnalysis) {
         $processAnalysis.ByCPU | Format-Table Name, 
         @{Label = "CPU(s)"; Expression = { [math]::Round($_.CPU, 2) } },
         @{Label = "Memory(MB)"; Expression = { [math]::Round($_.WS / 1MB, 2) } },
         Id -AutoSize
     }
+
+    # ------------------------------------------------------------
+    # Live (instantaneous) per-process CPU% snapshot
+    # ------------------------------------------------------------
+    # \Process(*)\% Processor Time returns CPU% summed across ALL cores, so on a
+    # 16-core box a single fully-busy thread = 100% (one core). To match Task
+    # Manager's 0-100% view we divide by NumberOfLogicalProcessors.
+    # The first counter sample is always 0 (counter needs an interval) so we
+    # pull two samples 1 second apart and use the second one.
+    # ------------------------------------------------------------
+    Write-Section "Live CPU% Snapshot (current second, like Task Manager)"
+    Write-Info "  Description: Instantaneous %CPU sampled over a 1-second interval, then"
+    Write-Info "               normalized to total cores so 100% = the entire box is busy."
+    Write-Info "               Compare against the cumulative table above to spot the"
+    
+    Write-Info "               difference between 'historically busy' vs 'busy right now'."
+    try {
+        $cores = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).NumberOfLogicalProcessors
+        if (-not $cores -or $cores -lt 1) { $cores = 1 }
+        $samples = Get-Counter '\Process(*)\% Processor Time' -SampleInterval 1 -MaxSamples 2 -ErrorAction Stop
+        # Use the SECOND sample (first is always zero for new counter sessions)
+        $live = $samples[-1].CounterSamples |
+            Where-Object { $_.InstanceName -and $_.InstanceName -ne '_total' -and $_.InstanceName -ne 'idle' } |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    Name        = $_.InstanceName
+                    LiveCPUPct  = [math]::Round(($_.CookedValue / $cores), 1)
+                }
+            } |
+            Where-Object { $_.LiveCPUPct -gt 0 } |
+            Sort-Object LiveCPUPct -Descending |
+            Select-Object -First 10
+
+        if ($live) {
+            $live | Format-Table Name, @{ Label = 'Live CPU%'; Expression = { $_.LiveCPUPct } } -AutoSize
+            $top = $live | Select-Object -First 1
+            if ($top.LiveCPUPct -lt 1) {
+                Write-Success "  Server is currently idle (top process <1% CPU right now)"
+            }
+            elseif ($top.LiveCPUPct -gt 80) {
+                Write-DiagWarning "  '$($top.Name)' is consuming $($top.LiveCPUPct)% CPU right now - active hotspot"
+            }
+            else {
+                Write-Info "  Top live consumer: '$($top.Name)' at $($top.LiveCPUPct)% (normal range)"
+            }
+        }
+        else {
+            Write-Success "  No active per-process CPU usage detected (server is idle)"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not capture live CPU snapshot: $($_.Exception.Message)"
+        Write-Info "    (English Get-Counter strings required; on non-English Windows this may fail.)"
+    }
     
     # Check for WMI high CPU
+    # ------------------------------------------------------------
+    # WmiPrvSE.exe = WMI Provider Host. There can be MULTIPLE instances running
+    # (one per WMI namespace host process), so Get-Process returns an array.
+    # We must iterate and aggregate, not call Round() on a collection (which
+    # raises 'Cannot find an overload for Round and the argument count: 2').
+    #
+    # High WmiPrvSE CPU is usually caused by:
+    #   - A monitoring agent running expensive WMI queries (SCOM, Datadog, etc.)
+    #   - A misbehaving WMI provider DLL (look for crashes in Event Log)
+    #   - Repeated polling of slow classes (Win32_PerfRawData_*, Win32_Product)
+    # ------------------------------------------------------------
     try {
-        $wmiProcess = Get-Process -Name "WmiPrvSE" -ErrorAction SilentlyContinue
-        if ($wmiProcess) {
-            $wmiCPU = [math]::Round($wmiProcess.CPU, 2)
-            Write-Info "`nWMI Provider Host (WmiPrvSE) CPU Usage: $($wmiCPU) seconds"
-            if ($wmiCPU -gt $WMI_CPU_WARNING_SECONDS) {
-                Write-DiagWarning "WMI Provider Host is consuming significant CPU time"
-                Write-Info "Consider using WMI-specific trace: .\TSS.ps1 -UEX_WMIBase -WIN_Kernel -ETWflags 1 -WPR CPU -Perfmon UEX_WMIPrvSE -PerfIntervalSec 1 -noBasicLog"
+        $wmiProcesses = @(Get-Process -Name "WmiPrvSE" -ErrorAction SilentlyContinue)
+        if ($wmiProcesses.Count -gt 0) {
+            $totalWmiCPU = 0
+            $maxWmiCPU = 0
+            foreach ($wp in $wmiProcesses) {
+                # Defensive: .CPU can be $null for protected processes
+                $cpu = if ($null -ne $wp.CPU) { [double]$wp.CPU } else { 0 }
+                $totalWmiCPU += $cpu
+                if ($cpu -gt $maxWmiCPU) { $maxWmiCPU = $cpu }
             }
+            $totalWmiCPU = [math]::Round($totalWmiCPU, 2)
+            $maxWmiCPU = [math]::Round($maxWmiCPU, 2)
+            Write-Info "`nWMI Provider Host (WmiPrvSE): $($wmiProcesses.Count) instance(s)"
+            Write-Info "  Total CPU across instances: $totalWmiCPU seconds"
+            Write-Info "  Highest single instance:    $maxWmiCPU seconds"
+            Write-Info "    Description: WmiPrvSE hosts WMI providers. Multiple instances are"
+            Write-Info "                 normal (one per namespace). High CPU often = a chatty"
+            Write-Info "                 monitoring agent issuing expensive queries."
+
+            # Normalize cumulative CPU seconds against system uptime. Absolute
+            # threshold (e.g. 100s) trips on every server up more than a day. The
+            # real signal is sustained CPU%: warn only when WmiPrvSE has consumed
+            # >0.5% of a single core averaged over the system uptime window.
+            $uptimeSec = 0
+            try {
+                $bootTime = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).LastBootUpTime
+                if ($bootTime) { $uptimeSec = [math]::Max(((Get-Date) - $bootTime).TotalSeconds, 1) }
+            }
+            catch { $uptimeSec = 0 }
+            $sustainedPct = if ($uptimeSec -gt 0) { [math]::Round(($maxWmiCPU / $uptimeSec) * 100, 3) } else { 0 }
+            if ($uptimeSec -gt 0) { Write-Info "  Sustained CPU% (avg over $([math]::Round($uptimeSec/3600,1))h uptime): $sustainedPct% of one core" }
+
+            $isRunaway = ($maxWmiCPU -gt $WMI_CPU_WARNING_SECONDS) -and
+                         (($uptimeSec -le 0) -or ($sustainedPct -gt 0.5))
+            if ($isRunaway) {
+                Write-DiagWarning "WMI Provider Host is consuming significant CPU time (sustained $sustainedPct% of one core)"
+                Write-Info "    Likely cause: A monitoring agent (SCOM, Datadog, BMC, custom"
+                Write-Info "                  scripts) is polling WMI too aggressively, OR a"
+                Write-Info "                  provider DLL is misbehaving."
+                Write-Info "    Diagnosis: Identify the WMI client with:"
+                Write-Info "                 wmic /namespace:\\root\cimv2 path Win32_Process where 'Name=\"WmiPrvSE.exe\"' get ProcessId,CommandLine"
+                Write-Info "               Then enable WMI activity logging:"
+                Write-Info "                 wevtutil sl Microsoft-Windows-WMI-Activity/Trace /e:true"
+                Write-Info "    Remediation: Use TSS for a focused WMI trace:"
+                Write-Info "                 .\TSS.ps1 -UEX_WMIBase -WIN_Kernel -ETWflags 1 -WPR CPU -Perfmon UEX_WMIPrvSE -PerfIntervalSec 1 -noBasicLog"
+            }
+            elseif ($maxWmiCPU -gt $WMI_CPU_WARNING_SECONDS) {
+                Write-Success "WMI Provider Host total CPU is large but rate is benign ($sustainedPct% sustained over uptime)"
+            }
+            else {
+                Write-Success "WMI Provider Host CPU is within normal range"
+            }
+        }
+        else {
+            Write-Info "`nWMI Provider Host (WmiPrvSE): not currently running"
         }
     }
     catch {
@@ -2516,11 +3977,20 @@ function Test-CPUUsage {
     }
 
     # Svchost.exe Breakdown (top consumers)
+    # ------------------------------------------------------------
+    # svchost.exe (Service Host) hosts one OR many Windows services per process.
+    # On Server 2016+, services are usually 1-per-process; on 2012 R2 they share.
+    # High CPU in a svchost = the SERVICE inside it is the real culprit. We map
+    # PID -> hosted service names via Win32_Service.ProcessId.
+    # ------------------------------------------------------------
     Write-Section "Top svchost.exe Instances by CPU"
+    Write-Info "  Description: svchost hosts Windows services. CPU shown belongs to the"
+    Write-Info "               service(s) inside, not svchost itself. Investigate the named service."
     try {
         $svchosts = Get-Process -Name "svchost" -ErrorAction SilentlyContinue | Sort-Object CPU -Descending | Select-Object -First 5
         foreach ($sh in $svchosts) {
-            $cpuSec = [math]::Round($sh.CPU, 1)
+            # Defensive: .CPU can be $null for protected svchost (e.g. PPL services)
+            $cpuSec = if ($null -ne $sh.CPU) { [math]::Round($sh.CPU, 1) } else { 0 }
             $memMB = [math]::Round($sh.WorkingSet64 / 1MB, 0)
             # Try to get hosted services
             try {
@@ -2538,16 +4008,28 @@ function Test-CPUUsage {
     }
 
     # Monitoring Agent Detection
+    # ------------------------------------------------------------
+    # Common third-party monitoring agents that run as user-mode processes and
+    # are notorious for CPU storms when their config is broken or they hit a bug.
+    # If CPU per agent > MONITORING_AGENT_CPU_WARNING (50s by default), flag it.
+    # ------------------------------------------------------------
     Write-Section "Monitoring Agent CPU Check"
     $monitoringAgents = @("MonitoringHost", "HealthService", "WinCollect", "MOMAgent")
+    Write-Info "  Description: Checks well-known monitoring agents (SCOM, QRadar, etc.)"
+    Write-Info "               for runaway CPU. These agents commonly storm during config errors."
     try {
+        $foundAny = $false
         foreach ($agent in $monitoringAgents) {
             $procs = Get-Process -Name $agent -ErrorAction SilentlyContinue
             if ($procs) {
+                $foundAny = $true
                 foreach ($p in $procs) {
-                    $cpuSec = [math]::Round($p.CPU, 1)
+                    # Defensive: .CPU can be $null for protected processes
+                    $cpuSec = if ($null -ne $p.CPU) { [math]::Round($p.CPU, 1) } else { 0 }
                     if ($cpuSec -gt $MONITORING_AGENT_CPU_WARNING) {
                         Write-DiagWarning "  $($p.Name) (PID $($p.Id)): CPU=${cpuSec}s - monitoring agent CPU storm"
+                        Write-Info "      Remediation: Restart the agent service; check its config"
+                        Write-Info "                   for invalid rules; review agent vendor logs."
                     }
                     else {
                         Write-Info "  $($p.Name) (PID $($p.Id)): CPU=${cpuSec}s"
@@ -2555,21 +4037,34 @@ function Test-CPUUsage {
                 }
             }
         }
+        if (-not $foundAny) {
+            Write-Info "  No common monitoring agents detected on this server"
+        }
     }
     catch {
         Write-Verbose "Could not check monitoring agents: $($_.Exception.Message)"
     }
 
     # Java.exe High CPU
+    # ------------------------------------------------------------
+    # Java processes running as services (Tomcat, Elasticsearch, custom apps) are
+    # frequent CPU offenders due to GC storms or runaway threads. We sum CPU per
+    # PID and flag instances over JAVA_CPU_WARNING_SECONDS.
+    # ------------------------------------------------------------
     try {
         $javaProcs = Get-Process -Name "java" -ErrorAction SilentlyContinue
         if ($javaProcs) {
             Write-Section "Java Process CPU Check"
+            Write-Info "  Description: Java apps with high CPU often = GC pressure or hot threads."
+            Write-Info "               Capture a thread dump (jstack <PID>) for root cause."
             foreach ($jp in $javaProcs) {
-                $cpuSec = [math]::Round($jp.CPU, 1)
+                # Defensive: .CPU can be $null for protected processes
+                $cpuSec = if ($null -ne $jp.CPU) { [math]::Round($jp.CPU, 1) } else { 0 }
                 $memMB = [math]::Round($jp.WorkingSet64 / 1MB, 0)
                 if ($cpuSec -gt $JAVA_CPU_WARNING_SECONDS) {
                     Write-DiagWarning "  java.exe (PID $($jp.Id)): CPU=${cpuSec}s Mem=${memMB}MB - high CPU"
+                    Write-Info "      Remediation: Run 'jstack $($jp.Id) > thread-dump.txt' to capture"
+                    Write-Info "                   thread state; look for BLOCKED/RUNNABLE patterns."
                 }
                 else {
                     Write-Info "  java.exe (PID $($jp.Id)): CPU=${cpuSec}s Mem=${memMB}MB"
@@ -2582,13 +4077,29 @@ function Test-CPUUsage {
     }
 
     # Split I/O Check (storage fragmentation indicator)
+    # ------------------------------------------------------------
+    # Split I/O = a single I/O request that the storage stack had to break into
+    # multiple physical requests because the data is non-contiguous on disk.
+    # Sustained high values mean fragmentation is forcing extra CPU cycles per I/O.
+    # ------------------------------------------------------------
     Write-Section "Split I/O Check"
+    Write-Info "  Description: Split I/O = one logical I/O fragmented into multiple physical"
+    Write-Info "               I/Os due to non-contiguous data placement. Each split adds CPU."
     try {
         $splitIO = Get-Counter '\PhysicalDisk(_Total)\Split IO/sec' -ErrorAction Stop
         $splitRate = [math]::Round($splitIO.CounterSamples.CookedValue, 0)
         Write-Info "  Split IO/sec: $splitRate"
         if ($splitRate -gt $SPLIT_IO_WARNING_THRESHOLD) {
             Write-DiagWarning "  HIGH Split I/O ($splitRate/sec) - storage fragmentation may be causing extra CPU load"
+            Write-Info "    Likely cause: Heavily fragmented volume, or workload doing large"
+            Write-Info "                  non-aligned reads (databases, logs, video)."
+            Write-Info "    Remediation: For HDDs run 'defrag C: /A' to assess fragmentation,"
+            Write-Info "                 then 'defrag C: /O' to optimize. SSDs do NOT need defrag."
+            Write-Info "                 Also align partitions to 1 MB and ensure 64 KB NTFS"
+            Write-Info "                 cluster size for SQL/DB workloads."
+        }
+        else {
+            Write-Success "  Split I/O rate is within normal range"
         }
     }
     catch {
@@ -2596,8 +4107,16 @@ function Test-CPUUsage {
     }
 
     # SQL AG Replication Counters (v3.0 cluster-safe)
+    # ------------------------------------------------------------
+    # On SQL AlwaysOn Availability Group nodes, replication backlog drives CPU on
+    # the primary (compressing+sending log) and on the secondary (redoing log).
+    # Log Send Queue and Redo Queue are the two canonical AG-lag counters.
+    # ------------------------------------------------------------
     if ($script:ClusterEnv.IsAGInstalled) {
         Write-Section "SQL AG Replication Health"
+        Write-Info "  Description: Log Send Queue = primary->secondary backlog (KB)."
+        Write-Info "               Redo Queue = secondary applying received log (KB)."
+        Write-Info "               >10 MB sustained = replication lag impacting failover RTO."
         try {
             $sendQueue = Get-Counter '\SQLServer:Database Replica(*)\Log Send Queue' -ErrorAction Stop
             foreach ($sample in $sendQueue.CounterSamples) {
@@ -2605,7 +4124,11 @@ function Test-CPUUsage {
                     $queueKB = [math]::Round($sample.CookedValue, 0)
                     Write-Info "  $($sample.InstanceName): Log Send Queue = $queueKB KB"
                     if ($queueKB -gt 10240) {
-                        Write-DiagWarning "    WARNING: Log send queue >10MB - AG replication lag"
+                        Write-DiagWarning "    Log send queue >10 MB - AG replication lag"
+                        Write-Info "      Likely cause: Network bandwidth saturation between replicas,"
+                        Write-Info "                    or primary log generation > network throughput."
+                        Write-Info "      Remediation: Check network latency/throughput between nodes;"
+                        Write-Info "                   verify endpoint encryption isn't a CPU bottleneck."
                     }
                 }
             }
@@ -2620,7 +4143,11 @@ function Test-CPUUsage {
                     $redoKB = [math]::Round($sample.CookedValue, 0)
                     Write-Info "  $($sample.InstanceName): Redo Queue = $redoKB KB"
                     if ($redoKB -gt 10240) {
-                        Write-DiagWarning "    WARNING: Redo queue >10MB - secondary applying changes slowly"
+                        Write-DiagWarning "    Redo queue >10 MB - secondary applying changes slowly"
+                        Write-Info "      Likely cause: Secondary disk I/O bottleneck or contention"
+                        Write-Info "                    from read-only workload on the secondary."
+                        Write-Info "      Remediation: Check disk latency on secondary; reduce read"
+                        Write-Info "                   workload; ensure redo threads aren't blocked."
                     }
                 }
             }
@@ -2631,7 +4158,15 @@ function Test-CPUUsage {
     #region v3.0 CPU Checks
 
     # 1. Per-Core CPU Usage
+    # ------------------------------------------------------------
+    # Aggregate %CPU can look healthy (e.g. 12% on a 16-core box) while a SINGLE
+    # core is pinned at 100%. That's a single-threaded bottleneck - typical of
+    # a hot SQL query, a .NET app holding a lock, or a service pinned via
+    # ProcessorAffinity. Per-core view is the only way to spot this.
+    # ------------------------------------------------------------
     Write-Section "Per-Core CPU Usage"
+    Write-Info "  Description: Per-core %CPU. Aggregate CPU can hide a single 'hot' core"
+    Write-Info "               pinned at 100% - the classic single-threaded bottleneck signature."
     try {
         $perCore = Get-Counter '\Processor(*)\% Processor Time' -ErrorAction Stop
         $hotCores = @()
@@ -2649,7 +4184,12 @@ function Test-CPUUsage {
             foreach ($hc in $hotCores) {
                 Write-DiagWarning "    $hc"
             }
-            Write-Info "  Single-threaded bottleneck likely (SQL query, .NET app, or service pinned to one core)"
+            Write-Info "    Likely cause: Single-threaded bottleneck (SQL query plan with a"
+            Write-Info "                  blocking serial operator, .NET app on lock, or process"
+            Write-Info "                  with restricted ProcessorAffinity - see Section 15)."
+            Write-Info "    Remediation: Identify pinned process (Live CPU% Snapshot above);"
+            Write-Info "                 review SQL plan for parallelism settings (MAXDOP);"
+            Write-Info "                 check process affinity with 'Get-Process | select Name,Id,ProcessorAffinity'."
         }
         else {
             Write-Success "  No hot cores detected ($coreCount cores, all below 95%)"
@@ -2660,7 +4200,16 @@ function Test-CPUUsage {
     }
 
     # 2. Privileged vs User Time
+    # ------------------------------------------------------------
+    # %CPU is split into Kernel (Privileged) and Application (User) time.
+    #   Privileged > 30%      = something in the kernel is burning cycles. Almost
+    #                           always a driver: storage filter, NIC, AV/EDR.
+    #   User > Privileged     = normal for application servers (SQL, IIS, Java).
+    #   Privileged > User     = abnormal - investigate drivers and OS subsystems.
+    # ------------------------------------------------------------
     Write-Section "Privileged vs User Time"
+    Write-Info "  Description: %CPU split between kernel-mode (drivers, OS) and user-mode"
+    Write-Info "               (applications). Kernel > 30% almost always = a driver issue."
     try {
         $privTime = Get-Counter '\Processor(_Total)\% Privileged Time' -ErrorAction Stop
         $userTime = Get-Counter '\Processor(_Total)\% User Time' -ErrorAction Stop
@@ -2669,10 +4218,17 @@ function Test-CPUUsage {
         Write-Info "  Kernel (Privileged): $privPercent%"
         Write-Info "  Application (User):  $userPercent%"
         if ($privPercent -gt 30) {
-            Write-DiagWarning "  HIGH kernel time (>30%) — investigate storage drivers, NIC drivers, or antivirus filter drivers"
+            Write-DiagWarning "  HIGH kernel time (>30%) - investigate storage drivers, NIC drivers, or antivirus filter drivers"
+            Write-Info "    Likely cause: AV/EDR filter driver scanning every I/O, a buggy NIC"
+            Write-Info "                  driver doing excessive interrupt handling, or storage"
+            Write-Info "                  filter (deduplication, encryption) on the I/O path."
+            Write-Info "    Diagnosis: Use 'xperf -on PROC_THREAD+LOADER+DPC+INTERRUPT -stackwalk DPC+INTERRUPT'"
+            Write-Info "               (Windows Performance Toolkit) for 30 seconds and analyze in WPA."
+            Write-Info "    Remediation: Update suspect drivers; review AV exclusions for hot paths;"
+            Write-Info "                 check 'fltmc' to enumerate active filter drivers."
         }
         elseif ($privPercent -gt $userPercent -and $privPercent -gt 15) {
-            Write-DiagWarning "  Kernel time exceeds User time — driver or OS subsystem issue likely"
+            Write-DiagWarning "  Kernel time exceeds User time - driver or OS subsystem issue likely"
         }
         else {
             Write-Success "  Normal kernel/user time ratio"
@@ -2683,7 +4239,15 @@ function Test-CPUUsage {
     }
 
     # 3. Processor Queue Length
+    # ------------------------------------------------------------
+    # \System\Processor Queue Length = number of threads READY to run but waiting
+    # for a CPU to become available. Sustained queue > 2x logical processors =
+    # CPU saturation: workload exceeds capacity. This is the canonical 'CPU
+    # bottleneck' signal even when total %CPU looks fine.
+    # ------------------------------------------------------------
     Write-Section "Processor Queue Length"
+    Write-Info "  Description: # of threads waiting in line for a CPU. Threshold = 2 x cores."
+    Write-Info "               Sustained excess = CPU saturation (workload > capacity)."
     try {
         $queueLen = Get-Counter '\System\Processor Queue Length' -ErrorAction Stop
         $queue = [math]::Round($queueLen.CounterSamples.CookedValue, 0)
@@ -2691,11 +4255,14 @@ function Test-CPUUsage {
         $threshold = if ($logicalProcs) { $logicalProcs * 2 } else { 4 }
         Write-Info "  Queue Length: $queue (threshold: $threshold for $logicalProcs logical processors)"
         if ($queue -gt $threshold) {
-            Write-DiagError "  CRITICAL: Processor queue length $queue > ${threshold} — threads are waiting for CPU!"
-            Write-Info "  This server needs more CPU capacity or workload reduction"
+            Write-DiagError "  Processor queue length $queue > ${threshold} - threads are waiting for CPU (critical)"
+            Write-Info "    Impact: User-perceived response time is degrading. Every queued"
+            Write-Info "            thread is one user/transaction stalled."
+            Write-Info "    Remediation: Reduce concurrent workload, scale out, add CPU capacity,"
+            Write-Info "                 or move CPU-heavy services to a different host."
         }
         elseif ($queue -gt ($logicalProcs)) {
-            Write-DiagWarning "  WARNING: Queue length elevated ($queue) — approaching CPU saturation"
+            Write-DiagWarning "  Queue length elevated ($queue) - approaching CPU saturation"
         }
         else {
             Write-Success "  Processor queue length is healthy"
@@ -2706,17 +4273,30 @@ function Test-CPUUsage {
     }
 
     # 4. Context Switches/sec
+    # ------------------------------------------------------------
+    # Context switch = the kernel saves one thread's state and loads another.
+    # Some switching is normal. >15K/core/sec sustained = thread thrashing,
+    # often due to: too many threads vying for too few cores, lock contention,
+    # or a hypervisor with oversubscribed vCPUs (very common on VMs).
+    # ------------------------------------------------------------
     Write-Section "Context Switches"
+    Write-Info "  Description: Rate of thread context switches. Per-core thresholds:"
+    Write-Info "               > 8K/core = monitor for lock contention"
+    Write-Info "               > 15K/core = thread thrashing or hypervisor oversubscription"
     try {
         $ctxSwitches = Get-Counter '\System\Context Switches/sec' -ErrorAction Stop
         $ctxRate = [math]::Round($ctxSwitches.CounterSamples.CookedValue, 0)
         $perCoreRate = if ($logicalProcs -and $logicalProcs -gt 0) { [math]::Round($ctxRate / $logicalProcs, 0) } else { $ctxRate }
         Write-Info "  Context Switches/sec: $ctxRate (${perCoreRate}/core)"
         if ($perCoreRate -gt 15000) {
-            Write-DiagWarning "  HIGH context switching (>15K/core) — thread contention, excessive threads, or hypervisor scheduling"
+            Write-DiagWarning "  HIGH context switching (>15K/core) - thread contention, excessive threads, or hypervisor scheduling"
+            Write-Info "    Likely cause: Too many runnable threads (check 'System Threads' below),"
+            Write-Info "                  lock contention, or VM running on oversubscribed host."
+            Write-Info "    Remediation: Reduce thread pool sizes; check for spinlock contention"
+            Write-Info "                 with WPA; if VM, verify host CPU ratio is < 4:1."
         }
         elseif ($perCoreRate -gt 8000) {
-            Write-DiagWarning "  Elevated context switching (>8K/core) — monitor for lock contention"
+            Write-DiagWarning "  Elevated context switching (>8K/core) - monitor for lock contention"
         }
         else {
             Write-Success "  Context switch rate is normal"
@@ -2727,7 +4307,17 @@ function Test-CPUUsage {
     }
 
     # 5. Interrupt & DPC Time
+    # ------------------------------------------------------------
+    # %Interrupt Time = CPU spent servicing hardware interrupts (NIC RX, disk IRQ).
+    # %DPC Time       = CPU spent in Deferred Procedure Calls (driver follow-up
+    #                    work scheduled from interrupt context).
+    # Both are KERNEL-MODE work driven by drivers. > 15% sustained = a driver is
+    # in trouble (NIC firmware bug, storage driver issue, or storm of interrupts).
+    # On Hyper-V hosts, vmswitch and storage VSPs are common offenders.
+    # ------------------------------------------------------------
     Write-Section "Interrupt & DPC Time"
+    Write-Info "  Description: %CPU spent in hardware interrupts and driver DPCs. High"
+    Write-Info "               values = a driver (usually NIC or storage) is misbehaving."
     try {
         $intTime = Get-Counter '\Processor(_Total)\% Interrupt Time' -ErrorAction Stop
         $dpcTime = Get-Counter '\Processor(_Total)\% DPC Time' -ErrorAction Stop
@@ -2736,11 +4326,18 @@ function Test-CPUUsage {
         Write-Info "  Interrupt Time: $intPercent%"
         Write-Info "  DPC Time: $dpcPercent%"
         if ($intPercent -gt 15 -or $dpcPercent -gt 15) {
-            Write-DiagError "  CRITICAL: High interrupt/DPC time — NIC driver, storage driver, or hardware issue"
-            Write-Info "  On Hyper-V hosts, check vmswitch and storage subsystem"
+            Write-DiagError "  High interrupt/DPC time - NIC driver, storage driver, or hardware issue (critical)"
+            Write-Info "    Impact: All other CPU work competes with driver work. User-mode"
+            Write-Info "            apps (SQL, IIS) get less CPU even at moderate %CPU figures."
+            Write-Info "    Diagnosis: Use 'xperf -on Base+Interrupt+DPC -stackwalk DPC+ISR'"
+            Write-Info "               for 30 seconds; analyze top DPC modules in WPA."
+            Write-Info "               On Hyper-V hosts also check vmswitch and storage VSPs."
+            Write-Info "    Remediation: Update NIC and storage drivers; enable RSS on NIC;"
+            Write-Info "                 check NIC firmware advisories; if VM, ensure SR-IOV"
+            Write-Info "                 or VMQ is correctly configured on the host."
         }
         elseif ($intPercent -gt 5 -or $dpcPercent -gt 5) {
-            Write-DiagWarning "  Elevated interrupt/DPC time — investigate NIC RSS settings and storage drivers"
+            Write-DiagWarning "  Elevated interrupt/DPC time - investigate NIC RSS settings and storage drivers"
         }
         else {
             Write-Success "  Interrupt and DPC time are normal"
@@ -2751,17 +4348,30 @@ function Test-CPUUsage {
     }
 
     # 6. System Uptime & Last Boot
+    # ------------------------------------------------------------
+    # Long uptime is a double-edged sword: stable, but accumulates kernel timer
+    # drift, memory fragmentation, leaked pool/handles, and unpatched OS bugs.
+    # > 90 days   : schedule a maintenance reboot
+    # > 180 days  : critical - kernel timer drift and resource leaks become real
+    # ------------------------------------------------------------
     Write-Section "System Uptime"
+    Write-Info "  Description: Days since last boot. Long uptime = unpatched kernel CVEs,"
+    Write-Info "               accumulated leaked pool/handles, and possible timer drift."
     try {
         $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
         $uptime = (Get-Date) - $os.LastBootUpTime
         Write-Info "  Last Boot: $($os.LastBootUpTime.ToString('yyyy-MM-dd HH:mm:ss'))"
         Write-Info "  Uptime: $($uptime.Days) days, $($uptime.Hours) hours"
         if ($uptime.TotalDays -gt 180) {
-            Write-DiagError "  Server running for $([math]::Round($uptime.TotalDays, 0)) days — kernel timer drift and memory fragmentation risk"
+            Write-DiagError "  Server running for $([math]::Round($uptime.TotalDays, 0)) days - kernel timer drift and memory fragmentation risk"
+            Write-Info "    Remediation: Schedule a maintenance reboot. Apply pending Windows"
+            Write-Info "                 Updates first, then reboot to clear kernel/pool state."
         }
         elseif ($uptime.TotalDays -gt 90) {
-            Write-DiagWarning "  Server running for $([math]::Round($uptime.TotalDays, 0)) days — consider scheduling maintenance reboot"
+            Write-DiagWarning "  Server running for $([math]::Round($uptime.TotalDays, 0)) days - consider scheduling maintenance reboot"
+        }
+        else {
+            Write-Success "  Uptime is within healthy range"
         }
     }
     catch {
@@ -2769,14 +4379,29 @@ function Test-CPUUsage {
     }
 
     # 7. Power Throttling Detection
+    # ------------------------------------------------------------
+    # \Processor Information(_Total)\% Processor Performance = current clock as %
+    # of nominal max. < 95% means the CPU is NOT running at full speed. Causes:
+    #   - Power plan = Balanced/PowerSaver (most common, easiest fix)
+    #   - Thermal throttling (server overheating - check IPMI/iLO/iDRAC)
+    #   - VM host CPU overcommit (hypervisor capping vCPU clock)
+    #   - Intel SpeedStep / AMD Cool'n'Quiet aggressive scaling
+    # ------------------------------------------------------------
     Write-Section "CPU Power Throttling"
+    Write-Info "  Description: Current CPU clock as % of nominal max. <95% = throttled."
+    Write-Info "               Causes: power plan, thermal limits, or hypervisor overcommit."
     try {
         $perfPercent = Get-Counter '\Processor Information(_Total)\% Processor Performance' -ErrorAction Stop
         $perfVal = [math]::Round($perfPercent.CounterSamples.CookedValue, 1)
         Write-Info "  Processor Performance: $perfVal%"
         if ($perfVal -lt 80) {
-            Write-DiagError "  CPU THROTTLED to $perfVal% — check power plan, thermal throttling, or VM host overcommit"
-            Write-Info "  Set power plan to High Performance: powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+            Write-DiagError "  CPU THROTTLED to $perfVal% - check power plan, thermal throttling, or VM host overcommit"
+            Write-Info "    Impact: Effectively running on slower CPU - all latency-sensitive"
+            Write-Info "            workloads (SQL, IIS, AD) will appear sluggish."
+            Write-Info "    Remediation: Set power plan to High Performance:"
+            Write-Info "                 powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+            Write-Info "                 Then check BIOS power profile (set to 'Max Performance'),"
+            Write-Info "                 and verify server intake temp via iLO/iDRAC/IPMI."
         }
         elseif ($perfVal -lt 95) {
             Write-DiagWarning "  CPU performance at $perfVal% (not running at full speed)"
@@ -2797,7 +4422,16 @@ function Test-CPUUsage {
     }
 
     # 8. Antivirus / Filter Driver CPU Detection
+    # ------------------------------------------------------------
+    # Modern AV/EDR is the #1 source of mysterious CPU on enterprise servers.
+    # Each agent registers a file system filter driver (high altitude) that sees
+    # every I/O. Misconfigured exclusions cause it to scan the same hot files
+    # repeatedly. Symantec ccSvcHst, CrowdStrike CSFalconService, Defender
+    # MsMpEng are the usual suspects.
+    # ------------------------------------------------------------
     Write-Section "Antivirus & Security Agent CPU"
+    Write-Info "  Description: Per-agent cumulative CPU. >300s consistently = a scan loop or"
+    Write-Info "               missing exclusion (DB files, log dirs, IIS temp paths)."
     try {
         $avProcesses = @(
             @{ Name = "MsMpEng"; Label = "Windows Defender" },
@@ -2814,18 +4448,31 @@ function Test-CPUUsage {
             @{ Name = "ds_agent"; Label = "Trend Micro Deep Security" }
         )
         $avFound = $false
+        $highCpuFound = $false
         foreach ($av in $avProcesses) {
             $procs = Get-Process -Name $av.Name -ErrorAction SilentlyContinue
             if ($procs) {
                 $avFound = $true
                 foreach ($p in $procs) {
-                    $cpuSec = [math]::Round($p.CPU, 1)
+                    # Defensive: .CPU can be $null for protected AV processes (PPL)
+                    $cpuSec = if ($null -ne $p.CPU) { [math]::Round($p.CPU, 1) } else { 0 }
                     $memMB = [math]::Round($p.WorkingSet64 / 1MB, 0)
                     $indicator = ""
-                    if ($cpuSec -gt 300) { $indicator = " [HIGH CPU - investigate exclusions]" }
+                    if ($cpuSec -gt 300) {
+                        $indicator = " [HIGH CPU - investigate exclusions]"
+                        $highCpuFound = $true
+                    }
                     Write-Info "  $($av.Label) ($($p.Name), PID $($p.Id)): CPU=${cpuSec}s Mem=${memMB}MB$indicator"
                 }
             }
+        }
+        if ($highCpuFound) {
+            Write-Info "    Remediation: Review exclusions per vendor + Microsoft guidance:"
+            Write-Info "                 - SQL data/log files and tempdb"
+            Write-Info "                 - IIS log + temp directories"
+            Write-Info "                 - Cluster CSV mount points"
+            Write-Info "                 - Backup staging folders"
+            Write-Info "                 Also disable on-access scanning of pagefile.sys."
         }
         if (-not $avFound) {
             Write-Info "  No known AV/security agent processes detected"
@@ -2853,7 +4500,15 @@ function Test-CPUUsage {
     }
 
     # 9. Hyper-V Hypervisor Overhead
+    # ------------------------------------------------------------
+    # On Hyper-V hosts, %Total Run Time = combined guest + hypervisor activity.
+    # %Hypervisor Run Time alone (>5%) means the host kernel is spending notable
+    # cycles on hypervisor work itself - typically NUMA spanning, too many vCPUs
+    # per LP, or root-partition driver overhead. This is invisible inside guests.
+    # ------------------------------------------------------------
     Write-Section "Hyper-V Hypervisor Overhead"
+    Write-Info "  Description: On a Hyper-V host, this shows what % of CPU is consumed by"
+    Write-Info "               the hypervisor itself vs guest VMs. >5% overhead = problem."
     try {
         $hvSvc = Get-Service -Name "vmms" -ErrorAction SilentlyContinue
         if ($null -ne $hvSvc -and $hvSvc.Status -eq "Running") {
@@ -2867,7 +4522,12 @@ function Test-CPUUsage {
                     $ohPercent = [math]::Round($hvOverhead.CounterSamples.CookedValue, 2)
                     Write-Info "  Hypervisor Overhead: $ohPercent%"
                     if ($ohPercent -gt 5) {
-                        Write-DiagWarning "  HIGH hypervisor overhead (>5%) — too many VMs or NUMA misconfiguration"
+                        Write-DiagWarning "  HIGH hypervisor overhead (>5%) - too many VMs or NUMA misconfiguration"
+                        Write-Info "    Likely cause: Too many vCPUs per logical processor, NUMA spanning,"
+                        Write-Info "                  or a chatty integration component (KVP, Heartbeat)."
+                        Write-Info "    Remediation: Review VM:LP ratio (target <= 4:1 for balanced load),"
+                        Write-Info "                 align VMs to NUMA nodes, disable unused integration"
+                        Write-Info "                 services on idle VMs."
                     }
                 }
 
@@ -2889,7 +4549,16 @@ function Test-CPUUsage {
     }
 
     # 10. Process CPU Time Trend (two-sample snapshot)
+    # ------------------------------------------------------------
+    # Wider-window companion to the 'Live CPU% Snapshot' above. Samples
+    # TotalProcessorTime per process at T+0 and T+5s, then computes the delta.
+    # Catches bursty processes that the 1-second snapshot might miss.
+    # NOTE: ApproxPct is % of ONE core (not normalized) - a value > 100 means
+    # the process used multiple cores during the sample window.
+    # ------------------------------------------------------------
     Write-Section "Real-Time Process CPU (5-second sample)"
+    Write-Info "  Description: Wider-window CPU sampler. ApproxPct = % of ONE core averaged"
+    Write-Info "               over 5s; values > 100% indicate multi-core usage in the window."
     try {
         Write-Info "  Sampling CPU usage over 5 seconds..."
         $snapshot1 = Get-Process -ErrorAction Stop | Where-Object { $_.Id -ne 0 } |
@@ -2906,9 +4575,9 @@ function Test-CPUUsage {
                     # Approximate % of one core over 5 seconds (5000ms)
                     $cpuPctApprox = [math]::Round(($cpuDelta / 5000) * 100, 1)
                     [PSCustomObject]@{
-                        Name   = $p2.Name
-                        PID    = $p2.Id
-                        DeltaMs = [math]::Round($cpuDelta, 0)
+                        Name      = $p2.Name
+                        PID       = $p2.Id
+                        DeltaMs   = [math]::Round($cpuDelta, 0)
                         ApproxPct = $cpuPctApprox
                     }
                 }
@@ -2918,8 +4587,11 @@ function Test-CPUUsage {
         if ($topDelta) {
             Write-Info "  Top 10 processes by CURRENT CPU usage (last 5s):"
             foreach ($td in $topDelta) {
-                Write-Info "    $($td.Name) (PID $($td.PID)): ${($td.DeltaMs)}ms (~$($td.ApproxPct)% of 1 core)"
+                Write-Info "    $($td.Name) (PID $($td.PID)): $($td.DeltaMs)ms (~$($td.ApproxPct)% of 1 core)"
             }
+        }
+        else {
+            Write-Success "  No processes consumed measurable CPU in the 5-second window"
         }
     }
     catch {
@@ -2927,7 +4599,15 @@ function Test-CPUUsage {
     }
 
     # 11. System Threads & Process Count
+    # ------------------------------------------------------------
+    # Healthy server: typically < 2000 threads, < 200 processes.
+    # Thread count > 5000 = approaching the kernel's per-process and per-system
+    # thread quotas. Often caused by a thread-pool leak in a .NET / Java service.
+    # Process count > 500 = runaway scheduled tasks or a service forking subprocs.
+    # ------------------------------------------------------------
     Write-Section "System Thread & Process Count"
+    Write-Info "  Description: System-wide thread + process totals. Excessive counts ="
+    Write-Info "               a service is leaking threads or spawning runaway children."
     try {
         $sysThreads = Get-Counter '\System\Threads' -ErrorAction Stop
         $sysProcesses = Get-Counter '\System\Processes' -ErrorAction Stop
@@ -2936,10 +4616,17 @@ function Test-CPUUsage {
         Write-Info "  Total Threads: $threadCount"
         Write-Info "  Total Processes: $processCount"
         if ($threadCount -gt 5000) {
-            Write-DiagWarning "  HIGH thread count ($threadCount) — approaching kernel resource limits"
+            Write-DiagWarning "  HIGH thread count ($threadCount) - approaching kernel resource limits"
+            Write-Info "    Remediation: Cross-reference 'Top Processes by Thread Count' from the"
+            Write-Info "                 Memory section to identify the leaker; restart that service."
         }
         if ($processCount -gt 500) {
-            Write-DiagWarning "  HIGH process count ($processCount) — investigate runaway services or scheduled tasks"
+            Write-DiagWarning "  HIGH process count ($processCount) - investigate runaway services or scheduled tasks"
+            Write-Info "    Remediation: Run 'Get-Process | Group-Object Name | Sort-Object Count -Descending'"
+            Write-Info "                 to find processes with many instances; check Task Scheduler."
+        }
+        if ($threadCount -le 5000 -and $processCount -le 500) {
+            Write-Success "  Thread and process counts are within healthy range"
         }
     }
     catch {
@@ -2947,7 +4634,16 @@ function Test-CPUUsage {
     }
 
     # 12. DPC Queue Rate
+    # ------------------------------------------------------------
+    # DPCs Queued/sec = how often drivers are deferring work from interrupt
+    # context. Normal values are usually < 1000 per core. > 5000/core sustained
+    # indicates a driver storm - often a NIC under heavy traffic or a storage
+    # adapter with a misconfigured queue depth.
+    # ------------------------------------------------------------
     Write-Section "DPC Queue Rate"
+    Write-Info "  Description: Rate at which drivers queue Deferred Procedure Calls."
+    Write-Info "               Companion metric to '%DPC Time' - tracks the FREQUENCY"
+    Write-Info "               of driver follow-up work, not the cycles consumed."
     try {
         $dpcQueued = Get-Counter '\Processor(_Total)\DPCs Queued/sec' -ErrorAction Stop
         $dpcRate = [math]::Round($dpcQueued.CounterSamples.CookedValue, 0)
@@ -2955,7 +4651,14 @@ function Test-CPUUsage {
         $perCoreDPC = if ($logicalProcs -and $logicalProcs -gt 0) { [math]::Round($dpcRate / $logicalProcs, 0) } else { $dpcRate }
         Write-Info "  Per-core DPC rate: $perCoreDPC/sec"
         if ($perCoreDPC -gt 5000) {
-            Write-DiagWarning "  HIGH DPC rate (>5K/core) — NIC or storage driver processing bottleneck"
+            Write-DiagWarning "  HIGH DPC rate (>5K/core) - NIC or storage driver processing bottleneck"
+            Write-Info "    Likely cause: NIC under heavy traffic without RSS, storage HBA queue"
+            Write-Info "                  depth too small, or AV driver intercepting every I/O."
+            Write-Info "    Remediation: Enable RSS on NIC (Set-NetAdapterRss); raise storport"
+            Write-Info "                 queue depth; capture xperf trace to identify top driver."
+        }
+        else {
+            Write-Success "  DPC queue rate is normal"
         }
     }
     catch {
@@ -2963,7 +4666,16 @@ function Test-CPUUsage {
     }
 
     # 13. NUMA Node Imbalance
+    # ------------------------------------------------------------
+    # NUMA = Non-Uniform Memory Access. On multi-socket servers each CPU has
+    # its own attached memory bank ('local'). Accessing the OTHER socket's
+    # memory ('remote') costs 1.5-2x more cycles. If processes are pinned
+    # to one node but use memory on another, you pay this penalty silently.
+    # >20% memory imbalance between nodes = NUMA-unaware workload placement.
+    # ------------------------------------------------------------
     Write-Section "NUMA Node Analysis"
+    Write-Info "  Description: Memory distribution across NUMA nodes. Imbalance = some"
+    Write-Info "               processes are using REMOTE memory (1.5-2x slower than local)."
     try {
         $numaNodes = Get-Counter '\NUMA Node Memory(*)\Total MBytes' -ErrorAction Stop
         $nodeData = @()
@@ -2986,7 +4698,11 @@ function Test-CPUUsage {
                 $imbalance = [math]::Round((($maxMB - $minMB) / $maxMB) * 100, 1)
                 if ($imbalance -gt 20) {
                     Write-DiagWarning "  NUMA imbalance: $imbalance% memory difference between nodes"
-                    Write-Info "  Processes may be hitting remote NUMA memory, causing hidden CPU penalties"
+                    Write-Info "    Likely cause: Workload not NUMA-aware. SQL Server, IIS app pools,"
+                    Write-Info "                  and Hyper-V VMs need explicit NUMA configuration."
+                    Write-Info "    Remediation: For SQL Server set 'soft-NUMA' or align affinity;"
+                    Write-Info "                 for IIS use 'Enable NUMA' in app pool advanced settings;"
+                    Write-Info "                 for Hyper-V align VM size to a single NUMA node when possible."
                 }
                 else {
                     Write-Success "  NUMA memory balanced (${imbalance}% difference)"
@@ -2994,7 +4710,7 @@ function Test-CPUUsage {
             }
         }
         elseif ($nodeData.Count -eq 1) {
-            Write-Info "  Single NUMA node ($($nodeData[0].TotalMB) MB) — no imbalance possible"
+            Write-Info "  Single NUMA node ($($nodeData[0].TotalMB) MB) - no imbalance possible"
         }
     }
     catch {
@@ -3002,7 +4718,17 @@ function Test-CPUUsage {
     }
 
     # 14. CPU-Related Event Log Entries
+    # ------------------------------------------------------------
+    # Event ID reference (CPU/hardware related):
+    #   17  - WHEA-Logger : Machine check exception (severe CPU error)
+    #   19  - WHEA-Logger : Corrected hardware error (CPU/memory ECC corrected)
+    #   47  - WHEA-Logger : Fatal hardware error (CPU/memory uncorrected)
+    # WHEA = Windows Hardware Error Architecture. Even 'corrected' errors mean
+    # silicon is degrading - Event 19 today often becomes Event 47 tomorrow.
+    # ------------------------------------------------------------
     Write-Section "CPU-Related Events (last 7 days)"
+    Write-Info "  Description: WHEA hardware errors + processor power events. WHEA = early"
+    Write-Info "               warning that CPU/memory/PCIe silicon is degrading."
     try {
         # WHEA hardware errors (CPU/memory correctable and uncorrectable)
         $wheaEvents = Get-WinEvent -FilterHashtable @{
@@ -3022,27 +4748,76 @@ function Test-CPUUsage {
                 }
                 Write-DiagError "    Event $($_.Name) ($desc): $($_.Count) occurrence(s)"
             }
-            Write-Info "  WHEA errors indicate CPU, memory, or PCIe hardware degradation"
+            Write-Info "    Impact: Hardware is degrading. Corrected errors today predict"
+            Write-Info "            uncorrected errors (BSOD) tomorrow. Schedule diagnostics."
+            Write-Info "    Remediation: Open vendor case (Dell SupportAssist, HPE ActiveHealth);"
+            Write-Info "                 run BIOS-level CPU/memory diagnostics from iLO/iDRAC;"
+            Write-Info "                 plan hardware replacement if correlations point to one DIMM/CPU."
         }
         else {
             Write-Success "  No WHEA hardware errors"
         }
 
-        # Thermal throttling / processor speed change
-        $thermalEvents = Get-WinEvent -FilterHashtable @{
+        # ----- Kernel-Processor-Power events (filtered to exclude informational noise) -----
+        # ------------------------------------------------------------
+        # IMPORTANT: Microsoft-Windows-Kernel-Processor-Power emits MANY purely
+        # informational events at every boot. We MUST split by Event ID to avoid
+        # false positives.
+        #
+        #   Informational (fires every boot, IGNORE):
+        #     55  - Processor capability enumeration (one event per logical proc).
+        #           "Processor X in group 0 exposes the following power management
+        #           capabilities". Max/Min perf % = 100 means CPU LOCKED AT FULL SPEED.
+        #     56  - Idle state info / power source change announcement.
+        #    100  - Power source change (AC/DC) — not relevant on servers.
+        #    101  - Power source change details.
+        #
+        #   Noteworthy (actual throttle / parking events):
+        #     35  - Processor parked
+        #     37  - Processor performance throttle
+        #     38  - Processor performance state change
+        #     39  - Processor performance throttle ceiling lowered
+        #    121  - Throttling has occurred (thermal or PPM)
+        #    125  - Processor performance state lowered (sustained)
+        # ------------------------------------------------------------
+        $infoOnlyKpp = @(55, 56, 100, 101)
+        $noteworthyKpp = @(35, 37, 38, 39, 121, 125)
+        $allKppEvents = Get-WinEvent -FilterHashtable @{
             LogName      = 'System'
             ProviderName = 'Microsoft-Windows-Kernel-Processor-Power'
             StartTime    = (Get-Date).AddDays(-7)
-        } -MaxEvents 10 -ErrorAction SilentlyContinue
+        } -MaxEvents 50 -ErrorAction SilentlyContinue
 
-        if ($thermalEvents) {
-            Write-DiagWarning "  Kernel-Processor-Power events: $($thermalEvents.Count)"
-            $thermalEvents | Select-Object -First 3 | ForEach-Object {
-                Write-Info "    [$($_.TimeCreated.ToString('MM-dd HH:mm'))] ID:$($_.Id) $(Get-EventSnippet -Event $_ -MaxLength 100)"
+        if ($allKppEvents) {
+            $noteworthyEvents = @($allKppEvents | Where-Object { $noteworthyKpp -contains $_.Id })
+            $infoEvents       = @($allKppEvents | Where-Object { $infoOnlyKpp   -contains $_.Id })
+            $otherEvents      = @($allKppEvents | Where-Object { ($noteworthyKpp + $infoOnlyKpp) -notcontains $_.Id })
+
+            if ($noteworthyEvents.Count -gt 0) {
+                Write-DiagWarning "  Processor power/throttle events: $($noteworthyEvents.Count)"
+                Write-Info "    Description: Actual throttle or parking events. Frequent occurrences ="
+                Write-Info "                 inadequate cooling or aggressive power saving"
+                Write-Info "                 (see 'CPU Power Throttling' section above)."
+                $noteworthyEvents | Select-Object -First 3 | ForEach-Object {
+                    Write-Info "    [$($_.TimeCreated.ToString('MM-dd HH:mm'))] ID:$($_.Id) $(Get-EventSnippet -Event $_ -MaxLength 100)"
+                }
+            }
+            else {
+                Write-Success "  No processor throttling or parking events"
+            }
+
+            if ($infoEvents.Count -gt 0) {
+                $idSummary = ($infoEvents | Group-Object Id | ForEach-Object { "ID:$($_.Name)=$($_.Count)" }) -join ', '
+                Write-Info "  ($($infoEvents.Count) informational Kernel-Processor-Power events: $idSummary"
+                Write-Info "   - capability enumeration / power source notes; fires at every boot, not a problem)"
+            }
+            if ($otherEvents.Count -gt 0) {
+                $otherSummary = ($otherEvents | Group-Object Id | ForEach-Object { "ID:$($_.Name)=$($_.Count)" }) -join ', '
+                Write-Info "  (Other Kernel-Processor-Power events: $otherSummary — not classified)"
             }
         }
         else {
-            Write-Success "  No processor power/thermal events"
+            Write-Success "  No processor power events"
         }
     }
     catch {
@@ -3050,7 +4825,16 @@ function Test-CPUUsage {
     }
 
     # 15. Process CPU Affinity Check
+    # ------------------------------------------------------------
+    # Default: every process can use every logical processor (full affinity mask).
+    # If a process has been deliberately PINNED to a subset of cores (via
+    # ProcessorAffinity, 'start /affinity', or service config), it artificially
+    # caps its own CPU - even when other cores are idle. Common with legacy apps,
+    # licensing workarounds, or accidentally-set values that nobody remembers.
+    # ------------------------------------------------------------
     Write-Section "Process CPU Affinity"
+    Write-Info "  Description: Lists processes pinned to a SUBSET of cores. Restricted"
+    Write-Info "               affinity caps CPU even when other cores are idle."
     try {
         $affinityIssues = @()
         # Calculate full affinity mask for this system
@@ -3076,7 +4860,11 @@ function Test-CPUUsage {
             foreach ($ai in $affinityIssues) {
                 Write-DiagWarning "  $ai"
             }
-            Write-Info "  Restricted affinity limits available CPU and can cause bottlenecks"
+            Write-Info "    Likely cause: Service configured with explicit affinity, legacy"
+            Write-Info "                  licensing constraint, or 'start /affinity' invocation."
+            Write-Info "    Remediation: Reset affinity via Task Manager > Details > right-click"
+            Write-Info "                 process > Set Affinity > All Processors. For services,"
+            Write-Info "                 review service binary path and registry ImagePath."
         }
         else {
             Write-Success "  No processes with restricted CPU affinity (all using full core set)"
@@ -3217,20 +5005,51 @@ function Test-DiskPerformance {
     }
     
     # Logical disk space
+    # ------------------------------------------------------------
+    # Free space below 20% triggers performance degradation:
+    # - NTFS becomes more fragmented (file allocations bounce around)
+    # - VSS snapshots may auto-delete to make room
+    # - VMs running on this volume can pause-critical at 100% full
+    # - SQL Server autogrow events become slow & blocking
+    # ------------------------------------------------------------
     Write-Section "Logical Disk Space"
+    Write-Info "  Description: Free-space % per drive. SCOM alert thresholds:"
+    Write-Info "               System drive ($($DISK_SYSTEM_WARNING_THRESHOLD)% used) | Non-system drive ($($DISK_NONSYSTEM_WARNING_THRESHOLD)% used)."
+    Write-Info "               In-script CRITICAL fires at $($DISK_SYSTEM_CRITICAL_THRESHOLD)% used (above SCOM)."
     if ($cachedVolumes) {
+        # System drive identified once via $env:SystemDrive (handles non-C: OS installs).
+        $systemDriveLetter = ($env:SystemDrive -replace ':', '').Trim()
         foreach ($vol in $cachedVolumes) {
             if ($vol.Size -le 0) { continue }
+            # Skip mount-point-only volumes / volumes without a drive letter.
+            if (-not $vol.DriveLetter) { continue }
+
             $usedSpace = $vol.Size - $vol.SizeRemaining
             $usedPercent = [math]::Round(($usedSpace / $vol.Size) * 100, 2)
             $freeGB = [math]::Round($vol.SizeRemaining / 1GB, 2)
-            
-            Write-Info "  Drive $($vol.DriveLetter): - $($usedPercent)% used - $($freeGB) GB free"
-            if ($usedPercent -gt $DISK_CRITICAL_THRESHOLD) {
-                Write-DiagError "    CRITICAL: Less than 10% free space!"
+
+            $isSystemDrive = ($vol.DriveLetter -eq $systemDriveLetter)
+            if ($isSystemDrive) {
+                $crit = $DISK_SYSTEM_CRITICAL_THRESHOLD
+                $warn = $DISK_SYSTEM_WARNING_THRESHOLD
+                $roleLabel = "system"
             }
-            elseif ($usedPercent -gt $DISK_WARNING_THRESHOLD) {
-                Write-DiagWarning "    WARNING: Less than 20% free space"
+            else {
+                $crit = $DISK_NONSYSTEM_CRITICAL_THRESHOLD
+                $warn = $DISK_NONSYSTEM_WARNING_THRESHOLD
+                $roleLabel = "data"
+            }
+
+            Write-Info "  Drive $($vol.DriveLetter): ($roleLabel) - $($usedPercent)% used - $($freeGB) GB free  [SCOM alert >= $($warn)%]"
+            if ($usedPercent -gt $crit) {
+                Write-DiagError "    Above $($crit)% used on $roleLabel drive (critical; SCOM alert at $($warn)%)"
+                Write-Info "      Impact: VSS snapshots may auto-delete; VMs risk pause-critical;"
+                Write-Info "              NTFS performance degrades; backups may fail."
+                Write-Info "      Remediation: Free space (cleanmgr.exe), expand volume, move data,"
+                Write-Info "                   or relocate page/log/temp files to another drive."
+            }
+            elseif ($usedPercent -gt $warn) {
+                Write-DiagWarning "    Above $($warn)% used on $roleLabel drive - SCOM alert threshold (schedule cleanup or expansion)"
             }
         }
     }
@@ -3239,7 +5058,17 @@ function Test-DiskPerformance {
     }
     
     # Disk latency check
+    # ------------------------------------------------------------
+    # \PhysicalDisk(*)\Avg. Disk sec/Read = average time per READ I/O request
+    # (in SECONDS, hence multiply by 1000 for ms). Sustained:
+    #   < 10 ms : healthy
+    #   10-20 ms: acceptable for HDD, slow for SSD
+    #   20-50 ms: real bottleneck - investigate queue depth, AV, or contention
+    #   > 50 ms : critical - SAN, fabric, driver, or failing media
+    # ------------------------------------------------------------
     Write-Section "Disk Latency (avg over last few seconds)"
+    Write-Info "  Description: Average READ latency per disk in milliseconds. The single"
+    Write-Info "               most predictive metric for storage health & app responsiveness."
     try {
         $diskReadLatency = Get-Counter '\PhysicalDisk(*)\Avg. Disk sec/Read' -ErrorAction Stop
         
@@ -3250,16 +5079,21 @@ function Test-DiskPerformance {
                     Write-Info "  Read Latency - $($sample.InstanceName): $($latencyMs) ms"
                     
                     if ($latencyMs -gt $DISK_LATENCY_CRITICAL_MS) {
-                        Write-DiagError "    CRITICAL: Serious I/O bottleneck (>$($DISK_LATENCY_CRITICAL_MS)ms)"
+                        Write-DiagError "    Serious I/O bottleneck (>$($DISK_LATENCY_CRITICAL_MS) ms read latency)"
+                        Write-Info "      Likely cause: Failing media, saturated SAN/fabric, AV/EDR scanning"
+                        Write-Info "                    every I/O, deep queue depth, or noisy-neighbor on shared storage."
+                        Write-Info "      Remediation: Check SMART (Section 'Disk Health'); review filter drivers"
+                        Write-Info "                   (Section 'File System Filter Drivers'); contact SAN team for"
+                        Write-Info "                   queue/lun analysis; verify MPIO paths are all active."
                     }
                     elseif ($latencyMs -gt $DISK_LATENCY_WARNING_MS) {
-                        Write-DiagWarning "    WARNING: Slow, needs attention ($($DISK_LATENCY_WARNING_MS)-$($DISK_LATENCY_CRITICAL_MS)ms)"
+                        Write-DiagWarning "    Slow, needs attention ($($DISK_LATENCY_WARNING_MS)-$($DISK_LATENCY_CRITICAL_MS) ms read latency)"
                     }
                     elseif ($latencyMs -gt $DISK_LATENCY_ACCEPTABLE_MS) {
-                        Write-Info "    INFO: Acceptable ($($DISK_LATENCY_ACCEPTABLE_MS)-$($DISK_LATENCY_WARNING_MS)ms)"
+                        Write-Info "    Acceptable ($($DISK_LATENCY_ACCEPTABLE_MS)-$($DISK_LATENCY_WARNING_MS) ms)"
                     }
                     else {
-                        Write-Success "    GOOD: Very good (<$($DISK_LATENCY_ACCEPTABLE_MS)ms)"
+                        Write-Success "    Very good (<$($DISK_LATENCY_ACCEPTABLE_MS) ms)"
                     }
                 }
             }
@@ -3270,7 +5104,30 @@ function Test-DiskPerformance {
     }
     
     # Check cluster size for volumes (reuses cached $cachedVolumes)
+    # ------------------------------------------------------------
+    # NTFS allocation unit (cluster) size = the smallest chunk of disk the FS
+    # tracks. Default = 4 KB. For SQL Server / database volumes, Microsoft
+    # recommends 64 KB because:
+    # - SQL reads/writes data in 8 KB pages and 64 KB extents
+    # - Larger clusters reduce metadata overhead on huge files
+    # - Aligns with SAN array stripe sizes
+    # Cannot be changed in-place; requires reformat.
+    # ------------------------------------------------------------
     Write-Section "Cluster Size (should be 64KB for databases)"
+    Write-Info "  Description: NTFS allocation unit size. Default 4 KB is fine for general"
+    
+    Write-Info "               workloads. SQL/database volumes should be 64 KB (matches SQL"
+    Write-Info "               extent size + reduces metadata overhead). Set at format time only."
+
+    # Only emit the 64KB warning when this server actually runs a database
+    # workload (SQL Server service installed). On non-DB hosts (and on the
+    # system drive) 4 KB is correct and the warning is pure noise.
+    $isDbServer = $false
+    try {
+        $sqlSvc = Get-Service -Name 'MSSQL*', 'SQLAgent*', 'MSSQLSERVER' -ErrorAction SilentlyContinue
+        if ($sqlSvc) { $isDbServer = $true }
+    } catch { }
+
     if ($cachedVolumes) {
         foreach ($vol in $cachedVolumes) {
             $drive = $vol.DriveLetter + ":"
@@ -3280,7 +5137,19 @@ function Test-DiskPerformance {
                     $clusterSizeKB = $clusterSize / 1KB
                     Write-Info "  Drive $($vol.DriveLetter): - Cluster Size: $($clusterSizeKB) KB"
                     if ($clusterSizeKB -ne 64) {
-                        Write-DiagWarning "    Recommended cluster size for SQL/Database servers is 64KB"
+                        # Skip system drive entirely - 4KB is correct there.
+                        if ($drive -ieq $env:SystemDrive) {
+                            Write-Info "    (System drive: 4 KB is the correct default; 64 KB recommendation does not apply.)"
+                        }
+                        elseif ($isDbServer) {
+                            Write-DiagWarning "    SQL Server detected on this host: recommended cluster size for database/log volumes is 64KB"
+                            Write-Info "      Remediation: Cluster size is set at FORMAT time and cannot be"
+                            Write-Info "                   changed in place. To fix: backup data, reformat with"
+                            Write-Info "                   'format $drive /FS:NTFS /A:64K /Q', restore data."
+                        }
+                        else {
+                            Write-Info "    (No SQL Server detected on this host; 64 KB recommendation does not apply.)"
+                        }
                     }
                 }
             }
@@ -3291,7 +5160,19 @@ function Test-DiskPerformance {
     }
 
     # Storage Disconnect Events (129, 153)
+    # ------------------------------------------------------------
+    # Event ID reference (storage transport):
+    #   129 - storahci/iaStorA/etc : 'Reset to device, \Device\RaidPort0, was issued.'
+    #         The HBA had to reset the bus because an I/O timed out. Indicates
+    #         the storage path stopped responding for >TimeOutValue (default 60s).
+    #   153 - disk : 'The IO operation at logical block address X for disk N
+    #                 was retried.' I/O was retried successfully but at the cost
+    #                 of latency. Often a leading indicator of upcoming media failure.
+    # Both are STORAGE LAYER complaints, not application bugs.
+    # ------------------------------------------------------------
     Write-Section "Storage Error Events (last 7 days)"
+    Write-Info "  Description: Event 129 = HBA bus reset (I/O hang); Event 153 = retried I/O."
+    Write-Info "               Both indicate storage transport problems below the file-system layer."
     try {
         $storageEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -3307,6 +5188,13 @@ function Test-DiskPerformance {
                     Write-DiagWarning "    [$($_.TimeCreated.ToString('MM-dd HH:mm'))] $(Get-EventSnippet -Event $_ -MaxLength 80)"
                 }
             }
+            Write-Info "    Likely cause (129): SAN fabric flap, MPIO path failure, HBA firmware bug,"
+            Write-Info "                        or controller cache battery dying."
+            Write-Info "    Likely cause (153): Failing platter/SSD cell, marginal cable/SFP, or"
+            Write-Info "                        SAN-side latency spike. Often precedes hard failure."
+            Write-Info "    Remediation: Check SAN/HBA logs at corresponding timestamps; verify MPIO"
+            Write-Info "                 path health (Section 'MPIO'); update HBA + storport drivers;"
+            Write-Info "                 run vendor disk diagnostics from iLO/iDRAC."
         }
         else {
             Write-Success "  No storage error events (129/153) found"
@@ -3317,16 +5205,40 @@ function Test-DiskPerformance {
     }
 
     # Disk Queue Length
+    # ------------------------------------------------------------
+    # \PhysicalDisk(*)\Current Disk Queue Length = # of I/O requests waiting at
+    # the disk RIGHT NOW. Sustained queue > 2 per spindle = the disk cannot keep
+    # up with the workload. On SSDs the threshold is higher (per controller).
+    # ------------------------------------------------------------
     Write-Section "Disk Queue Length"
+    Write-Info "  Description: # of I/O requests currently waiting at the disk. Threshold = 2"
+    Write-Info "               per physical spindle (HDD) or 8+ per SSD controller queue."
     try {
         $queueLength = Get-Counter '\PhysicalDisk(*)\Current Disk Queue Length' -ErrorAction Stop
+        $anyHighQueue = $false
+        $anyActivity = $false
         foreach ($sample in $queueLength.CounterSamples) {
             if ($sample.InstanceName -ne "_total" -and $sample.CookedValue -gt 0) {
+                $anyActivity = $true
                 Write-Info "  $($sample.InstanceName): Queue Length = $([math]::Round($sample.CookedValue, 1))"
                 if ($sample.CookedValue -gt $DISK_QUEUE_WARNING_THRESHOLD) {
-                    Write-DiagWarning "    WARNING: Queue length >$($DISK_QUEUE_WARNING_THRESHOLD) - I/O bottleneck on this disk"
+                    Write-DiagWarning "    Queue length >$($DISK_QUEUE_WARNING_THRESHOLD) - I/O bottleneck on this disk"
+                    $anyHighQueue = $true
                 }
             }
+        }
+        if ($anyHighQueue) {
+            Write-Info "    Likely cause: Workload exceeds disk capacity, contending services"
+            Write-Info "                  (backup + AV scan + DB), or an oversaturated SAN LUN."
+            Write-Info "    Remediation: Identify top I/O process via Resource Monitor / 'Get-Process'"
+            Write-Info "                 sorted by IOReadBytes/IOWriteBytes; stagger backup windows;"
+            Write-Info "                 add spindles or move to SSD."
+        }
+        elseif (-not $anyActivity) {
+            Write-Success "  All disks idle (queue length = 0 across all spindles)"
+        }
+        else {
+            Write-Success "  Disk queue length within healthy range"
         }
     }
     catch {
@@ -3334,7 +5246,15 @@ function Test-DiskPerformance {
     }
 
     # Write Latency (supplement to existing read latency)
+    # ------------------------------------------------------------
+    # Same thresholds as read latency. Write latency that is significantly
+    # WORSE than read latency points to: write-cache disabled, synchronous
+    # replication (SQL AG, Storage Replica), or a controller battery dead
+    # (cache flushed to disk on every write).
+    # ------------------------------------------------------------
     Write-Section "Disk Write Latency"
+    Write-Info "  Description: Average WRITE latency per disk. If much higher than read,"
+    Write-Info "               check controller cache state, sync replication, or write throttling."
     try {
         $writeLatency = Get-Counter '\PhysicalDisk(*)\Avg. Disk sec/Write' -ErrorAction Stop
         foreach ($sample in $writeLatency.CounterSamples) {
@@ -3342,10 +5262,14 @@ function Test-DiskPerformance {
                 $latencyMs = [math]::Round($sample.CookedValue * 1000, 2)
                 Write-Info "  Write Latency - $($sample.InstanceName): $latencyMs ms"
                 if ($latencyMs -gt $DISK_LATENCY_CRITICAL_MS) {
-                    Write-DiagError "    CRITICAL: Write latency >$($DISK_LATENCY_CRITICAL_MS)ms"
+                    Write-DiagError "    Write latency >$($DISK_LATENCY_CRITICAL_MS) ms (critical)"
+                    Write-Info "      Likely cause: Disabled write-back cache (controller battery dead),"
+                    Write-Info "                    synchronous replication overhead, or full SSD doing GC."
+                    Write-Info "      Remediation: Check RAID controller cache/battery (vendor tool);"
+                    Write-Info "                   if AG sync, check 'SQL AG Replication Health' (CPU section)."
                 }
                 elseif ($latencyMs -gt $DISK_LATENCY_WARNING_MS) {
-                    Write-DiagWarning "    WARNING: Write latency elevated"
+                    Write-DiagWarning "    Write latency elevated"
                 }
             }
         }
@@ -3355,55 +5279,107 @@ function Test-DiskPerformance {
     }
 
     # NTFS Metadata / Corruption Errors
+    # ------------------------------------------------------------
+    # Event ID reference:
+    #   55 - Microsoft-Windows-Ntfs : The file system structure on volume X is
+    #                                 corrupt and unusable. Run chkdsk.
+    #
+    # IMPORTANT: Event ID 55 in the System log is REUSED by many providers
+    # (Microsoft-Windows-Kernel-Processor-Power = informational power capability
+    # enumeration that fires every boot, ACPI subsystem, etc.). We MUST filter
+    # by ProviderName='Microsoft-Windows-Ntfs' to avoid false positives.
+    # ------------------------------------------------------------
     Write-Section "NTFS Errors (last 30 days)"
+    Write-Info "  Description: Event 55 from Microsoft-Windows-Ntfs provider = file system"
+    
+    Write-Info "               structure corruption. Filtered to exclude unrelated Event 55s"
+    Write-Info "               from Kernel-Processor-Power and other providers (false positives)."
     try {
         $ntfsEvents = Get-WinEvent -FilterHashtable @{
-            LogName   = 'System'
-            Id        = 55
-            StartTime = (Get-Date).AddDays(-30)
+            LogName      = 'System'
+            Id           = 55
+            ProviderName = 'Microsoft-Windows-Ntfs'
+            StartTime    = (Get-Date).AddDays(-30)
         } -MaxEvents 5 -ErrorAction SilentlyContinue
 
         if ($ntfsEvents) {
-            Write-DiagError "  Found $($ntfsEvents.Count) NTFS corruption event(s)!"
+            Write-DiagError "  Found $($ntfsEvents.Count) NTFS corruption event(s)"
             $ntfsEvents | Select-Object -First 3 | ForEach-Object {
                 Write-DiagWarning "    [$($_.TimeCreated.ToString('MM-dd HH:mm'))] $(Get-EventSnippet -Event $_ -MaxLength 100)"
             }
-            Write-Info "  Run: chkdsk /R on affected volume"
+            Write-Info "    Impact: File system metadata is damaged. Affected files may be"
+            Write-Info "            inaccessible or returning incorrect data."
+            Write-Info "    Remediation: 1. Identify affected volume from event detail."
+            Write-Info "                 2. Schedule maintenance and run 'chkdsk <drive>: /F /R'."
+            Write-Info "                 3. If recurring, suspect failing media - run SMART check"
+            Write-Info "                    (Section 'Disk Health & Predictive Failure')."
         }
         else {
-            Write-Success "  No NTFS errors detected"
+            Write-Success "  No NTFS corruption events from Microsoft-Windows-Ntfs provider"
         }
     }
     catch {
         Write-Info "  Could not query NTFS events"
     }
 
-    # VM Pause-Critical Risk (>95% full) — reuses cached $cachedVolumes
+    # VM Pause-Critical Risk (>95% full) - reuses cached $cachedVolumes
+    # ------------------------------------------------------------
+    # When a Hyper-V dynamic VHDX is on a host volume that fills to 100%, the VM
+    # immediately enters Pause-Critical state. The same applies to many third-
+    # party hypervisors and any thin-provisioned storage. >95% full = no headroom.
+    # ------------------------------------------------------------
     Write-Section "VM Pause-Critical Risk Check"
+    Write-Info "  Description: Drives >95% full. If a Hyper-V/VMware host volume hosting"
+    Write-Info "               dynamic disks fills completely, child VMs IMMEDIATELY pause."
     if ($cachedVolumes) {
+        $anyAtRisk = $false
         foreach ($vol in ($cachedVolumes | Where-Object { $_.Size -gt 0 })) {
             $usedPercent = [math]::Round((($vol.Size - $vol.SizeRemaining) / $vol.Size) * 100, 1)
             if ($usedPercent -gt 95) {
-                Write-DiagError "  Drive $($vol.DriveLetter): $usedPercent% full - VM MAY PAUSE if disk fills completely!"
+                Write-DiagError "  Drive $($vol.DriveLetter): $usedPercent% full - VM MAY PAUSE if disk fills completely"
+                $anyAtRisk = $true
             }
+        }
+        if ($anyAtRisk) {
+            Write-Info "    Remediation: Free space NOW (cleanmgr.exe, delete old logs, move VHDXs);"
+            Write-Info "                 expand the underlying LUN; or migrate VMs to a host with capacity."
+        }
+        else {
+            Write-Success "  No volumes above 95% - no immediate VM pause-critical risk"
         }
     }
 
     #region v3.0 Disk Checks
 
     # 1. Disk IOPS (Read + Write)
+    # ------------------------------------------------------------
+    # IOPS = I/O Operations Per Second. Different media tiers cap at:
+    #   7.2K HDD : ~80 IOPS sustained
+    #   15K HDD  : ~180 IOPS sustained
+    #   SATA SSD : 10,000-50,000 IOPS
+    #   NVMe SSD : 100,000-1,000,000+ IOPS
+    # Compare current IOPS to media tier ceiling (next section) to spot saturation.
+    # ------------------------------------------------------------
     Write-Section "Disk IOPS"
+    Write-Info "  Description: I/O operations per second per disk. Compare to media-type"
+    Write-Info "               ceiling: HDD ~80-180 IOPS, SSD 10K-50K, NVMe 100K+."
     try {
         $readIOPS = Get-Counter '\PhysicalDisk(*)\Disk Reads/sec' -ErrorAction Stop
         $writeIOPS = Get-Counter '\PhysicalDisk(*)\Disk Writes/sec' -ErrorAction Stop
+        $anyIopsActivity = $false
         foreach ($sample in $readIOPS.CounterSamples) {
-            if ($sample.InstanceName -ne "_total" -and ($sample.CookedValue -gt 0)) {
-                $wSample = $writeIOPS.CounterSamples | Where-Object { $_.InstanceName -eq $sample.InstanceName }
-                $rIOPS = [math]::Round($sample.CookedValue, 0)
-                $wIOPS = if ($wSample) { [math]::Round($wSample.CookedValue, 0) } else { 0 }
-                $totalIOPS = $rIOPS + $wIOPS
+            if ($sample.InstanceName -eq '_total') { continue }
+            $wSample = $writeIOPS.CounterSamples | Where-Object { $_.InstanceName -eq $sample.InstanceName }
+            $rIOPS = [math]::Round($sample.CookedValue, 0)
+            $wIOPS = if ($wSample) { [math]::Round($wSample.CookedValue, 0) } else { 0 }
+            $totalIOPS = $rIOPS + $wIOPS
+            if ($totalIOPS -gt 0) {
+                $anyIopsActivity = $true
                 Write-Info "  $($sample.InstanceName): Read=$rIOPS Write=$wIOPS Total=$totalIOPS IOPS"
             }
+        }
+        if (-not $anyIopsActivity) {
+            Write-Info "  All disks idle at sample time (0 IOPS). Re-run while workload is active for a meaningful number."
         }
     }
     catch {
@@ -3411,17 +5387,31 @@ function Test-DiskPerformance {
     }
 
     # 2. Disk Throughput (MB/sec)
+    # ------------------------------------------------------------
+    # Throughput is the OTHER side of the IOPS coin. Workloads divide into:
+    # - Random small I/O (databases, OLTP)        : limited by IOPS
+    # - Sequential large I/O (backup, video, ETL) : limited by throughput
+    # Compare against link speed: SATA 6 Gb = ~600 MB/s, SAS 12 Gb = ~1.2 GB/s,
+    # NVMe Gen3 x4 = ~3.5 GB/s, NVMe Gen4 x4 = ~7 GB/s.
+    # ------------------------------------------------------------
     Write-Section "Disk Throughput"
+    Write-Info "  Description: MB/sec per disk. Sequential workloads (backup, ETL) cap on"
+    Write-Info "               throughput, not IOPS. Compare to link speed (SATA/SAS/NVMe)."
     try {
         $readTP = Get-Counter '\PhysicalDisk(*)\Disk Read Bytes/sec' -ErrorAction Stop
         $writeTP = Get-Counter '\PhysicalDisk(*)\Disk Write Bytes/sec' -ErrorAction Stop
+        $anyThroughput = $false
         foreach ($sample in $readTP.CounterSamples) {
             if ($sample.InstanceName -ne "_total" -and ($sample.CookedValue -gt 0 -or ($writeTP.CounterSamples | Where-Object { $_.InstanceName -eq $sample.InstanceName }).CookedValue -gt 0)) {
+                $anyThroughput = $true
                 $wSample = $writeTP.CounterSamples | Where-Object { $_.InstanceName -eq $sample.InstanceName }
                 $rMBs = [math]::Round($sample.CookedValue / 1MB, 2)
                 $wMBs = if ($wSample) { [math]::Round($wSample.CookedValue / 1MB, 2) } else { 0 }
                 Write-Info "  $($sample.InstanceName): Read=${rMBs} MB/s Write=${wMBs} MB/s"
             }
+        }
+        if (-not $anyThroughput) {
+            Write-Info "  All disks idle at sample time (0 MB/s). Re-run during workload for a meaningful number."
         }
     }
     catch {
@@ -3429,19 +5419,48 @@ function Test-DiskPerformance {
     }
 
     # 3. Storage Media Type (SSD vs HDD)
+    # ------------------------------------------------------------
+    # Get-PhysicalDisk reports MediaType from SMART data:
+    #   SSD          : flash-based, low latency, high IOPS
+    #   HDD          : spinning rust, ~80-180 IOPS depending on RPM
+    #   SCM          : Storage Class Memory (Optane / persistent memory)
+    #   Unspecified  : SAN-presented LUN; depends on backend
+    # Critical to know for capacity planning and AV exclusion strategy.
+    # ------------------------------------------------------------
     Write-Section "Storage Media Type"
+    Write-Info "  Description: Physical media classification from SMART data. HDDs need"
+    Write-Info "               more aggressive AV exclusions for DB workloads."
     try {
-        $physDisks = Get-PhysicalDisk -ErrorAction Stop
-        foreach ($pd in $physDisks) {
-            $mediaType = if ($pd.MediaType) { $pd.MediaType } else { "Unknown" }
-            $busType = if ($pd.BusType) { $pd.BusType } else { "Unknown" }
-            $sizeGB = [math]::Round($pd.Size / 1GB, 1)
-            Write-Info "  $($pd.FriendlyName): $mediaType ($busType) - ${sizeGB}GB"
-            if ($mediaType -eq "HDD") {
-                Write-DiagWarning "    HDD detected — expect higher latency than SSD; critical for SQL/database workloads"
+        $physDisks = @(Get-PhysicalDisk -ErrorAction Stop)
+
+        # Group identical disks (same FriendlyName + MediaType + BusType + size).
+        # Storage Spaces / S2D pools commonly present 24+ identical capacity drives;
+        # listing each one separately produces a wall of duplicate output and a
+        # duplicate HDD warning per disk. Roll them into a single line + single warning.
+        $diskGroups = $physDisks | Group-Object -Property {
+            $mt = if ($_.MediaType) { $_.MediaType } else { 'Unknown' }
+            $bt = if ($_.BusType) { $_.BusType } else { 'Unknown' }
+            $gb = [math]::Round($_.Size / 1GB, 1)
+            "$($_.FriendlyName)|$mt|$bt|$gb"
+        }
+
+        $hddWarningEmitted = $false
+        foreach ($grp in $diskGroups | Sort-Object Count -Descending) {
+            $sample = $grp.Group[0]
+            $mediaType = if ($sample.MediaType) { $sample.MediaType } else { 'Unknown' }
+            $busType = if ($sample.BusType) { $sample.BusType } else { 'Unknown' }
+            $sizeGB = [math]::Round($sample.Size / 1GB, 1)
+            $countSuffix = if ($grp.Count -gt 1) { " x$($grp.Count)" } else { '' }
+            Write-Info "  $($sample.FriendlyName): $mediaType ($busType) - ${sizeGB}GB$countSuffix"
+
+            if ($mediaType -eq 'HDD' -and -not $hddWarningEmitted) {
+                Write-DiagWarning "    HDD detected - expect higher latency than SSD; critical for SQL/database workloads"
+                Write-Info "      Remediation: Move DB data + log + tempdb files to SSD/NVMe; ensure"
+                Write-Info "                   AV exclusions cover SQL data dirs and backup paths."
+                $hddWarningEmitted = $true
             }
-            if ($mediaType -eq "Unspecified" -and $busType -like "*iSCSI*") {
-                Write-Info "    iSCSI LUN — media type depends on SAN backend"
+            if ($mediaType -eq 'Unspecified' -and $busType -like '*iSCSI*') {
+                Write-Info "    iSCSI LUN - media type depends on SAN backend (ask SAN admin)"
             }
         }
     }
@@ -3450,16 +5469,28 @@ function Test-DiskPerformance {
     }
 
     # 4. SMART / Predictive Failure Detection
+    # ------------------------------------------------------------
+    # SMART (Self-Monitoring, Analysis and Reporting Technology) is firmware-level
+    # disk health monitoring. Windows surfaces it via:
+    # - Get-PhysicalDisk HealthStatus (Healthy / Warning / Unhealthy)
+    # - MSStorageDriver_FailurePredictStatus (PredictFailure boolean)
+    # A 'Predictive Failure' = the disk is reporting that it expects to fail SOON
+    # (typically days to weeks). Replace immediately, don't wait.
+    # ------------------------------------------------------------
     Write-Section "Disk Health & Predictive Failure"
+    Write-Info "  Description: SMART-derived disk health. 'PredictFailure' = the disk"
+    Write-Info "               firmware says it expects to fail SOON. Replace immediately."
     try {
         $physDisks = Get-PhysicalDisk -ErrorAction Stop
+        $anyUnhealthy = $false
         foreach ($pd in $physDisks) {
             $health = $pd.HealthStatus
             $opStatus = $pd.OperationalStatus
             if ($health -ne "Healthy" -or $opStatus -ne "OK") {
                 Write-DiagError "  $($pd.FriendlyName): Health=$health OpStatus=$opStatus"
+                $anyUnhealthy = $true
                 if ($health -like "*Predict*" -or $health -like "*Warning*") {
-                    Write-DiagError "    PREDICTIVE FAILURE — replace this disk immediately!"
+                    Write-DiagError "    PREDICTIVE FAILURE - replace this disk immediately"
                 }
             }
             else {
@@ -3472,8 +5503,16 @@ function Test-DiskPerformance {
             foreach ($sd in $smartDisks) {
                 if ($sd.PredictFailure) {
                     Write-DiagError "  SMART Predictive Failure on InstanceName: $($sd.InstanceName)"
+                    $anyUnhealthy = $true
                 }
             }
+        }
+        if ($anyUnhealthy) {
+            Write-Info "    Remediation: 1. Verify the disk in vendor tool (Dell OMSA, HPE SSA,"
+            Write-Info "                    Lenovo XClarity) and capture full SMART log."
+            Write-Info "                 2. Open hardware case; ensure recent backup completed."
+            Write-Info "                 3. If RAID member, controller will auto-rebuild after swap."
+            Write-Info "                 4. Replace before scheduled BSOD - data loss risk."
         }
     }
     catch {
@@ -3481,19 +5520,28 @@ function Test-DiskPerformance {
     }
 
     # 5. Volume Shadow Copy (VSS) Snapshot Space
+    # ------------------------------------------------------------
+    # VSS = Volume Shadow Copy Service. Snapshots are point-in-time copies used
+    # by Windows Backup, System Restore, and most third-party backup software
+    # (Veeam, Commvault, etc.). Each snapshot consumes 'diff area' space - hidden
+    # from regular file size totals. Orphaned snapshots = silent disk-fill source.
+    # ------------------------------------------------------------
     Write-Section "VSS Shadow Copy Usage"
+    Write-Info "  Description: VSS snapshots are HIDDEN consumers of disk space. Failed/"
+    Write-Info "               orphaned backups can leave dozens of snapshots silently"
+    Write-Info "               consuming 100s of GB - common cause of mystery disk fill."
     try {
         $shadows = Get-CimInstance Win32_ShadowCopy -ErrorAction SilentlyContinue
         if ($shadows) {
             $shadowsByVolume = $shadows | Group-Object VolumeName
             foreach ($group in $shadowsByVolume) {
                 $count = $group.Count
-                $totalSizeMB = [math]::Round(($group.Group | Measure-Object -Property MaxSize -Sum).Sum / 1MB, 0)
-                $oldestDate = ($group.Group | Sort-Object InstallDate | Select-Object -First 1).InstallDate
                 Write-Info "  Volume $($group.Name): $count snapshot(s)"
                 if ($count -gt 10) {
-                    Write-DiagWarning "    $count VSS snapshots — orphaned snapshots consuming hidden disk space"
-                    Write-Info "    Clean up: vssadmin delete shadows /for=$($group.Name) /oldest"
+                    Write-DiagWarning "    $count VSS snapshots - orphaned snapshots consuming hidden disk space"
+                    Write-Info "      Remediation: List with 'vssadmin list shadows /for=$($group.Name)';"
+                    Write-Info "                   delete oldest with 'vssadmin delete shadows /for=$($group.Name) /oldest';"
+                    Write-Info "                   verify backup software is properly cleaning up its snapshots."
                 }
             }
             Write-Info "  Total VSS snapshots: $($shadows.Count)"
@@ -3507,6 +5555,12 @@ function Test-DiskPerformance {
     }
 
     # Check VSS writers health
+    # ------------------------------------------------------------
+    # VSS writers are app-specific components (SQL, Exchange, Hyper-V, IIS)
+    # that prepare their state for snapshotting. A failed writer = backups for
+    # that app FAIL or produce inconsistent snapshots. Common cause: the writer
+    # service is stopped, or it errored on the last attempt.
+    # ------------------------------------------------------------
     try {
         $vssWriters = vssadmin list writers 2>&1
         $failedWriters = $vssWriters | Select-String 'State:.*Failed|State:.*Not responding|State:.*Waiting for completion' -ErrorAction SilentlyContinue
@@ -3515,6 +5569,11 @@ function Test-DiskPerformance {
             foreach ($fw in $failedWriters) {
                 Write-DiagWarning "    $($fw.Line.Trim())"
             }
+            Write-Info "    Impact: Application-consistent backups for the failed writer's app"
+            Write-Info "            (SQL/Exchange/Hyper-V) will fail or be crash-consistent only."
+            Write-Info "    Remediation: Restart the host service (e.g. SQL Writer Service);"
+            Write-Info "                 if persistent, run 'vssadmin list writers' for full output;"
+            Write-Info "                 reboot may be required for stuck-state writers."
         }
         else {
             Write-Success "  All VSS writers are stable"
@@ -3523,7 +5582,16 @@ function Test-DiskPerformance {
     catch { }
 
     # 6. Storage Spaces / Pool Health
+    # ------------------------------------------------------------
+    # Storage Spaces = Microsoft's software-defined storage. A 'pool' aggregates
+    # physical disks; 'virtual disks' are carved from pools with redundancy
+    # (mirror/parity). Degraded = a member disk failed and the pool is rebuilding
+    # or is single-disk-tolerant. Critical timeline matters for redundancy.
+    # ------------------------------------------------------------
     Write-Section "Storage Spaces & Pool Health"
+    Write-Info "  Description: Software-defined storage pool health. Degraded = disk failed,"
+    Write-Info "               pool may be rebuilding. Second disk failure during rebuild ="
+    Write-Info "               data loss for non-mirror configurations."
     try {
         $pools = Get-StoragePool -ErrorAction SilentlyContinue | Where-Object { $_.IsPrimordial -eq $false }
         if ($pools) {
@@ -3541,10 +5609,13 @@ function Test-DiskPerformance {
                         if ($vd.HealthStatus -ne "Healthy" -or $vd.OperationalStatus -ne "OK") {
                             Write-DiagError "    VDisk '$($vd.FriendlyName)': $($vd.HealthStatus) / $($vd.OperationalStatus)"
                             if ($vd.OperationalStatus -like "*Degraded*") {
-                                Write-DiagError "      DEGRADED — rebuild in progress or missing disk!"
+                                Write-DiagError "      DEGRADED - rebuild in progress or missing disk"
                             }
                         }
                     }
+                    Write-Info "    Remediation: Run 'Get-PhysicalDisk' to find the failed/missing"
+                    Write-Info "                 member; replace; pool will auto-rebuild. Monitor with"
+                    Write-Info "                 'Get-StorageJob' for rebuild progress."
                 }
                 else {
                     Write-Success "    Pool Health: Healthy"
@@ -3560,7 +5631,15 @@ function Test-DiskPerformance {
     }
 
     # 7. Disk Fragmentation Level
+    # ------------------------------------------------------------
+    # Fragmentation = file data scattered across non-contiguous disk extents.
+    # On HDD this DEVASTATES sequential read perf. On SSD it has minimal impact
+    # (random access cost is uniform), so Windows uses TRIM instead of defrag.
+    # The 'Optimize-Volume -Analyze' command reports current fragmentation %.
+    # ------------------------------------------------------------
     Write-Section "Disk Fragmentation"
+    Write-Info "  Description: % of files split into non-contiguous extents. Critical on HDD"
+    Write-Info "               (kills sequential read), irrelevant on SSD (which uses TRIM)."
     if ($cachedVolumes) {
         foreach ($vol in ($cachedVolumes | Where-Object { $_.DriveLetter -and $_.Size -gt 0 })) {
             try {
@@ -3581,35 +5660,79 @@ function Test-DiskPerformance {
     }
 
     # 8. Pagefile Disk Placement
+    # ------------------------------------------------------------
+    # Pagefile (pagefile.sys) is the most write-active file on the OS drive when
+    # under memory pressure. Co-locating it with OS + apps + logs creates I/O
+    # contention. Best practice: dedicated fast (SSD) drive, separate from OS.
+    # On modern servers with abundant RAM this matters less, but still avoid
+    # putting it on the same spindle as a busy database log.
+    # ------------------------------------------------------------
     Write-Section "Pagefile Disk Placement"
+    Write-Info "  Description: Pagefile is heavily I/O-active under memory pressure."
+    Write-Info "               Sharing a spindle with OS + DB log = contention. Move to SSD."
     try {
         $pageFiles = Get-CimInstance Win32_PageFileUsage -ErrorAction Stop
+
+        # Detect whether there is even a candidate "other" drive to move the
+        # pagefile to. On single-disk VMs (most cloud / Hyper-V dev hosts)
+        # warning about pagefile-on-C: is unactionable noise.
+        $candidateDrives = @()
+        try {
+            $candidateDrives = @(
+                Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction Stop |
+                    Where-Object { $_.DeviceID -ne $env:SystemDrive -and $_.Size -gt 10GB }
+            )
+        } catch { }
+
         if ($pageFiles) {
             foreach ($pf in $pageFiles) {
                 $pfDrive = $pf.Name.Substring(0, 2)
                 Write-Info "  Page file: $($pf.Name) ($($pf.AllocatedBaseSize) MB)"
                 # Check if pagefile is on the OS drive
                 $osDrive = $env:SystemDrive
-                if ($pfDrive -eq $osDrive) {
-                    Write-DiagWarning "    Page file is on the OS drive ($osDrive) — may cause I/O contention"
-                    Write-Info "    For high-performance servers, place page file on a separate disk"
+                if ($pfDrive -ieq $osDrive) {
+                    if ($candidateDrives.Count -eq 0) {
+                        Write-Info "    Page file is on the OS drive ($osDrive). Single-disk host -"
+                        Write-Info "    no alternate drive available; this is expected."
+                    }
+                    else {
+                        Write-DiagWarning "    Page file is on the OS drive ($osDrive) - may cause I/O contention"
+                        Write-Info "      Candidate alternate drive(s): $((@($candidateDrives) | ForEach-Object DeviceID) -join ', ')"
+                        Write-Info "      Remediation: For high-performance servers, configure pagefile on"
+                        Write-Info "                   a dedicated SSD volume. Keep a small (1 GB) pagefile on"
+                        Write-Info "                   the OS drive for crash dump support."
+                    }
+                }
+                else {
+                    Write-Success "    Page file is on a non-OS drive ($pfDrive) - good"
                 }
             }
         }
+        else {
+            Write-Info "  No active pagefiles reported (system-managed pagefile may be off)"
+        }
     }
     catch {
-        Write-DiagWarning "  Could not check pagefile placement"
+        Write-DiagWarning "  Could not check pagefile placement: $($_.Exception.Message)"
     }
 
     # 9. Temp/TempDB Disk Check
+    # ------------------------------------------------------------
+    # SQL Server's tempdb is HEAVILY used: temp tables, sort spills, hash spills,
+    # version store, snapshot isolation. Co-locating with OS or with user DB data
+    # = serious contention. Best practice: dedicated SSD, multiple data files
+    # (1 per logical core, up to 8). We just check placement here.
+    # ------------------------------------------------------------
     Write-Section "TEMP & SQL TempDB Location"
+    Write-Info "  Description: SQL tempdb is heavily I/O-active. Sharing a disk with the"
+    Write-Info "               OS or user databases causes severe contention on busy servers."
     try {
         $tempPath = $env:TEMP
         $tempDrive = $tempPath.Substring(0, 2)
         $osDrive = $env:SystemDrive
         Write-Info "  Windows TEMP: $tempPath (Drive: $tempDrive)"
         if ($tempDrive -eq $osDrive) {
-            Write-Info "    TEMP is on OS drive — normal for most servers"
+            Write-Info "    TEMP is on OS drive - normal for most servers"
         }
 
         # Check SQL TempDB if SQL is running
@@ -3625,7 +5748,10 @@ function Test-DiskPerformance {
                     $tempDbDrive = $tempDbPath.Substring(0, 2)
                     Write-Info "  SQL TempDB: $tempDbPath"
                     if ($tempDbDrive -eq $osDrive) {
-                        Write-DiagWarning "    TempDB on OS drive ($osDrive) — move to a dedicated fast disk for production"
+                        Write-DiagWarning "    TempDB on OS drive ($osDrive) - move to a dedicated fast disk for production"
+                        Write-Info "      Remediation: ALTER DATABASE tempdb MODIFY FILE (NAME=tempdev,"
+                        Write-Info "                   FILENAME='X:\TempDB\tempdb.mdf'); restart SQL service."
+                        Write-Info "                   Add data files (1 per core, up to 8) for allocation contention."
                     }
                 }
                 $reader.Close()
@@ -3641,7 +5767,16 @@ function Test-DiskPerformance {
     }
 
     # 10. Filter Driver Stack (fltmc)
+    # ------------------------------------------------------------
+    # File system minifilters intercept EVERY I/O on their attached volumes.
+    # AV/EDR (WdFilter, csagent, SentinelMonitor), backup (Veeam, Commvault),
+    # encryption (BitLocker), and dedup all stack here. More filters = more
+    # latency. >10 filters on a busy DB server = measurable I/O cost.
+    # ------------------------------------------------------------
     Write-Section "File System Filter Drivers"
+    Write-Info "  Description: Each minifilter intercepts EVERY file I/O. Stack depth"
+    Write-Info "               directly multiplies per-IO latency. Top offenders: AV, backup,"
+    Write-Info "               encryption, dedup, ransomware-protection drivers."
     try {
         $fltmcOutput = fltmc 2>&1
         $filterLines = $fltmcOutput | Select-String '^\s*\d+' -ErrorAction SilentlyContinue
@@ -3652,7 +5787,7 @@ function Test-DiskPerformance {
                 $line = $fl.Line.Trim()
                 # Flag known high-impact AV filters
                 if ($line -match 'WdFilter|csagent|SentinelMonitor|SymEFA|savonaccess|CbFilter|epfw|tmPreFilter') {
-                    Write-DiagWarning "    $line  [AV/Security filter — impacts I/O latency]"
+                    Write-DiagWarning "    $line  [AV/Security filter - impacts I/O latency]"
                 }
                 else {
                     Write-Info "    $line"
@@ -3662,7 +5797,10 @@ function Test-DiskPerformance {
                 Write-Info "    ... and $($filterCount - 15) more"
             }
             if ($filterCount -gt 10) {
-                Write-DiagWarning "  $filterCount filter drivers is HIGH — each adds latency to every I/O operation"
+                Write-DiagWarning "  $filterCount filter drivers is HIGH - each adds latency to every I/O operation"
+                Write-Info "    Remediation: Audit installed filters - retire unused backup agents,"
+                Write-Info "                 remove redundant AV after vendor migration, ensure DB"
+                Write-Info "                 paths are excluded from AV/EDR file scanning."
             }
         }
         else {
@@ -3684,19 +5822,31 @@ function Test-DiskPerformance {
     catch { }
 
     # 11. Disk Timeout & Retry Settings
+    # ------------------------------------------------------------
+    # HKLM\SYSTEM\CurrentControlSet\Services\Disk\TimeOutValue (REG_DWORD,
+    # seconds) controls how long Windows waits for a disk I/O before considering
+    # it failed. Default = 60s. SAN-attached servers often need this raised to
+    # 90-120s to ride out transient fabric blips. iSCSI has its own LinkDownTime.
+    # ------------------------------------------------------------
     Write-Section "Disk Timeout Configuration"
+    Write-Info "  Description: How long Windows waits for a disk I/O before treating it as"
+    Write-Info "               failed. Default 60s. SAN servers may need 90-120s; values"
+    Write-Info "               below 30s cause premature errors during fabric flaps."
     try {
         $diskTimeout = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Disk' -Name 'TimeOutValue' -ErrorAction SilentlyContinue
         $timeoutValue = if ($diskTimeout -and $diskTimeout.TimeOutValue) { $diskTimeout.TimeOutValue } else { 60 }
         Write-Info "  Disk I/O Timeout: $timeoutValue seconds"
         if ($timeoutValue -eq 60) {
-            Write-Info "    Default value (60s) — appropriate for most configurations"
+            Write-Info "    Default value (60s) - appropriate for most configurations"
         }
         elseif ($timeoutValue -lt 30) {
-            Write-DiagWarning "    LOW timeout (${timeoutValue}s) — may cause premature I/O failures on slow SAN paths"
+            Write-DiagWarning "    LOW timeout (${timeoutValue}s) - may cause premature I/O failures on slow SAN paths"
+            Write-Info "      Remediation: Raise to vendor recommended value (often 60-90s)"
+            Write-Info "                   in HKLM\SYSTEM\CurrentControlSet\Services\Disk\TimeOutValue."
         }
         elseif ($timeoutValue -gt 120) {
-            Write-DiagWarning "    HIGH timeout (${timeoutValue}s) — I/O hangs will take very long to surface as errors"
+            Write-DiagWarning "    HIGH timeout (${timeoutValue}s) - I/O hangs will take very long to surface as errors"
+            Write-Info "      Remediation: Lower to ~90s unless storage vendor specifically requires more."
         }
 
         # Check SAN-specific timeout for iSCSI
@@ -3710,7 +5860,15 @@ function Test-DiskPerformance {
     }
 
     # 12. MPIO (Multipath I/O) Status
+    # ------------------------------------------------------------
+    # MPIO = Multiple physical paths to the same SAN LUN, for redundancy and/or
+    # load balancing. If a path fails, traffic auto-fails over. A 'Standby' or
+    # 'Failed' path means the failover happened (good!) but you're now running
+    # without redundancy until the path is restored.
+    # ------------------------------------------------------------
     Write-Section "MPIO (Multipath I/O)"
+    Write-Info "  Description: SAN multi-path redundancy. 'Failed' or 'Standby' paths"
+    Write-Info "               mean failover already occurred - no redundancy until fixed."
     try {
         $mpioFeature = Get-WindowsFeature -Name Multipath-IO -ErrorAction SilentlyContinue
         if ($mpioFeature -and $mpioFeature.Installed) {
@@ -3736,6 +5894,9 @@ function Test-DiskPerformance {
                         foreach ($dp in $degradedPaths | Select-Object -First 5) {
                             Write-DiagWarning "    $($dp.Line.Trim())"
                         }
+                        Write-Info "    Remediation: Check SAN fabric (zoning, switch port, HBA, SFP);"
+                        Write-Info "                 vendor MPIO tool (Dell EqualLogic HIT, EMC PowerPath,"
+                        Write-Info "                 NetApp DSM) for detailed path state; restore redundancy ASAP."
                     }
                     else {
                         Write-Success "  All MPIO paths are active"
@@ -3755,7 +5916,18 @@ function Test-DiskPerformance {
     }
 
     # 13. ReFS vs NTFS Detection
+    # ------------------------------------------------------------
+    # NTFS  = battle-tested, supports compression / EFS / quotas / dedup
+    # ReFS  = Resilient File System; designed for huge volumes (SOFS, Hyper-V,
+    #         Veeam repos, S2D). Has integrity streams, auto-repair from mirror.
+    #         Does NOT support: file-level compression, EFS, quotas, page file,
+    #         OS install, removable media. Choose carefully.
+    # ------------------------------------------------------------
     Write-Section "File System Type per Volume"
+    Write-Info "  Description: NTFS is the default, fully featured. ReFS is for very large"
+    Write-Info "               volumes (Hyper-V, backup repos, S2D) but lacks compression,"
+    
+    Write-Info "               EFS, quotas, and cannot host the OS or page file."
     if ($cachedVolumes) {
         foreach ($vol in ($cachedVolumes | Where-Object { $_.DriveLetter -and $_.Size -gt 0 })) {
             $fsType = $vol.FileSystemType
@@ -3769,24 +5941,47 @@ function Test-DiskPerformance {
     }
 
     # 14. Disk Busy Time %
+    # ------------------------------------------------------------
+    # \PhysicalDisk(*)\% Disk Time = % of elapsed time disk was servicing
+    # requests. NOTE: this counter can exceed 100% on multi-spindle arrays
+    # (each spindle counts toward the total) - we cap display at 100% but flag
+    # the underlying value. >80% sustained = disk is the bottleneck.
+    # ------------------------------------------------------------
     Write-Section "Disk Busy Time"
+    Write-Info "  Description: % of time the disk is servicing I/O. >80% = disk is the"
+    Write-Info "               bottleneck. Counter can exceed 100% on multi-spindle arrays"
+    Write-Info "               (one count per spindle); display is capped at 100%."
     try {
         $diskTime = Get-Counter '\PhysicalDisk(*)\% Disk Time' -ErrorAction Stop
+        $anyBusy = $false
+        $anyActivity = $false
         foreach ($sample in $diskTime.CounterSamples) {
             if ($sample.InstanceName -ne "_total") {
                 $busyPercent = [math]::Round($sample.CookedValue, 1)
                 # % Disk Time can exceed 100% on multi-spindle arrays; cap display
                 $displayPercent = [math]::Min($busyPercent, 100)
                 if ($busyPercent -gt 80) {
-                    Write-DiagWarning "  $($sample.InstanceName): $displayPercent% busy — disk is the bottleneck"
+                    Write-DiagWarning "  $($sample.InstanceName): $displayPercent% busy - disk is the bottleneck"
+                    $anyBusy = $true
+                    $anyActivity = $true
                 }
                 elseif ($busyPercent -gt 50) {
                     Write-Info "  $($sample.InstanceName): $displayPercent% busy (moderate load)"
+                    $anyActivity = $true
                 }
                 elseif ($busyPercent -gt 0) {
                     Write-Info "  $($sample.InstanceName): $displayPercent% busy"
+                    $anyActivity = $true
                 }
             }
+        }
+        if ($anyBusy) {
+            Write-Info "    Remediation: Identify the top I/O process (Resource Monitor / Process"
+            Write-Info "                 Explorer / 'Get-Process | Sort IOReadBytes -Descending');"
+            Write-Info "                 stagger backup + AV scan windows; consider faster media."
+        }
+        elseif (-not $anyActivity) {
+            Write-Success "  All disks idle (0% busy time across all spindles)"
         }
     }
     catch {
@@ -3794,7 +5989,16 @@ function Test-DiskPerformance {
     }
 
     # 15. Storage Tiering Status (Storage Spaces Direct / Tiered Volumes)
+    # ------------------------------------------------------------
+    # Storage tiering = mixing fast (SSD) and slow (HDD) media in one volume,
+    # with the OS dynamically promoting hot data to the SSD tier. Requires the
+    # 'Storage Tiers Optimization' scheduled task to actually do the promotion.
+    # If the task is disabled/broken, hot data stays on slow tier = no benefit.
+    # ------------------------------------------------------------
     Write-Section "Storage Tiering"
+    Write-Info "  Description: Tiered volumes auto-promote hot data to SSD. Requires the"
+    Write-Info "               'Storage Tiers Optimization' task to be Ready/Running -"
+    Write-Info "               if disabled, hot data stays on slow tier and you get no benefit."
     try {
         $tiers = Get-StorageTier -ErrorAction SilentlyContinue
         if ($tiers) {
@@ -3811,7 +6015,10 @@ function Test-DiskPerformance {
                 if ($tierTask) {
                     Write-Info "  Tiering optimization task: $($tierTask.State)"
                     if ($tierTask.State -ne 'Ready' -and $tierTask.State -ne 'Running') {
-                        Write-DiagWarning "    Tiering task is $($tierTask.State) — hot data may not be promoted to SSD tier"
+                        Write-DiagWarning "    Tiering task is $($tierTask.State) - hot data may not be promoted to SSD tier"
+                        Write-Info "      Remediation: Enable+start the 'Storage Tiers Optimization' task"
+                        Write-Info "                   under \Microsoft\Windows\Storage Tiers Management;"
+                        Write-Info "                   confirm Last Run Result = 0x0."
                     }
                 }
             }
@@ -3954,7 +6161,17 @@ function Test-ServicesHealth {
     Write-Header "Windows Services Health Check"
     
     # Check critical services
-    Write-Info "Checking Critical Services..."
+    # ------------------------------------------------------------
+    # CriticalServices = curated list of services whose absence/failure breaks
+    # core OS functionality (RPC, EventLog, LanmanServer, Schedule, W32Time,
+    # Netlogon, etc.) or business-critical roles (SQL, Cluster, IIS).
+    # Special case: SQLSERVERAGENT being Stopped on an AG SECONDARY replica is
+    # NORMAL (Agent only runs on the PRIMARY). We suppress the alert there.
+    # ------------------------------------------------------------
+    Write-Section "Critical Services"
+    Write-Info "  Description: Curated set of services that MUST be running for the OS or"
+    Write-Info "               its primary role to function (RPC, EventLog, LanmanServer,"
+    Write-Info "               Schedule, W32Time, Netlogon, plus role-specific services)."
     try {
         foreach ($svcName in $script:CriticalServices) {
             try {
@@ -3970,6 +6187,10 @@ function Test-ServicesHealth {
                     }
                     else {
                         Write-DiagError "  $($svc.DisplayName) ($($svc.Name)): STOPPED (Auto-Start)"
+                        Write-Info "    Impact: An auto-start critical service is offline. Dependent"
+                        Write-Info "            features (auth, file share, scheduled tasks) may fail."
+                        Write-Info "    Remediation: Start-Service '$($svc.Name)'; if it fails, check"
+                        Write-Info "                 System log for the latest error from $($svc.Name)."
                     }
                 }
                 elseif ($svc.Status -eq "Stopped") {
@@ -3989,20 +6210,106 @@ function Test-ServicesHealth {
     }
     
     # Stopped automatic services
+    # ------------------------------------------------------------
+    # Any service set to StartType=Automatic SHOULD be running. If it isn't,
+    # either: (a) it crashed and Recovery options aren't restarting it,
+    # (b) a dependency failed, or (c) an admin manually stopped it without
+    # disabling. NOTE: 'Automatic (Delayed Start)' services may legitimately
+    # show Stopped briefly during the first ~2 minutes after boot.
+    # ------------------------------------------------------------
     Write-Section "Stopped Automatic Services"
+    Write-Info "  Description: Services configured for auto-start that are not running."
+    Write-Info "               Indicates crash, failed dependency, or unexplained manual stop."
+    Write-Info "               Trigger-start services (e.g. sppsvc, edgeupdate, RemoteRegistry)"
+    Write-Info "               are filtered out - they self-stop when their trigger is idle."
     try {
+        # Known trigger-start / on-demand auto services that legitimately stop
+        # themselves between activations. Listing them as "stopped automatic"
+        # is a chronic false-positive and trains operators to ignore the section.
+        $triggerStartAllowList = @(
+            'sppsvc',          # Software Protection - starts/stops on activation events
+            'WbioSrvc',        # Windows Biometric - on-demand
+            'TabletInputService',
+            'tiledatamodelsvc',
+            'RemoteRegistry',  # often disabled by hardening, also trigger-start
+            'TrustedInstaller',
+            'MapsBroker',      # downloaded maps - triggers on Maps app launch
+            'WSearch',         # search service may pause
+            'gpsvc',           # rare, but trigger-start in some builds
+            'CDPSvc',          # Connected Devices Platform
+            'CDPUserSvc',
+            'BITS',            # background transfer - explicit start
+            'wuauserv',        # Windows Update - trigger-start since Win10
+            'InstallService',
+            'DoSvc',           # Delivery Optimization - trigger-start
+            'WaaSMedicSvc'     # Windows Update medic - trigger-start
+        )
+        # Edge update / Office click-to-run / GoogleUpdate etc. all share a
+        # 'edgeupdate*' / 'gupdate*' / 'OneSync*' naming pattern.
+        $triggerStartPatterns = @(
+            'edgeupdate*',
+            'gupdate*',
+            'GoogleUpdate*',
+            'MicrosoftEdgeElevation*',
+            'ClickToRunSvc*',
+            'OneSyncSvc*',
+            'WpnUserService*',
+            'cbdhsvc*',
+            'BcastDVRUserService*',
+            'DevicesFlow*',
+            'PimIndexMaintenanceSvc*',
+            'UnistoreSvc*',
+            'UserDataSvc*',
+            'InventorySvc*'    # PerSession diagnostic service
+        )
+
         $stoppedAuto = Get-Service -ErrorAction Stop | Where-Object {
-            $_.StartType -eq "Automatic" -and $_.Status -ne "Running"
+            $_.StartType -eq 'Automatic' -and $_.Status -ne 'Running'
         }
-        
-        if ($stoppedAuto) {
-            Write-DiagWarning "  Found $($stoppedAuto.Count) stopped automatic service(s):"
-            foreach ($svc in $stoppedAuto) {
+
+        # Filter out the known trigger-start / on-demand services
+        $reportable = @()
+        foreach ($svc in @($stoppedAuto)) {
+            if ($triggerStartAllowList -contains $svc.Name) { continue }
+            $matchedPattern = $false
+            foreach ($p in $triggerStartPatterns) {
+                if ($svc.Name -like $p) { $matchedPattern = $true; break }
+            }
+            if ($matchedPattern) { continue }
+
+            # Final check: ask sc.exe whether the service has a trigger
+            # configured. If yes, it's expected to be stopped when idle.
+            try {
+                $triggerInfo = & sc.exe qtriggerinfo $svc.Name 2>$null
+                if ($LASTEXITCODE -eq 0 -and ($triggerInfo -join "`n") -notmatch 'START SERVICE\s*:\s*0') {
+                    if (($triggerInfo -join "`n") -match 'START SERVICE') {
+                        # Has at least one start trigger - skip
+                        continue
+                    }
+                }
+            }
+            catch { }
+
+            $reportable += $svc
+        }
+
+        if ($reportable.Count -gt 0) {
+            Write-DiagWarning "  Found $($reportable.Count) stopped automatic service(s):"
+            foreach ($svc in $reportable) {
                 Write-DiagWarning "    - $($svc.DisplayName) ($($svc.Name)): $($svc.Status)"
             }
+            Write-Info "  Remediation: Start each one and watch System log. Persistent failure"
+            Write-Info "               => check service Recovery tab and the dependency chain"
+            Write-Info "               via 'sc.exe qc <ServiceName>'."
         }
         else {
-            Write-Success "  All automatic services are running"
+            $skipped = (@($stoppedAuto).Count - $reportable.Count)
+            if ($skipped -gt 0) {
+                Write-Success "  All non-trigger automatic services are running ($skipped trigger-start services skipped)"
+            }
+            else {
+                Write-Success "  All automatic services are running"
+            }
         }
     }
     catch {
@@ -4010,7 +6317,18 @@ function Test-ServicesHealth {
     }
     
     # Disabled services that are typically needed
+    # ------------------------------------------------------------
+    # StartType=Disabled means the service CANNOT start, even on demand. Often
+    # done as 'hardening' (e.g. SecurityHealthService, RemoteRegistry, WinRM)
+    # but mis-applied disabling regularly causes outages months later when an
+    # admin or feature tries to use the service. Review the list against the
+    # server's role: a DC needs Netlogon enabled, a file server needs
+    # LanmanServer, an Arc-enrolled box needs himds + GuestConfigArc, etc.
+    # ------------------------------------------------------------
     Write-Section "Disabled Services (may need attention)"
+    Write-Info "  Description: Services explicitly set to StartType=Disabled. Often the"
+    Write-Info "               result of past hardening; verify none are needed by the"
+    Write-Info "               server's current role (DC, file server, Arc, RDS, etc.)."
     try {
         $disabledSvcs = @(Get-Service -ErrorAction Stop | Where-Object {
             $_.StartType -eq "Disabled"
@@ -4023,6 +6341,8 @@ function Test-ServicesHealth {
             foreach ($svc in $disabledSvcs) {
                 Write-Info "    - $($svc.DisplayName) ($($svc.Name))"
             }
+            Write-Info "  Remediation: To re-enable a service:"
+            Write-Info "               Set-Service -Name <Name> -StartupType Automatic; Start-Service <Name>"
         }
         else {
             Write-Info "  No disabled services found"
@@ -4033,7 +6353,22 @@ function Test-ServicesHealth {
     }
     
     # Recently crashed services (Event 7034)
+    # ------------------------------------------------------------
+    # System Event 7034 = 'The X service terminated unexpectedly.'
+    # Logged by Service Control Manager when a service process exits without
+    # going through the normal Stop sequence. The accompanying message includes
+    # how many times the service has crashed since boot - the fact that we see
+    # it logged means SCM did NOT successfully restart it via the Recovery tab.
+    # Companion events to look for:
+    #   1000  - Application Error (the actual exception in the service .exe)
+    #   7031  - Service crashed but Recovery action triggered
+    #   7032  - Recovery action failed
+    # ------------------------------------------------------------
     Write-Section "Recently Crashed/Terminated Services (last 24 hours)"
+    Write-Info "  Description: SCM Event 7034 = a service process terminated unexpectedly"
+    
+    Write-Info "               (no clean Stop). Check Application log Event 1000 around the"
+    Write-Info "               same timestamp for the actual unhandled exception/faulting module."
     try {
         $crashEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -4046,6 +6381,9 @@ function Test-ServicesHealth {
             foreach ($evt in $crashEvents) {
                 Write-DiagWarning "    [$($evt.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))] $(Get-EventSnippet -Event $evt -MaxLength 120)"
             }
+            Write-Info "  Remediation: Configure service Recovery actions (sc.exe failure <Name>"
+            Write-Info "               reset= 86400 actions= restart/60000/restart/60000/run/60000)"
+            Write-Info "               and capture a user-mode dump via WER LocalDumps for the next crash."
         }
         else {
             Write-Success "  No service crashes detected in the last 24 hours"
@@ -4056,32 +6394,118 @@ function Test-ServicesHealth {
     }
 
     # W32Time NTP Sync Status
+    # ------------------------------------------------------------
+    # Time skew > 5 minutes from the domain hierarchy will break Kerberos
+    # authentication (KRB_AP_ERR_SKEW), causing logon failures, GPO failures,
+    # cluster heartbeat issues, AD replication failures, and SQL AG endpoint
+    # auth failures. Stratum tells you where in the time hierarchy you are
+    # (1 = direct from a stratum-0 source; 16 = unsynchronized / offline).
+    # In an AD domain, every member should sync from its PDC Emulator chain;
+    # the PDC Emulator should sync from a reliable external NTP source.
+    # ------------------------------------------------------------
     Write-Section "Time Service (NTP) Sync Status"
+    Write-Info "  Description: Source = current NTP peer; Stratum = distance from authoritative"
+    Write-Info "               clock (1=best, 16=unsynced); Last Sync = recency. >5min skew"
+    Write-Info "               from the domain breaks Kerberos => mass auth failures."
     try {
         $w32tmOutput = w32tm /query /status 2>&1
         if ($LASTEXITCODE -eq 0) {
-            $sourceMatch = $w32tmOutput | Select-String 'Source:'
+            $sourceMatch  = $w32tmOutput | Select-String 'Source:'
             $stratumMatch = $w32tmOutput | Select-String 'Stratum:'
-            $lastSync = $w32tmOutput | Select-String 'Last Successful Sync Time:'
-            if ($sourceMatch) { Write-Info "  $($sourceMatch.Line.Trim())" }
-            if ($stratumMatch) { Write-Info "  $($stratumMatch.Line.Trim())" }
-            if ($lastSync) {
-                Write-Info "  $($lastSync.Line.Trim())"
+            $lastSync     = $w32tmOutput | Select-String 'Last Successful Sync Time:'
+
+            $sourceText  = if ($sourceMatch)  { $sourceMatch.Line.Trim() }  else { '' }
+            $stratumText = if ($stratumMatch) { $stratumMatch.Line.Trim() } else { '' }
+            $lastSyncText= if ($lastSync)     { $lastSync.Line.Trim() }     else { '' }
+
+            if ($sourceText)  { Write-Info "  $sourceText" }
+            if ($stratumText) { Write-Info "  $stratumText" }
+            if ($lastSyncText){ Write-Info "  $lastSyncText" }
+
+            # Stratum classification
+            $stratumValue = $null
+            if ($stratumText -match 'Stratum:\s*(\d+)') { $stratumValue = [int]$Matches[1] }
+            if ($null -ne $stratumValue) {
+                if ($stratumValue -ge 16) {
+                    Write-DiagError "  Stratum is $stratumValue - clock is UNSYNCHRONIZED"
+                    Write-Info "    Remediation: 'w32tm /resync /force'; check UDP/123 outbound + source NTP server reachability."
+                }
+                elseif ($stratumValue -ge 6) {
+                    Write-DiagWarning "  Stratum is $stratumValue - poor NTP hierarchy depth (target <= 4)"
+                    Write-Info "    Likely cause: chained syncing through several intermediates."
+                    Write-Info "    Remediation: Point W32Time directly at a known good NTP peer."
+                }
+                else {
+                    Write-Success "  Stratum $stratumValue is healthy"
+                }
             }
-            else {
+
+            # Source classification
+            if ($sourceText -match 'VM IC Time') {
+                # AD-joined member relying on host clock instead of domain hierarchy
+                $isDomainJoined = $false
+                try {
+                    $isDomainJoined = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).PartOfDomain
+                } catch { }
+                if ($isDomainJoined) {
+                    Write-DiagWarning "  Time source is the Hyper-V host (VM IC Time Synchronization Provider)."
+                    Write-Info "    Domain members should sync from the AD time hierarchy, not the host."
+                    Write-Info "    Remediation: Disable the 'Time synchronization' integration service on"
+                    Write-Info "                 the VM, or run 'w32tm /config /syncfromflags:domhier /update'"
+                    Write-Info "                 then 'Restart-Service W32Time'."
+                }
+                else {
+                    Write-Info "  (Workgroup VM syncing from Hyper-V host - acceptable.)"
+                }
+            }
+
+            # Last-sync recency
+            if ($lastSyncText -match 'Last Successful Sync Time:\s*(.+)$') {
+                $lastSyncRaw = $Matches[1].Trim()
+                [datetime]$lastSyncDate = [datetime]::MinValue
+                if ([datetime]::TryParse($lastSyncRaw, [ref]$lastSyncDate) -and $lastSyncDate -gt [datetime]::MinValue) {
+                    $hoursSince = ((Get-Date) - $lastSyncDate).TotalHours
+                    if ($hoursSince -gt 24) {
+                        Write-DiagWarning "  Last successful sync was $([math]::Round($hoursSince,1)) hours ago - clock may be drifting"
+                    }
+                }
+                elseif ($lastSyncRaw -match 'unspecified|never') {
+                    Write-DiagWarning "  NTP has never synced successfully"
+                    Write-Info "    Impact: Clock will drift; Kerberos auth will fail when skew > 5 min."
+                    Write-Info "    Remediation: 'w32tm /resync /force'; check UDP/123 outbound."
+                }
+            }
+            elseif (-not $lastSyncText) {
                 Write-DiagWarning "  NTP has never synced successfully"
+                Write-Info "    Impact: Clock will drift; Kerberos auth will fail when skew > 5 min."
+                Write-Info "    Remediation: 'w32tm /resync /force' then 'w32tm /query /status' again."
+                Write-Info "                 If still failing, check the source with 'w32tm /query /source'"
+                Write-Info "                 and firewall UDP/123 outbound."
             }
         }
         else {
             Write-DiagWarning "  W32Time service may not be running"
+            Write-Info "    Remediation: Start-Service W32Time; Set-Service W32Time -StartupType Automatic"
         }
     }
     catch {
-        Write-DiagWarning "  Could not check NTP status"
+        Write-DiagWarning "  Could not check NTP status: $($_.Exception.Message)"
     }
 
     # Task Scheduler Health
+    # ------------------------------------------------------------
+    # Errors here usually fall into a few buckets:
+    #   - Stored credentials no longer valid (account password rotated/expired)
+    #   - 'At log on' / 'On idle' triggers on missing user accounts
+    #   - Action exe path no longer exists (after uninstall/upgrade)
+    #   - Task running under SYSTEM but trying to access mapped drives
+    # The Operational log surfaces these as Level 1 (critical) / 2 (error).
+    # The full Task Scheduler diagnostic deep-dive lives in its own section.
+    # ------------------------------------------------------------
     Write-Section "Task Scheduler Health"
+    Write-Info "  Description: High-level scan of TaskScheduler/Operational error events."
+    Write-Info "               Common causes: stale stored creds, missing exe paths, accounts"
+    Write-Info "               that no longer exist. See dedicated Task Scheduler section for detail."
     try {
         $schedEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'Microsoft-Windows-TaskScheduler/Operational'
@@ -4094,6 +6518,9 @@ function Test-ServicesHealth {
             foreach ($evt in $schedEvents) {
                 Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] ID:$($evt.Id) $(Get-EventSnippet -Event $evt -MaxLength 80)"
             }
+            Write-Info "  Remediation: Open Task Scheduler, sort by 'Last Run Result' != 0x0,"
+            Write-Info "               re-enter credentials, fix action paths, or use the dedicated"
+            Write-Info "               Task Scheduler diagnostic option for a focused report."
         }
         else {
             Write-Success "  No Task Scheduler errors in last 24 hours"
@@ -4104,7 +6531,21 @@ function Test-ServicesHealth {
     }
 
     # EventLog Service Errors
+    # ------------------------------------------------------------
+    # System Event 1108 = 'The Event Logging service encountered an error
+    # while processing an incoming event published from <provider>.'
+    # Why it matters: when 1108s appear, you are LOSING event records (the
+    # log subsystem itself is dropping them). Common root causes:
+    #   - Malformed manifest from a 3rd-party provider
+    #   - Disk full on %WinDir%\System32\winevt\Logs
+    #   - Permissions on a custom .evtx file
+    #   - High-volume audit policy overrunning the log subsystem
+    # If 1108 is firing, NOTHING in the System/Security/Application logs is
+    # 100% trustworthy until you fix the underlying cause.
+    # ------------------------------------------------------------
     Write-Section "EventLog Service Errors"
+    Write-Info "  Description: Event 1108 = the EventLog service itself is dropping events."
+    Write-Info "               Severity is HIGH - your audit/diagnostic trail has gaps."
     try {
         $evtLogErrors = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -4117,6 +6558,10 @@ function Test-ServicesHealth {
             foreach ($evt in $evtLogErrors) {
                 Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] $(Get-EventSnippet -Event $evt -MaxLength 80)"
             }
+            Write-Info "  Remediation: Check disk space on %WinDir%\System32\winevt\Logs;"
+            Write-Info "               identify the offending provider in the message and update"
+            Write-Info "               or uninstall it; if Security log is overrunning, retune"
+            Write-Info "               audit policy or increase log size (wevtutil sl Security /ms:)."
         }
         else {
             Write-Success "  No EventLog service errors"
@@ -4125,7 +6570,22 @@ function Test-ServicesHealth {
     catch { Write-Info "  Could not query EventLog errors" }
 
     # Netlogon / Domain Connectivity Events
+    # ------------------------------------------------------------
+    # Event ID reference (System log):
+    #   5719  - Netlogon : 'No Domain Controller is available for domain X'
+    #           => DNS, network, or ALL DCs unreachable. Auth will fail.
+    #   7023  - SCM      : 'The X service terminated with the following error'
+    #           Often pairs with a service that depends on Netlogon/RPC.
+    #   7024  - SCM      : 'The X service terminated with service-specific
+    #           error <code>'. The error code is usually the real story.
+    # IMPORTANT: 7023/7024 are SCM events used by ALL services - we surface
+    # them here because Netlogon/auth-stack issues frequently cascade into
+    # them. The text payload identifies the actual service.
+    # ------------------------------------------------------------
     Write-Section "Netlogon Events"
+    Write-Info "  Description: 5719 = no DC reachable (DNS/network/all-DCs-down)."
+    Write-Info "               7023/7024 = a service failed to start (often cascades from"
+    Write-Info "               Netlogon/RPC failure). Look at the message for the real cause."
     try {
         $netlogonEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -4138,6 +6598,10 @@ function Test-ServicesHealth {
             foreach ($evt in $netlogonEvents) {
                 Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] EventID $($evt.Id): $(Get-EventSnippet -Event $evt -MaxLength 80)"
             }
+            Write-Info "  Remediation: For 5719: 'nltest /sc_query:<DOMAIN>' to test secure channel;"
+            Write-Info "               'nltest /dsgetdc:<DOMAIN>' to find a DC; verify DNS server list"
+            Write-Info "               on the NIC. For 7023/7024: open the related service in services.msc,"
+            Write-Info "               check dependencies (services.msc -> Properties -> Dependencies)."
         }
         else {
             Write-Success "  No Netlogon connectivity issues"
@@ -4146,11 +6610,27 @@ function Test-ServicesHealth {
     catch { Write-Info "  Could not query Netlogon events" }
 
     # RDP Licensing Service
+    # ------------------------------------------------------------
+    # On RDS (Remote Desktop Session Host) servers, the RD Licensing service
+    # issues per-device or per-user CALs. If the service is stopped or no RD
+    # License Server is reachable, users hit the 120-day grace period - and
+    # after expiry, RDP sessions are refused with 'No Remote Desktop license
+    # servers available'. Common system events:
+    #   1128 - 'RD Session Host server cannot connect to license server'
+    #   1129 - 'RD Session Host server cannot issue a license'
+    # Note: TermServLicensing is only present if the RD Licensing role is
+    # installed; absence is normal on non-RDS servers.
+    # ------------------------------------------------------------
     Write-Section "RDP Licensing"
+    Write-Info "  Description: Status of RD Licensing service + recent license issuance errors."
+    Write-Info "               Only meaningful on RDS / RD Session Host servers."
     try {
         $rdpLic = Get-Service -Name "TermServLicensing" -ErrorAction SilentlyContinue
         if ($null -ne $rdpLic) {
             Write-Info "  TermServLicensing: $($rdpLic.Status) ($($rdpLic.StartType))"
+        }
+        else {
+            Write-Info "  TermServLicensing service not present (not an RD Licensing server)"
         }
         $rdpEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -4159,6 +6639,9 @@ function Test-ServicesHealth {
         } -MaxEvents 3 -ErrorAction SilentlyContinue
         if ($rdpEvents) {
             Write-DiagWarning "  RDP licensing errors found in last 7 days"
+            Write-Info "    Impact: New RDP sessions may fail once the 120-day grace period ends."
+            Write-Info "    Remediation: Verify the RD License Server is online and reachable from"
+            Write-Info "                 this host; confirm the licensing mode in 'Set-RDLicenseConfiguration'."
         }
     }
     catch { }
@@ -4229,6 +6712,15 @@ function Test-EventLogHealth {
         Write-Section "$logName Log"
         
         # Check log size and capacity
+        # ------------------------------------------------------------
+        # When an event log fills, the default retention policy 'Overwrite events
+        # as needed' silently rotates - meaning historical evidence for an
+        # incident may already be GONE by the time you investigate. Critical for
+        # Security log especially: high-volume audit policy + small max size =
+        # only a few hours of audit history retained.
+        # ------------------------------------------------------------
+        Write-Info "  Description: Current size vs configured maximum. >90% full ="
+        Write-Info "               imminent rollover. Historical events may already be lost."
         try {
             $log = Get-WinEvent -ListLog $logName -ErrorAction Stop
             $usedMB = [math]::Round($log.FileSize / 1MB, 2)
@@ -4242,6 +6734,8 @@ function Test-EventLogHealth {
             
             if ($usedPercent -gt 90) {
                 Write-DiagWarning "  WARNING: Log is nearly full! Consider increasing max size or archiving."
+                Write-Info "    Remediation: 'wevtutil sl $logName /ms:268435456' (sets max to 256 MB)"
+                Write-Info "                 or archive with 'wevtutil epl $logName archive.evtx'."
             }
         }
         catch {
@@ -4249,6 +6743,14 @@ function Test-EventLogHealth {
         }
         
         # Scan for Critical and Error events in last 24 hours
+        # ------------------------------------------------------------
+        # Level 1 = Critical, Level 2 = Error. We pull the last 24 h, group by
+        # (EventID, ProviderName) so a recurring single event isn't masked by
+        # a one-off flood of unrelated errors. Top 10 by frequency are the
+        # actionable signal; the trailing list of 5 most-recent is for context.
+        # ------------------------------------------------------------
+        Write-Info "  Description: Critical (Level 1) + Error (Level 2) events in last 24h."
+        Write-Info "               Grouped by EventID+Provider so recurring failures stand out."
         try {
             $events = Get-WinEvent -FilterHashtable @{
                 LogName   = $logName
@@ -4288,7 +6790,24 @@ function Test-EventLogHealth {
     }
 
     # Cluster Events (1135, 1672)
+    # ------------------------------------------------------------
+    # System Event ID reference for Failover Clustering:
+    #   1135 - 'Cluster node X was removed from the active failover cluster
+    #          membership.' = a node lost heartbeat / quorum and was evicted.
+    #          Almost always points to network blip or PAUSED-by-monitoring.
+    #   1672 - 'Cluster node X is not joined to the cluster' (quarantine).
+    #          Triggered when a node fails 3+ times in 1 hour - quarantined
+    #          for 2 hours and cannot re-join automatically.
+    # Both events almost always correlate with one of:
+    #   - Network adapter / NIC driver flap (check Section 'Network Adapter Error Events')
+    #   - VMQ-related packet drops on Hyper-V hosts
+    #   - SAN / iSCSI path loss
+    #   - Antivirus filter holding a registry key during cluster snapshot
+    # ------------------------------------------------------------
     Write-Section "Cluster Heartbeat/Quarantine Events (last 7 days)"
+    Write-Info "  Description: 1135 = node evicted from cluster (heartbeat/quorum loss)."
+    Write-Info "               1672 = node quarantined after 3+ failures in 1 hour."
+    Write-Info "               Correlate timestamps with NIC events + storage path events."
     try {
         $clusterEvts = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -4301,6 +6820,10 @@ function Test-EventLogHealth {
             foreach ($g in ($clusterEvts | Group-Object Id)) {
                 Write-DiagWarning "    Event $($g.Name): $($g.Count) occurrence(s)"
             }
+            Write-Info "  Remediation: Run 'Get-ClusterLog -TimeSpan 60 -Destination C:\Temp'"
+            Write-Info "               and search for 'STATUS_LIVEDUMP_GENERATED' or 'NETFT' entries"
+            Write-Info "               near the event time. Verify cluster network priority order"
+            Write-Info "               with 'Get-ClusterNetwork | Select Name,Role,Metric'."
         }
         else {
             Write-Success "  No cluster heartbeat/quarantine events"
@@ -4309,8 +6832,23 @@ function Test-EventLogHealth {
     catch { Write-Info "  Failover Clustering may not be installed" }
 
     # FailoverClustering Operational Log (v3.0 cluster-safe)
+    # ------------------------------------------------------------
+    # The Operational channel captures Critical / Error / Warning entries from
+    # the cluster service that don't always surface in System log. Common IDs
+    # of interest:
+    #   1146  - RHS (Resource Host) terminated unexpectedly
+    #   1230  - Cluster resource entered FAILED state
+    #   1564  - File Share Witness offline (FSW path unreachable)
+    #   1561  - Cluster lost quorum
+    #   1809  - Cluster heartbeat dropped
+    # We collect Levels 1/2/3 (Critical/Error/Warning) over 24 h, group by
+    # ID for at-a-glance frequency, then sample 3 for context.
+    # ------------------------------------------------------------
     if ($script:ClusterEnv.IsClusterNode) {
         Write-Section "Failover Clustering Operational Log (last 24h)"
+        Write-Info "  Description: Critical/Error/Warning entries from the cluster service."
+        Write-Info "               Watch for 1146 (RHS crash), 1230 (resource failed), 1564 (FSW lost),"
+        Write-Info "               1561 (quorum lost), 1809 (heartbeat dropped)."
         try {
             $fcEvents = Get-WinEvent -FilterHashtable @{
                 LogName   = 'Microsoft-Windows-FailoverClustering/Operational'
@@ -4338,7 +6876,22 @@ function Test-EventLogHealth {
     }
 
     # Storage Events (129, 153)
+    # ------------------------------------------------------------
+    # System Event ID reference (Provider = disk / storahci / iaStorAVC / etc.):
+    #   129 - 'Reset to device, \Device\RaidPort0, was issued.' = the storage
+    #         driver had to issue a SCSI bus reset because the controller stopped
+    #         responding to a command in time. Often the precursor to a RAID
+    #         path failover or to data-corruption events.
+    #   153 - 'The IO operation at logical block address X was retried.' = a
+    #         transient I/O failure that the driver recovered from. Single events
+    #         are routine; >10/day on the same disk = degrading drive or path.
+    # Both IDs are reused by SOME unrelated providers, but on Server SKUs they
+    # are overwhelmingly storage-related. Cross-reference with the 'Disk' section.
+    # ------------------------------------------------------------
     Write-Section "Storage Adapter Events (129/153, last 7 days)"
+    Write-Info "  Description: 129 = storage driver issued bus reset (controller hung)."
+    Write-Info "               153 = transient I/O retry (>10/day on same disk = degrading)."
+    Write-Info "               Correlate with disk latency spikes in the Disk diagnostic."
     try {
         $storEvts = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -4351,6 +6904,10 @@ function Test-EventLogHealth {
             foreach ($g in ($storEvts | Group-Object Id)) {
                 Write-DiagWarning "    Event $($g.Name): $($g.Count) occurrence(s)"
             }
+            Write-Info "  Remediation: Update HBA / RAID controller firmware + driver to vendor's"
+            Write-Info "               latest. Run 'Get-PhysicalDisk | ? HealthStatus -ne Healthy'."
+            Write-Info "               If on SAN, ask storage team to check fabric / array logs at"
+            Write-Info "               the same timestamps for path errors."
         }
         else {
             Write-Success "  No storage adapter errors"
@@ -4359,7 +6916,21 @@ function Test-EventLogHealth {
     catch { }
 
     # DNS Update Failures (1196)
+    # ------------------------------------------------------------
+    # System Event ID reference (Provider = NETLOGON / DnsApi):
+    #   8018 - 'Active Directory could not register DNS records' (DC-side)
+    #   8019 - 'DNS update failed for hostname X.Y.Z'
+    # Triggered when the host tries to dynamically register/refresh its A/PTR
+    # record and the DNS server refuses or is unreachable. Symptoms: stale
+    # records pointing to an old IP, name resolution failures from peers,
+    # Kerberos ticket failures (SPN/host mismatch).
+    # NOTE: A/PTR registration relies on UPDATE permission; on Secure-only
+    # zones, only the matching computer account can update its own records.
+    # ------------------------------------------------------------
     Write-Section "DNS Update Failure Events"
+    Write-Info "  Description: 8018/8019 = host failed to dynamically register its A/PTR"
+    Write-Info "               record. Result: stale DNS, name resolution failures from peers,"
+    Write-Info "               possible Kerberos issues."
     try {
         $dnsEvts = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -4369,6 +6940,9 @@ function Test-EventLogHealth {
 
         if ($dnsEvts) {
             Write-DiagWarning "  Found $($dnsEvts.Count) DNS dynamic update failure(s)"
+            Write-Info "  Remediation: 'ipconfig /registerdns' to force re-registration; check"
+            Write-Info "               that the DNS server allows secure dynamic updates and the"
+            Write-Info "               computer account has Write permission on its DNS record."
         }
         else {
             Write-Success "  No DNS update failures"
@@ -4377,7 +6951,19 @@ function Test-EventLogHealth {
     catch { }
 
     # Known Critical Event Summary (from $script:KnownCriticalEventIDs)
+    # ------------------------------------------------------------
+    # $script:KnownCriticalEventIDs is a hand-curated lookup of high-impact
+    # event IDs the support team has decided are 'never normal' (e.g. bugcheck
+    # 1001, USER32 1074 unplanned shutdown, SCM 7001 dependency failure, etc.).
+    # Defined near the top of the script under #region Constants.
+    # We surface ANY occurrence in the last 24 h - even one is worth noting.
+    # ------------------------------------------------------------
     Write-Section "High-Priority Event Summary (last 24h)"
+    Write-Info "  Description: Curated list of high-impact event IDs (bugcheck, unplanned"
+    
+    Write-Info "               shutdown, SCM dependency failure, etc.). Even one occurrence"
+    Write-Info "               in the last 24 h warrants investigation."
+    $foundAny = $false
     foreach ($logName in $script:KnownCriticalEventIDs.Keys) {
         foreach ($evtDef in $script:KnownCriticalEventIDs[$logName]) {
             try {
@@ -4390,10 +6976,14 @@ function Test-EventLogHealth {
 
                 if ($found.Count -gt 0) {
                     Write-DiagWarning "  [$logName] Event $($evtDef.Id) ($($evtDef.Desc)): $($found.Count) occurrence(s)"
+                    $foundAny = $true
                 }
             }
             catch { }
         }
+    }
+    if (-not $foundAny) {
+        Write-Success "  No high-priority events found in the last 24 hours"
     }
 }
 
@@ -4463,7 +7053,17 @@ function Test-DNSHealth {
     Write-Header "DNS Health & Connectivity"
     
     # DNS Client service status
-    Write-Info "DNS Client Service Status:"
+    # ------------------------------------------------------------
+    # Dnscache (DNS Client) is the user-mode service that caches name lookups,
+    # handles dynamic registration, and proxies queries to the configured
+    # resolvers. If it's stopped, every name resolution falls back to a direct
+    # query and registry/HOSTS-file behavior changes - many apps will appear
+    # 'slow' and dynamic A/PTR record updates won't happen at boot.
+    # ------------------------------------------------------------
+    Write-Section "DNS Client Service Status"
+    Write-Info "  Description: The Dnscache service handles name resolution + dynamic A/PTR"
+    Write-Info "               registration. Stopped = direct queries on every lookup, no"
+    Write-Info "               registration at boot, slow application name resolution."
     try {
         $dnsClient = Get-Service -Name "Dnscache" -ErrorAction Stop
         if ($dnsClient.Status -eq "Running") {
@@ -4471,6 +7071,7 @@ function Test-DNSHealth {
         }
         else {
             Write-DiagError "  DNS Client service is NOT running: $($dnsClient.Status)"
+            Write-Info "    Remediation: Start-Service Dnscache; Set-Service Dnscache -StartupType Automatic"
         }
     }
     catch {
@@ -4478,16 +7079,44 @@ function Test-DNSHealth {
     }
     
     # Configured DNS servers per adapter
+    # ------------------------------------------------------------
+    # The IPv4 DNS server list per active NIC plus a sub-50ms ping check on each.
+    # Common pitfalls:
+    #   - Empty server list on a NIC that's actually being used (DHCP failed)
+    #   - Public resolver (8.8.8.8) listed on a domain-joined server -> AD
+    #     SRV lookups won't resolve (kerberos/group policy will fail)
+    #   - Multiple NICs each with their own DNS list -> 'split-horizon' query
+    #     order can be unpredictable (see Get-DnsClientNrptPolicy)
+    # ------------------------------------------------------------
     Write-Section "Configured DNS Servers"
+    Write-Info "  Description: IPv4 DNS resolver list per active NIC, with reachability /"
+    Write-Info "               latency check. Domain members must use AD DNS, NOT public 8.8.8.8."
     try {
-        $adapters = Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq "Up" }
+        $adapters = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq "Up" })
+
+        # Storage / heartbeat NICs (SMB Direct, iSCSI, cluster heartbeat) deliberately
+        # have NO DNS servers configured - DNS on a non-default-route NIC can confuse
+        # the resolver. Don't WARN for these; emit INFO instead.
+        $storageNicPattern = '(?i)SMB|Storage|Heartbeat|Cluster|vMotion|LiveMigration|RDMA|iSCSI|Backup|Repl'
+
+        # Pre-scan: does ANY adapter have DNS configured? If at least one does,
+        # missing DNS on others is far more likely a deliberate choice than breakage.
+        $anyDnsConfigured = $false
+        foreach ($a in $adapters) {
+            $d = Get-DnsClientServerAddress -InterfaceAlias $a.Name -ErrorAction SilentlyContinue |
+                Where-Object { $_.AddressFamily -eq 2 }
+            if ($null -ne $d -and $null -ne $d.ServerAddresses -and $d.ServerAddresses.Count -gt 0) {
+                $anyDnsConfigured = $true; break
+            }
+        }
+
         foreach ($adapter in $adapters) {
             $dnsServers = Get-DnsClientServerAddress -InterfaceAlias $adapter.Name -ErrorAction SilentlyContinue |
             Where-Object { $_.AddressFamily -eq 2 }  # IPv4
-            
+
             if ($null -ne $dnsServers -and $null -ne $dnsServers.ServerAddresses -and $dnsServers.ServerAddresses.Count -gt 0) {
                 Write-Info "  $($adapter.Name): $($dnsServers.ServerAddresses -join ', ')"
-                
+
                 # Ping each DNS server
                 foreach ($dns in $dnsServers.ServerAddresses) {
                     try {
@@ -4506,7 +7135,17 @@ function Test-DNSHealth {
                 }
             }
             else {
-                Write-DiagWarning "  $($adapter.Name): No DNS servers configured"
+                $isStorageNic = $adapter.Name -match $storageNicPattern
+                if ($isStorageNic -and $anyDnsConfigured) {
+                    Write-Info "  $($adapter.Name): No DNS servers configured (expected on storage/heartbeat NIC)"
+                }
+                elseif ($anyDnsConfigured) {
+                    # Other NIC has DNS; this one missing it is mildly unusual but rarely a real outage
+                    Write-Info "  $($adapter.Name): No DNS servers configured (resolver will use other NIC)"
+                }
+                else {
+                    Write-DiagWarning "  $($adapter.Name): No DNS servers configured"
+                }
             }
         }
     }
@@ -4515,7 +7154,17 @@ function Test-DNSHealth {
     }
     
     # DNS resolution tests
+    # ------------------------------------------------------------
+    # Two external (microsoft.com / google.com) + the local computer's domain.
+    # External tests prove resolver path + internet egress; local-domain test
+    # proves the AD DNS chain works for SRV/Kerberos discovery.
+    # NOTE: A successful resolution here does NOT prove DNSSEC validation -
+    # use 'Resolve-DnsName -DnsSecOk' if DNSSEC matters in your environment.
+    # ------------------------------------------------------------
     Write-Section "DNS Resolution Tests"
+    Write-Info "  Description: External (microsoft.com / google.com) + local domain."
+    Write-Info "               Failures here = resolver path broken, firewall block, or"
+    Write-Info "               configured DNS servers themselves down."
     $testDomains = @("microsoft.com", "google.com")
     
     foreach ($domain in $testDomains) {
@@ -4550,7 +7199,16 @@ function Test-DNSHealth {
     }
     
     # DNS cache statistics
+    # ------------------------------------------------------------
+    # The local DNS resolver cache holds answers up to their TTL. We surface a
+    # count + a small sample so an operator can spot stale CNAME/A entries that
+    # are 'sticking' due to long TTLs (>1 hour) - common cause of post-DR or
+    # post-failover apps still hitting the OLD endpoint.
+    # ------------------------------------------------------------
     Write-Section "DNS Cache Statistics"
+    Write-Info "  Description: Local resolver cache contents. Stale entries with long TTLs"
+    Write-Info "               (>1 hour) are a common cause of post-failover 'wrong endpoint'"
+    Write-Info "               issues. Flush with 'ipconfig /flushdns' if needed."
     try {
         $cache = Get-DnsClientCache -ErrorAction Stop
         if ($cache) {
@@ -4570,7 +7228,21 @@ function Test-DNSHealth {
     }
 
     # DNS "Bad Key" Errors
+    # ------------------------------------------------------------
+    # A "BADKEY" response from the DNS server during a TSIG-signed dynamic
+    # update means the requesting principal's signing key (typically the AD
+    # computer/cluster name object) does not match the key the DNS server
+    # expects, OR the principal does not have permission to update the record.
+    # On a Failover Cluster, this most often manifests as the Cluster Name
+    # Object (CNO) or Virtual Computer Object (VCO) being unable to update its
+    # A record after a failover -> stale DNS pointing to the previous owner.
+    # NOTE: Querying 'DNS Server' log only works on machines actually running
+    # the DNS Server role; on a member server the catch returns 'not available'.
+    # ------------------------------------------------------------
     Write-Section "DNS Bad Key Errors (cluster CNO/VCO failures)"
+    Write-Info "  Description: BADKEY = TSIG-signed dynamic update was rejected. Common"
+    Write-Info "               cluster CNO/VCO failure - cluster name cannot update its A"
+    Write-Info "               record after failover, leaving stale DNS pointing to old owner."
     try {
         $badKeyEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'DNS Server'
@@ -4581,6 +7253,8 @@ function Test-DNSHealth {
             Write-DiagError "  Found $($badKeyEvents.Count) DNS Bad Key event(s) in last 7 days!"
             Write-Info "  This typically means cluster name objects (CNO/VCO) cannot update DNS"
             Write-Info "  Fix: Grant the cluster computer object 'Full Control' on the DNS record"
+            Write-Info "       (DNS Manager -> right-click record -> Properties -> Security tab),"
+            Write-Info "       OR delete the stale DNS record and let the CNO re-register."
         }
         else {
             Write-Success "  No DNS Bad Key errors"
@@ -4591,7 +7265,16 @@ function Test-DNSHealth {
     }
 
     # Cluster Listener Name Resolution
+    # ------------------------------------------------------------
+    # The Cluster Name (CNO) is the network identity used by clients to reach
+    # the cluster. If the CNO does not resolve, every client connecting via the
+    # cluster's virtual name (file shares, generic services) breaks - even though
+    # the underlying nodes are individually reachable.
+    # ------------------------------------------------------------
     Write-Section "Cluster Name Resolution"
+    Write-Info "  Description: The Cluster Name Object (CNO) is the virtual name clients use."
+    Write-Info "               Resolution failure = no client can reach the cluster identity"
+    Write-Info "               even if the underlying nodes are healthy."
     try {
         $clusterSvc = Get-Service -Name "ClusSvc" -ErrorAction SilentlyContinue
         if ($null -ne $clusterSvc -and $clusterSvc.Status -eq "Running") {
@@ -4616,8 +7299,17 @@ function Test-DNSHealth {
     }
 
     # AG Listener Name Resolution (v3.0 cluster-safe)
+    # ------------------------------------------------------------
+    # SQL AlwaysOn Availability Group Listeners are virtual network names backed
+    # by Windows cluster resources. If the listener DNS record is stale (still
+    # points to the previous PRIMARY's IP) after a failover, applications using
+    # the listener experience login timeouts even though SQL is healthy on the
+    # new PRIMARY. This is the #1 cause of post-failover AG connectivity issues.
+    # ------------------------------------------------------------
     if ($script:ClusterEnv.IsAGInstalled -and $script:ClusterEnv.AGDetails.Count -gt 0) {
         Write-Section "AG Listener Name Resolution"
+        Write-Info "  Description: SQL AG listener virtual name. Stale DNS post-failover is"
+        Write-Info "               the #1 cause of AG client connection timeouts."
         foreach ($ag in $script:ClusterEnv.AGDetails) {
             if ($ag.listener_name) {
                 Write-Info "  AG '$($ag.ag_name)' listener: $($ag.listener_name):$($ag.listener_port)"
@@ -4637,7 +7329,17 @@ function Test-DNSHealth {
     }
 
     # AD Secure Dynamic DNS Update Failures
+    # ------------------------------------------------------------
+    # Same 8018/8019 IDs surfaced in the Event Log section, but here in the
+    # context of DNS health (is the host's own A/PTR registration current?).
+    # If failing, expect symptoms like:
+    #   - Other servers cannot reach this host by name
+    #   - Kerberos failures (SPN <-> A record mismatch)
+    #   - GPO 'computer config' policies failing to apply
+    # ------------------------------------------------------------
     Write-Section "DNS Dynamic Update Failures"
+    Write-Info "  Description: 8018/8019 = host failed to register/refresh its A/PTR. Other"
+    Write-Info "               servers may not be able to resolve this host's name."
     try {
         $dnsUpdateFail = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -4650,6 +7352,9 @@ function Test-DNSHealth {
             foreach ($evt in $dnsUpdateFail) {
                 Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] $(Get-EventSnippet -Event $evt -MaxLength 100)"
             }
+            Write-Info "  Remediation: 'ipconfig /registerdns' to retry; verify the DNS zone"
+            Write-Info "               allows secure dynamic updates and the computer object"
+            Write-Info "               has Write permission on its DNS record."
         }
         else {
             Write-Success "  No DNS dynamic update failures"
@@ -4658,7 +7363,19 @@ function Test-DNSHealth {
     catch { }
 
     # Reverse DNS Check
+    # ------------------------------------------------------------
+    # Reverse zones (in-addr.arpa) map IP -> name. Many enterprise services rely
+    # on PTR records:
+    #   - Email servers (anti-spam reverse-lookup)
+    #   - Kerberos (SPN validation in some configurations)
+    #   - SQL Server log shipping with hostnames
+    #   - Audit / SIEM reverse-resolution for IP source enrichment
+    # We sample the first 2 IPs to keep this fast on multi-NIC servers.
+    # ------------------------------------------------------------
     Write-Section "Reverse DNS Lookup"
+    Write-Info "  Description: PTR (reverse) lookup for the server's first 2 IPs. Missing"
+    Write-Info "               PTRs break SMTP anti-spam, some Kerberos paths, and SIEM"
+    Write-Info "               IP-to-hostname enrichment."
     try {
         $serverIPs = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' }
         foreach ($ip in $serverIPs | Select-Object -First 2) {
@@ -4668,6 +7385,8 @@ function Test-DNSHealth {
             }
             catch {
                 Write-DiagWarning "  $($ip.IPAddress) -> No PTR record (reverse DNS missing)"
+                Write-Info "    Remediation: Create PTR in the matching in-addr.arpa zone, or"
+                Write-Info "                 enable PTR auto-creation on the forward zone properties."
             }
         }
     }
@@ -4747,7 +7466,20 @@ function Test-SecurityAuthentication {
     Write-Header "Security & Authentication Check"
     
     # Account lockout policy
-    Write-Info "Account Lockout Policy:"
+    # ------------------------------------------------------------
+    # Local 'net accounts' surfaces three policy settings that determine how
+    # the OS responds to bad-password floods:
+    #   Lockout threshold           = N bad attempts before account locks
+    #   Lockout duration            = how long it stays locked (minutes)
+    #   Lockout observation window  = sliding window for counting attempts
+    # NOTE: On a domain-joined machine, the domain GPO usually OVERRIDES the
+    # local policy shown here for domain accounts. We still surface local
+    # policy because it applies to local accounts (e.g. local Administrator).
+    # ------------------------------------------------------------
+    Write-Section "Account Lockout Policy"
+    Write-Info "  Description: Local lockout settings (threshold/duration/observation window)."
+    Write-Info "               Domain GPO overrides these for domain accounts; local policy"
+    Write-Info "               still applies to local accounts (e.g. local Administrator)."
     try {
         $lockoutPolicy = net accounts 2>&1
         $lockoutThresholdMatch = $lockoutPolicy | Select-String "Lockout threshold"
@@ -4772,6 +7504,9 @@ function Test-SecurityAuthentication {
         }
         elseif ($lockoutThreshold -match "Never") {
             Write-DiagWarning "  WARNING: No account lockout threshold configured!"
+            Write-Info "    Impact: Accounts can be brute-forced indefinitely with no lockout."
+            Write-Info "    Remediation: 'net accounts /lockoutthreshold:5 /lockoutwindow:30 /lockoutduration:30'"
+            Write-Info "                 (or apply the equivalent GPO from a Domain Controller)."
         }
     }
     catch {
@@ -4779,7 +7514,21 @@ function Test-SecurityAuthentication {
     }
     
     # Recent failed logon events (Event 4625)
+    # ------------------------------------------------------------
+    # Security Event 4625 = 'An account failed to log on.' Requires the audit
+    # policy 'Audit Logon - Failure' to be enabled (it usually is by default
+    # on Server 2016+). The XML payload contains TargetUserName + IpAddress
+    # which we extract to spot:
+    #   - One account being repeatedly hammered (likely brute force)
+    #   - One source IP probing many accounts (password spraying)
+    # We sample the top 5 targeted accounts; the source IP grouping is left
+    # to the operator's manual follow-up if needed.
+    # ------------------------------------------------------------
     Write-Section "Recent Failed Logon Attempts (last 24 hours)"
+    Write-Info "  Description: Security Event 4625 = failed logon. Requires 'Audit Logon"
+    Write-Info "               (Failure)' policy enabled. Top 5 targeted accounts shown."
+    Write-Info "               High count on one account = brute force; low count across many"
+    Write-Info "               accounts from one IP = password spraying."
     try {
         $failedLogons = Get-WinEvent -FilterHashtable @{
             LogName   = 'Security'
@@ -4817,7 +7566,21 @@ function Test-SecurityAuthentication {
     }
     
     # Kerberos ticket status
+    # ------------------------------------------------------------
+    # 'klist' lists the Kerberos tickets currently cached for the running user.
+    # Useful checks:
+    #   - Cached Tickets count = 0 -> user has not authenticated to AD this
+    #     session, OR Kerberos is failing and falling back to NTLM
+    #   - Server: krbtgt/<DOMAIN> -> the TGT (Ticket Granting Ticket); without
+    #     this nothing else will work
+    #   - Long expired tickets still cached -> stale; 'klist purge' to clear
+    # NOTE: This shows tickets for the WSTT-running user only. Use 'klist -li 0x3e7'
+    # for SYSTEM (computer account) tickets.
+    # ------------------------------------------------------------
     Write-Section "Kerberos Ticket Status"
+    Write-Info "  Description: Cached Kerberos tickets for the current user. Count=0 means"
+    Write-Info "               no AD auth this session OR Kerberos failed and fell back to NTLM."
+    Write-Info "               For SYSTEM (computer-account) tickets use 'klist -li 0x3e7'."
     try {
         $klistOutput = klist 2>&1
         $ticketMatch = $klistOutput | Select-String "Cached Tickets"
@@ -4838,7 +7601,23 @@ function Test-SecurityAuthentication {
     }
     
     # Secure channel with domain
+    # ------------------------------------------------------------
+    # Every domain-joined computer maintains a 'secure channel' to a Domain
+    # Controller using the computer-account password (rotated every ~30 days
+    # by Netlogon). If the local machine and AD disagree on this password
+    # (typical causes: VM rolled back from snapshot, machine rejoined after
+    # being orphaned, replication divergence), the secure channel breaks and
+    # symptoms include:
+    #   - 'Trust relationship between this workstation and primary domain failed'
+    #   - GPO doesn't apply
+    #   - Group Policy errors 1058/1006/1030
+    # Repair: Test-ComputerSecureChannel -Repair (needs domain-admin creds) OR
+    # 'netdom resetpwd /server:<DC> /userd:<admin> /passwordd:*'
+    # ------------------------------------------------------------
     Write-Section "Domain Secure Channel"
+    Write-Info "  Description: Computer-account password sync between this host and AD."
+    Write-Info "               Broken = 'trust relationship failed' errors, GPO failures,"
+    Write-Info "               group policy events 1058/1006/1030."
     try {
         $domain = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Domain
         if ($domain -and $domain -ne "WORKGROUP") {
@@ -4849,6 +7628,8 @@ function Test-SecurityAuthentication {
             else {
                 Write-DiagError "  Secure channel with '$domain' is BROKEN"
                 Write-Info "  Fix: Test-ComputerSecureChannel -Repair -Credential (Get-Credential)"
+                Write-Info "       (provide a domain admin credential when prompted). Alternative:"
+                Write-Info "       'netdom resetpwd /server:<DC> /userd:<admin> /passwordd:*'."
             }
         }
         else {
@@ -4860,17 +7641,29 @@ function Test-SecurityAuthentication {
     }
     
     # Windows Firewall status
+    # ------------------------------------------------------------
+    # Three profiles - Domain, Private, Public. Default behaviour SHOULD be
+    # all three Enabled with Inbound=Block, Outbound=Allow. Common mistakes:
+    #   - Disabling the Public profile so 'wifi just works' on a server
+    #   - Setting DefaultInboundAction=Allow to 'troubleshoot' and forgetting
+    #   - Per-rule allows piling up over time; the 'show rule' export is the
+    #     real audit (see Network Diagnostics 'Firewall Rules on Common Ports')
+    # ------------------------------------------------------------
     Write-Section "Windows Firewall Status"
+    Write-Info "  Description: Per-profile (Domain/Private/Public) enabled state + default"
+    Write-Info "               actions. Disabling a profile = NO host firewall on networks of"
+    Write-Info "               that type. Default Inbound MUST be Block on a hardened server."
     try {
         $fwProfiles = Get-NetFirewallProfile -ErrorAction Stop
-        foreach ($profile in $fwProfiles) {
-            $status = if ($profile.Enabled) { "ENABLED" } else { "DISABLED" }
+        foreach ($fwProfile in $fwProfiles) {
+            $status = if ($fwProfile.Enabled) { "ENABLED" } else { "DISABLED" }
             
-            if ($profile.Enabled) {
-                Write-Success "  $($profile.Name): $status (Inbound: $($profile.DefaultInboundAction), Outbound: $($profile.DefaultOutboundAction))"
+            if ($fwProfile.Enabled) {
+                Write-Success "  $($fwProfile.Name): $status (Inbound: $($fwProfile.DefaultInboundAction), Outbound: $($fwProfile.DefaultOutboundAction))"
             }
             else {
-                Write-DiagWarning "  $($profile.Name): $status"
+                Write-DiagWarning "  $($fwProfile.Name): $status"
+                Write-Info "    Remediation: Set-NetFirewallProfile -Profile $($fwProfile.Name) -Enabled True"
             }
         }
     }
@@ -4879,7 +7672,19 @@ function Test-SecurityAuthentication {
     }
 
     # Account Lockout Events (4740)
+    # ------------------------------------------------------------
+    # Security Event 4740 = 'A user account was locked out.' Logged on the DC
+    # that processed the lockout (so on a member server you'll only see locals).
+    # The first Property of the event = locked-out account name; we group on it.
+    # If you see the same account locking out repeatedly, check:
+    #   - Stored credentials in saved RDP files, scheduled tasks, IIS app pools
+    #   - Service accounts whose password was changed but a reference was missed
+    #   - Mobile devices with cached old passwords (ActiveSync / Outlook)
+    # ------------------------------------------------------------
     Write-Section "Account Lockout Events (4740, last 24h)"
+    Write-Info "  Description: Event 4740 = account was locked out. On member servers, only"
+    Write-Info "               local-account lockouts appear here. For domain accounts, query"
+    Write-Info "               the DC that holds the PDC Emulator role."
     try {
         $lockoutEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'Security'
@@ -4892,6 +7697,9 @@ function Test-SecurityAuthentication {
             $lockoutEvents | Group-Object { $_.Properties[0].Value } | ForEach-Object {
                 Write-DiagWarning "    Account '$($_.Name)': $($_.Count) lockout(s)"
             }
+            Write-Info "  Remediation: Find the source of bad-password attempts using the LockoutStatus"
+            Write-Info "               sysinternals tool, or query Event 4625 across all DCs grouped by"
+            Write-Info "               IpAddress / WorkstationName for the locked-out account."
         }
         else {
             Write-Success "  No account lockouts in last 24 hours"
@@ -4902,7 +7710,18 @@ function Test-SecurityAuthentication {
     }
 
     # Logon as a Service Policy
+    # ------------------------------------------------------------
+    # SeServiceLogonRight = the SIDs allowed to host a Windows service. Every
+    # service identity that's not LocalSystem / LocalService / NetworkService
+    # MUST appear in this list, otherwise the service fails to start with:
+    #   1069 'The service did not start due to a logon failure.'
+    # We export the local security policy via secedit and parse the right.
+    # SECURITY: secedit's output contains policy data; we tighten the temp file
+    # ACL to current-user + SYSTEM only before reading, then delete it.
+    # ------------------------------------------------------------
     Write-Section "Logon as a Service Policy"
+    Write-Info "  Description: SeServiceLogonRight = identities allowed to run as a service."
+    Write-Info "               Missing from this list = service fails with Event 1069 'logon failure'."
     try {
         $tmpFile = Join-Path $env:TEMP "secedit_export_$([System.Guid]::NewGuid().ToString('N')).cfg"
         try {
@@ -4950,7 +7769,24 @@ function Test-SecurityAuthentication {
     }
 
     # Schannel Errors (36870)
+    # ------------------------------------------------------------
+    # System Event ID reference (Provider = Schannel):
+    #   36870 - 'A fatal error occurred when attempting to access the SSL
+    #           server credential private key.' = the cert's private key is
+    #           inaccessible (ACL on MachineKeys folder is wrong, key was
+    #           moved/deleted, or the cert was imported without 'mark key
+    #           exportable').
+    #   36871 - 'A fatal error occurred while creating an SSL client credential.'
+    #           Often paired with 36870; client side of the same problem.
+    #   36874 - 'An TLS 1.x connection request was received from a remote
+    #           client application, but none of the cipher suites supported
+    #           by the client application are supported by the server.'
+    #           = TLS version / cipher suite mismatch (client TLS 1.0 hitting
+    #           a TLS 1.2-only server, or DH/RSA cipher requirements).
+    # ------------------------------------------------------------
     Write-Section "Schannel TLS Errors"
+    Write-Info "  Description: 36870/36871 = TLS cert private key inaccessible (ACL/missing key)."
+    Write-Info "               36874 = client/server TLS version or cipher suite mismatch."
     try {
         $schannelEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -4972,7 +7808,21 @@ function Test-SecurityAuthentication {
     catch { }
 
     # NTLM vs Kerberos Detection
+    # ------------------------------------------------------------
+    # Security Event 4624 = 'An account was successfully logged on.' Property
+    # index [14] is the AuthenticationPackageName. Healthy modern servers
+    # should overwhelmingly use Kerberos; high NTLM share suggests:
+    #   - SPN missing on the target service (Kerberos can't find a target)
+    #   - Connection by IP instead of hostname (NTLM-only path)
+    #   - Cross-trust / cross-forest path with broken Kerberos delegation
+    #   - Legacy clients/scripts that explicitly request NTLM
+    # NTLMv1 in particular is a major audit / compliance finding (cracked in
+    # seconds on modern hardware) - check Event 4624 + property 'LmPackageName'.
+    # ------------------------------------------------------------
     Write-Section "Authentication Protocol Usage (last 100 logons)"
+    Write-Info "  Description: Kerberos vs NTLM ratio over last 100 successful logons."
+    Write-Info "               High NTLM share = SPN issues, IP-based connections, or legacy"
+    Write-Info "               clients. NTLMv1 in particular is a compliance finding."
     try {
         $logonEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'Security'
@@ -4983,19 +7833,62 @@ function Test-SecurityAuthentication {
         if ($logonEvents) {
             $ntlmCount = 0
             $kerbCount = 0
+            $unknownCount = 0
             foreach ($evt in $logonEvents) {
                 try {
-                    $authPkg = if ($evt.Properties.Count -gt 14) { $evt.Properties[14].Value } else { $null }
-                    if ($authPkg -eq 'NTLM' -or $authPkg -like 'NtLm*') { $ntlmCount++ }
+                    # Use named XML field lookup instead of a fixed Properties[14]
+                    # index. The position of AuthenticationPackageName in 4624
+                    # has shifted between Windows versions, which caused this
+                    # check to silently report 0/0 on Server 2025.
+                    $authPkg = $null
+                    try {
+                        [xml]$xml = $evt.ToXml()
+                        $node = $xml.Event.EventData.Data | Where-Object { $_.Name -eq 'AuthenticationPackageName' } | Select-Object -First 1
+                        if ($node) { $authPkg = [string]$node.'#text' }
+                        if (-not $authPkg) {
+                            $node = $xml.Event.EventData.Data | Where-Object { $_.Name -eq 'LmPackageName' } | Select-Object -First 1
+                            if ($node) { $authPkg = [string]$node.'#text' }
+                        }
+                    }
+                    catch { }
+
+                    # Fallback to positional property if XML parse failed
+                    if (-not $authPkg -and $evt.Properties.Count -gt 14) {
+                        $authPkg = [string]$evt.Properties[14].Value
+                    }
+
+                    if ($authPkg -match '^NTLM' -or $authPkg -like 'NtLm*') { $ntlmCount++ }
                     elseif ($authPkg -eq 'Kerberos') { $kerbCount++ }
+                    elseif ($authPkg -eq 'Negotiate') {
+                        # Negotiate wraps Kerberos OR NTLM. Treat as Kerberos
+                        # only if LmPackageName is empty/'-'.
+                        $kerbCount++
+                    }
+                    else { $unknownCount++ }
                 }
-                catch { }
+                catch { $unknownCount++ }
             }
             Write-Info "  Kerberos logons: $kerbCount"
             Write-Info "  NTLM logons: $ntlmCount"
-            if ($ntlmCount -gt $kerbCount -and $ntlmCount -gt 10) {
-                Write-DiagWarning "  WARNING: NTLM usage is high - consider investigating Kerberos fallback issues"
+            if ($unknownCount -gt 0) {
+                Write-Info "  Unclassified logons: $unknownCount (auth package not reported)"
             }
+            if ($ntlmCount -eq 0 -and $kerbCount -eq 0) {
+                Write-Info "  No classifiable logon events in the last 24h (host may be idle or"
+                Write-Info "  Audit Logon Events not enabled)."
+            }
+            elseif ($ntlmCount -gt $kerbCount -and $ntlmCount -gt 10) {
+                Write-DiagWarning "  NTLM usage is high - consider investigating Kerberos fallback issues"
+                Write-Info "    Diagnosis: Enable NTLM auditing via GPO 'Network security: Restrict NTLM:"
+                Write-Info "               Audit Incoming NTLM Traffic' to see WHICH calls are using NTLM."
+                Write-Info "               Often points to apps connecting by IP, missing SPNs, or cross-trust paths."
+            }
+            else {
+                Write-Success "  Authentication mix looks healthy (Kerberos-dominant)"
+            }
+        }
+        else {
+            Write-Info "  No 4624 events in the last 24h (Audit Logon may be disabled, or host idle)"
         }
     }
     catch {
@@ -5003,24 +7896,69 @@ function Test-SecurityAuthentication {
     }
 
     # MachineKeys Permissions
+    # ------------------------------------------------------------
+    # %ProgramData%\Microsoft\Crypto\RSA\MachineKeys holds the private keys for
+    # machine-scope certificates (RDP cert, IIS cert, AD authentication cert,
+    # etc.). Required ACL: SYSTEM = Full, Administrators = Full, Everyone =
+    # Read-attributes (the third is what lets normal apps see WHICH keys exist
+    # without being able to read them).
+    # When ACLs are wrong (often after restoring an old image, applying a
+    # heavy-handed CIS hardening template, or running 'icacls /reset'):
+    #   - RDP fails: 'No remote desktop license servers available' OR connection
+    #     just disconnects mid-handshake
+    #   - IIS HTTPS bindings serve a wrong cert / no cert
+    #   - Schannel logs 36870 events (see above)
+    # ------------------------------------------------------------
     Write-Section "MachineKeys Directory Permissions"
+    Write-Info "  Description: Required ACL on MachineKeys: SYSTEM Full + Administrators Full."
+    Write-Info "               Wrong ACL = RDP/IIS HTTPS / TLS apps fail with Schannel 36870."
     try {
         $mkPath = "$env:ProgramData\Microsoft\Crypto\RSA\MachineKeys"
         if (Test-Path $mkPath) {
             $acl = Get-Acl $mkPath -ErrorAction Stop
-            $hasSystem = $acl.Access | Where-Object { $_.IdentityReference -like '*SYSTEM*' }
-            $hasAdmins = $acl.Access | Where-Object { $_.IdentityReference -like '*Administrators*' }
+
+            # Translate IdentityReference to SID and check the well-known SIDs
+            # SYSTEM (S-1-5-18) and BUILTIN\Administrators (S-1-5-32-544).
+            # String matching like '*SYSTEM*' fails on localized OS builds and
+            # on ACEs stored as raw SIDs.
+            $hasSystem = $false
+            $hasAdmins = $false
+            foreach ($ace in $acl.Access) {
+                try {
+                    $sid = if ($ace.IdentityReference -is [System.Security.Principal.SecurityIdentifier]) {
+                        $ace.IdentityReference
+                    }
+                    else {
+                        $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
+                    }
+                    if ($sid.Value -eq 'S-1-5-18') { $hasSystem = $true }
+                    if ($sid.Value -eq 'S-1-5-32-544') { $hasAdmins = $true }
+                }
+                catch {
+                    # Translation can fail for orphaned SIDs - fall back to string match
+                    if ($ace.IdentityReference.Value -like '*SYSTEM*' -or $ace.IdentityReference.Value -eq 'NT AUTHORITY\SYSTEM') { $hasSystem = $true }
+                    if ($ace.IdentityReference.Value -like '*Administrators*' -or $ace.IdentityReference.Value -eq 'BUILTIN\Administrators') { $hasAdmins = $true }
+                }
+            }
+
             if ($hasSystem -and $hasAdmins) {
                 Write-Success "  MachineKeys has SYSTEM and Administrators access"
             }
             else {
                 Write-DiagError "  MachineKeys missing SYSTEM or Administrators permissions!"
+                Write-Info "    SYSTEM ACE present:        $hasSystem"
+                Write-Info "    Administrators ACE present: $hasAdmins"
                 Write-Info "  This can cause RDP, TLS certificate, and encryption failures"
+                Write-Info "  Remediation: 'icacls $env:ProgramData\Microsoft\Crypto\RSA\MachineKeys /grant SYSTEM:F'"
+                Write-Info "               'icacls $env:ProgramData\Microsoft\Crypto\RSA\MachineKeys /grant Administrators:F'"
             }
+        }
+        else {
+            Write-Info "  MachineKeys directory not found at $mkPath (skipping)"
         }
     }
     catch {
-        Write-Info "  Could not check MachineKeys permissions"
+        Write-Info "  Could not check MachineKeys permissions: $($_.Exception.Message)"
     }
 }
 
@@ -5104,20 +8042,55 @@ function Test-WindowsUpdateStatus {
     Write-Header "Windows Update Status"
     
     # Windows Update service status
-    Write-Info "Windows Update Service Status:"
+    # ------------------------------------------------------------
+    # Two services drive Windows Update:
+    #   wuauserv  (Windows Update)            - the agent itself; orchestrates
+    #                                            scan, download, install
+    #   BITS      (Background Intelligent     - the download transport that
+    #              Transfer Service)            wuauserv hands jobs to
+    # On modern Windows, BOTH are typically StartType=Manual (triggered) and
+    # only run on demand. Disabled = updates will never apply (a real risk
+    # introduced by some hardening templates that misread STIG guidance).
+    # ------------------------------------------------------------
+    Write-Section "Windows Update Service Status"
+    Write-Info "  Description: wuauserv = the WU agent; BITS = its download transport."
+    Write-Info "               Both should be Manual (triggered) on modern Windows. Disabled"
+    Write-Info "               on either = updates will never apply."
     try {
         $wuService = Get-Service -Name "wuauserv" -ErrorAction Stop
         $bitsService = Get-Service -Name "BITS" -ErrorAction Stop
         
         Write-Info "  Windows Update (wuauserv): $($wuService.Status) ($($wuService.StartType))"
         Write-Info "  BITS: $($bitsService.Status) ($($bitsService.StartType))"
+
+        if ($wuService.StartType -eq 'Disabled') {
+            Write-DiagError "  wuauserv is DISABLED - patches cannot install on this server."
+            Write-Info "    Remediation: 'Set-Service wuauserv -StartupType Manual' (or Automatic)."
+        }
+        if ($bitsService.StartType -eq 'Disabled') {
+            Write-DiagError "  BITS is DISABLED - WU and SCCM downloads will fail."
+            Write-Info "    Remediation: 'Set-Service BITS -StartupType Manual'."
+        }
     }
     catch {
         Write-DiagError "Failed to check Windows Update services: $($_.Exception.Message)"
     }
     
     # Last installed updates
+    # ------------------------------------------------------------
+    # Get-HotFix wraps Win32_QuickFixEngineering; it ONLY shows updates that
+    # MSI/CBS recorded with a KB ID. So 'platform' updates (driver, defender
+    # definition, OOB feature updates) won't appear here - that's why a server
+    # may show 'last updated 200 days ago' yet still be relatively current.
+    # Known issue: on Server 2019 the InstalledOn property is often $null;
+    # we capture those separately so the operator at least knows they exist.
+    # Thresholds: >90d = critical (likely missing security rollups);
+    #             >30d = warning (one full Patch Tuesday cycle missed).
+    # ------------------------------------------------------------
     Write-Section "Last 10 Installed Updates"
+    Write-Info "  Description: KB updates from CBS/MSI history. Drivers + Defender defs are"
+    Write-Info "               NOT included. >90d since last KB = critical, >30d = warning."
+    Write-Info "               Server 2019 commonly returns InstalledOn=$null for some KBs."
     try {
         $updates = Get-HotFix -ErrorAction Stop |
             Where-Object { $null -ne $_.InstalledOn } |
@@ -5147,9 +8120,13 @@ function Test-WindowsUpdateStatus {
                 
                 if ($daysSinceUpdate -gt 90) {
                     Write-DiagError "  CRITICAL: Server has not been updated in over 90 days!"
+                    Write-Info "    Impact: Likely missing 3+ security rollups; high CVE exposure."
+                    Write-Info "    Remediation: Run 'sconfig' option 6, or PSWindowsUpdate module:"
+                    Write-Info "                 Install-Module PSWindowsUpdate -Force; Get-WUInstall -AcceptAll -AutoReboot"
                 }
                 elseif ($daysSinceUpdate -gt 30) {
                     Write-DiagWarning "  WARNING: Server has not been updated in over 30 days"
+                    Write-Info "    Recommendation: Schedule next maintenance window; one Patch Tuesday cycle missed."
                 }
                 else {
                     Write-Success "  Server is up to date (last updated $daysSinceUpdate days ago)"
@@ -5172,7 +8149,22 @@ function Test-WindowsUpdateStatus {
     }
     
     # Pending reboot check
+    # ------------------------------------------------------------
+    # Three independent registry signals indicate Windows wants a reboot:
+    #   1. CBS\RebootPending           - servicing stack queued changes that
+    #                                     can only be applied during boot
+    #   2. WindowsUpdate\RebootRequired - WU installed binaries waiting to
+    #                                     activate
+    #   3. PendingFileRenameOperations  - files locked by running processes;
+    #                                     SMSS will rename/delete on next boot
+    # If ANY of these is present, fresh updates / role installs will likely
+    # fail with vague errors until the box reboots. The 'Reasons' list below
+    # is critical because operators often see 'Reboot pending' and reboot,
+    # only to have it return - the underlying source needs cleanup.
+    # ------------------------------------------------------------
     Write-Section "Pending Reboot Check"
+    Write-Info "  Description: Three signals (CBS, Windows Update, PendingFileRenameOperations)."
+    Write-Info "               Any present = subsequent updates / role installs may fail until reboot."
     try {
         $pendingReboot = $false
         $reasons = @()
@@ -5202,6 +8194,9 @@ function Test-WindowsUpdateStatus {
         if ($pendingReboot) {
             Write-DiagWarning "  REBOOT PENDING!"
             Write-DiagWarning "  Reasons: $($reasons -join ', ')"
+            Write-Info "    Remediation: Schedule reboot. If 'Reboot pending' returns immediately"
+            Write-Info "                 after reboot, run 'DISM /online /cleanup-image /restorehealth'"
+            Write-Info "                 followed by 'sfc /scannow' to repair the servicing stack."
         }
         else {
             Write-Success "  No pending reboot detected"
@@ -5212,7 +8207,20 @@ function Test-WindowsUpdateStatus {
     }
     
     # OS version info
+    # ------------------------------------------------------------
+    # Win32_OperatingSystem.Caption is the friendly name (e.g. 'Microsoft
+    # Windows Server 2022 Standard'). BuildNumber is the canonical version
+    # identifier and is what we cross-reference against the lifecycle table
+    # in the next check. LastBootUpTime is in WMI/CIM time format which gets
+    # converted to a [DateTime] automatically by the modern Get-CimInstance.
+    # >90 days uptime is flagged because:
+    #   - Patches that need restart can't have been applied recently
+    #   - Memory leaks accumulate; non-paged pool exhaustion becomes likely
+    #   - On 2008 R2, uptime counter wraps around 497 days (TickCount32)
+    # ------------------------------------------------------------
     Write-Section "OS Version Information"
+    Write-Info "  Description: OS edition + build + uptime. Build number = canonical version"
+    Write-Info "               identifier (matched against lifecycle table below)."
     try {
         $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
         Write-Info "  OS: $($os.Caption)"
@@ -5225,6 +8233,8 @@ function Test-WindowsUpdateStatus {
         
         if ($uptime.TotalDays -gt 90) {
             Write-DiagWarning "  WARNING: Server has been running for over 90 days without restart"
+            Write-Info "    Impact: Reboot-required patches cannot have applied; non-paged pool may be elevated."
+            Write-Info "    Recommendation: Plan a maintenance reboot at the next available window."
         }
     }
     catch {
@@ -5232,7 +8242,21 @@ function Test-WindowsUpdateStatus {
     }
 
     # CBS Store Health
+    # ------------------------------------------------------------
+    # %SystemRoot%\Logs\CBS\CBS.log is the Component Based Servicing log -
+    # every install/uninstall/repair operation logs here. Heuristic check:
+    # if the LAST 200 lines contain >10 ERROR entries, the servicing stack
+    # is probably struggling (corrupted manifest, missing payload, ACL on
+    # WinSxS folder, etc.). Full health check is:
+    #   DISM /Online /Cleanup-Image /CheckHealth      (fast - just checks)
+    #   DISM /Online /Cleanup-Image /ScanHealth       (slow - deep scan)
+    #   DISM /Online /Cleanup-Image /RestoreHealth    (slow - actually fix)
+    #   sfc /scannow                                  (verifies system files)
+    # Tail-only sampling keeps this check fast even on multi-GB CBS.log files.
+    # ------------------------------------------------------------
     Write-Section "CBS Store Health"
+    Write-Info "  Description: Heuristic - if last 200 lines of CBS.log contain >10 ERROR entries,"
+    Write-Info "               the servicing stack is struggling. Sampling tail keeps this fast."
     try {
         $cbsLog = "$env:SystemRoot\Logs\CBS\CBS.log"
         if (Test-Path $cbsLog) {
@@ -5251,7 +8275,21 @@ function Test-WindowsUpdateStatus {
     }
 
     # Pending.xml Check
+    # ------------------------------------------------------------
+    # %SystemRoot%\WinSxS\pending.xml is the queue of CBS operations the OS
+    # plans to perform during the next servicing-aware boot. A NORMAL system
+    # has no pending.xml. If it exists and persists across reboots:
+    #   - A previous install was interrupted (power loss, BSOD mid-update)
+    #   - 'TrustedInstaller' service couldn't drain the queue (often due to
+    #     ACL damage on WinSxS or a stuck reboot)
+    # Symptoms: 'Add Roles & Features' wizard fails with vague errors;
+    # subsequent CU installs error out with 0x800f0922 / 0x80070bc9.
+    # Recovery: usually a clean reboot. If the file persists, you may need
+    # 'Stop-Service trustedinstaller' + manual XML parsing or DISM repair.
+    # ------------------------------------------------------------
     Write-Section "Pending.xml Check"
+    Write-Info "  Description: WinSxS\pending.xml = CBS reboot queue. Should NOT exist normally."
+    Write-Info "               If persistent across reboots, blocks role installs and CU updates."
     try {
         $pendingXml = "$env:SystemRoot\WinSxS\pending.xml"
         if (Test-Path $pendingXml) {
@@ -5266,7 +8304,21 @@ function Test-WindowsUpdateStatus {
     catch { }
 
     # Legacy OS Detection
+    # ------------------------------------------------------------
+    # Build numbers and corresponding products (kept inline for offline use):
+    #   <14393  -> Server 2012 / 2012 R2 (and earlier) - end of EXTENDED support
+    #              (2012 R2 ext support ended Oct 2023; ESU available)
+    #    14393  -> Server 2016         - mainstream ended Jan 2022, ext until Jan 2027
+    #    17763  -> Server 2019         - mainstream until Jan 2024, ext until Jan 2029
+    #    20348  -> Server 2022         - mainstream until Oct 2026, ext until Oct 2031
+    #    26100  -> Server 2025         - latest GA build
+    # We don't currently surface the precise EOL date but flag the stages so
+    # operators know whether they're on a refresh path or a critical migration.
+    # ------------------------------------------------------------
     Write-Section "OS Lifecycle Check"
+    Write-Info "  Description: Maps build number to product + support tier. <14393 = end of"
+    Write-Info "               extended support; 14393 (2016) approaches mainstream end;"
+    Write-Info "               17763 (2019) and newer = supported."
     try {
         $build = [int]$os.BuildNumber
         if ($build -lt 14393) {
@@ -5293,7 +8345,20 @@ function Test-WindowsUpdateStatus {
     catch { }
 
     # Failed Update Events
+    # ------------------------------------------------------------
+    # The Setup event log is where role/feature/update install events land
+    # (separate from System log). Levels: 1=Critical, 2=Error, 3=Warning.
+    # Common error events include:
+    #   - 'Update for ... failed to install with error 0x80070643' (generic
+    #     install failure - often disk space or AV interference)
+    #   - '0x800f0922' (CBS couldn't reserve space or write to WinSxS)
+    #   - '0x800f0831' (corrupt source - feed in a /source: pointer)
+    # We just surface the events; manual triage is needed to interpret the
+    # specific error code. Reference: Microsoft Update error codes KB938205.
+    # ------------------------------------------------------------
     Write-Section "Failed Update Events (last 7 days)"
+    Write-Info "  Description: Setup event log Critical/Error/Warning entries. Cross-reference"
+    Write-Info "               error codes with KB938205 (Windows Update error code list)."
     try {
         $updateFail = Get-WinEvent -FilterHashtable @{
             LogName   = 'Setup'
@@ -5306,6 +8371,8 @@ function Test-WindowsUpdateStatus {
             foreach ($evt in $updateFail) {
                 Write-DiagWarning "    [$($evt.TimeCreated.ToString('MM-dd HH:mm'))] $(Get-EventSnippet -Event $evt -MaxLength 100)"
             }
+            Write-Info "  Triage: 'wuauclt /resetauthorization /detectnow' to refresh WU; if that fails,"
+            Write-Info "          'DISM /online /cleanup-image /restorehealth' to repair the servicing stack."
         }
         else {
             Write-Success "  No failed update events"
@@ -5404,9 +8471,35 @@ function Test-CrossCategoryHealth {
     param()
 
     Write-Header "Cross-Category Health Scorecard"
+    # ------------------------------------------------------------
+    # PURPOSE: Fast 9-point triage that surfaces the highest-frequency
+    # production issues across all WSTT categories. Each check is INTENTIONALLY
+    # narrow - it only flags an issue area; the operator is expected to drop
+    # into the dedicated diagnostic (menu options 1-9) for root cause.
+    #
+    # SCORING: $issues counter increments once per failing check. The final
+    # 'SCORECARD' line summarises the count. Any non-zero count = follow-up
+    # required. The order of checks reflects real-world incident frequency:
+    #   1. Cluster heartbeat / quarantine     (HA outages)
+    #   2. Storage adapter resets             (SAN/disk fabric issues)
+    #   3. DNS dynamic update failures        (auth + GPO issues)
+    #   4. RDP listener + MachineKeys         (remote access + cert ACLs)
+    #   5. Account lockouts                   (security + service account drift)
+    #   6. Pending reboot                     (blocking patch installs)
+    #   7. Schannel TLS errors                (cert/private-key issues)
+    #   8. Cluster quorum + node state        (only if cluster member)
+    #   9. SQL AG synchronization             (only if AG is installed)
+    # ------------------------------------------------------------
+    Write-Info "Cross-cutting triage - flags issue AREAS only. Use main-menu options 1-9"
+    Write-Info "for root-cause analysis on anything flagged below."
+    Write-Host ""
     $issues = 0
 
     # 1. Cluster / AG Instability (heartbeat loss + network discards)
+    # Events 1135 = 'Cluster node was removed from the active failover
+    # cluster membership' (heartbeat loss). 1672 = node placed in QUARANTINE
+    # by Windows after 3 ungraceful failures within an hour. Either is a
+    # serious HA red flag.
     Write-Info "1. Cluster / AG Stability:"
     try {
         $clusterEvts = Get-WinEvent -FilterHashtable @{
@@ -5428,6 +8521,9 @@ function Test-CrossCategoryHealth {
     }
 
     # 2. Storage 129/153 Errors
+    # Event 129 'Reset to device, \Device\RaidPort0, was issued' = HBA reset.
+    # Event 153 'IO operation retried/failed on device' = path/timeout failure.
+    # Repeated occurrences = SAN fabric / driver / cabling / firmware issue.
     Write-Info "2. Storage Health:"
     try {
         $storEvts = Get-WinEvent -FilterHashtable @{
@@ -5447,6 +8543,9 @@ function Test-CrossCategoryHealth {
     catch { Write-Info "   Could not check" }
 
     # 3. DNS Bad Key / Cluster DNS
+    # Events 8018/8019 = 'The dynamic registration of the DNS record failed'
+    # (BADKEY = secure update authentication failed). Common with secure
+    # channel breaks, stale TSIG keys, or wrong DNS scavenging windows.
     Write-Info "3. DNS Health:"
     try {
         $dnsFailures = Get-WinEvent -FilterHashtable @{
@@ -5466,6 +8565,10 @@ function Test-CrossCategoryHealth {
     catch { Write-Info "   Could not check" }
 
     # 4. RDP Connectivity & MachineKeys
+    # Two related checks: (a) is RDP port 3389 actually listening on loopback,
+    # and (b) does the MachineKeys folder still grant SYSTEM access (broken
+    # ACL = RDP TLS handshake fails because it can't read the cert private key).
+    # Loopback test avoids firewall noise - just confirms the listener exists.
     Write-Info "4. RDP Connectivity:"
     try {
         $tcpClient = New-Object System.Net.Sockets.TcpClient
@@ -5475,8 +8578,29 @@ function Test-CrossCategoryHealth {
             Write-Success "   OK - RDP port 3389 is listening"
         }
         else {
-            $issues++
-            Write-DiagError "   ISSUE: RDP port 3389 is NOT listening"
+            # Before flagging as a real ISSUE, check whether RDP is INTENTIONALLY off.
+            # On hardened cluster nodes / Server Core / SCONFIG-managed boxes, RDP is
+            # often disabled in favor of PowerShell Remoting (WinRM/5985) - that's a
+            # security posture choice, not a misconfiguration.
+            $rdpDisabledByPolicy = $false
+            try {
+                $tsKey = Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -ErrorAction Stop
+                if ($tsKey.fDenyTSConnections -eq 1) { $rdpDisabledByPolicy = $true }
+            }
+            catch { }
+            $termSvc = Get-Service -Name 'TermService' -ErrorAction SilentlyContinue
+            $termSvcDisabled = $termSvc -and ($termSvc.StartType -eq 'Disabled' -or $termSvc.Status -ne 'Running')
+            $winRMRunning = (Get-Service -Name 'WinRM' -ErrorAction SilentlyContinue).Status -eq 'Running'
+
+            if ($rdpDisabledByPolicy -or $termSvcDisabled) {
+                $reason = if ($rdpDisabledByPolicy) { 'fDenyTSConnections=1 (Allow Remote Desktop = OFF)' } else { "TermService is $($termSvc.Status)/$($termSvc.StartType)" }
+                $altMgmt = if ($winRMRunning) { '; PowerShell Remoting (WinRM/5985) IS available as alternative' } else { '' }
+                Write-Info "   INFO: RDP port 3389 not listening - intentionally disabled ($reason)$altMgmt"
+            }
+            else {
+                $issues++
+                Write-DiagError "   ISSUE: RDP port 3389 is NOT listening"
+            }
         }
         $tcpClient.Close()
         $tcpClient.Dispose()
@@ -5500,6 +8624,8 @@ function Test-CrossCategoryHealth {
     catch { }
 
     # 5. Account Lockouts
+    # Event 4740 = lockout. Member servers only see local-account lockouts;
+    # for domain accounts the equivalent live on the PDC Emulator role-holder.
     Write-Info "5. Account Lockouts:"
     try {
         $lockouts = Get-WinEvent -FilterHashtable @{
@@ -5519,6 +8645,9 @@ function Test-CrossCategoryHealth {
     catch { Write-Info "   Could not check (audit policy may be needed)" }
 
     # 6. Pending Reboot
+    # Cheap registry-key existence test - if EITHER key exists, a reboot is
+    # queued (CBS or WindowsUpdate). Pending reboot blocks new patch installs
+    # and many role/feature operations.
     Write-Info "6. Pending Reboot:"
     $rebootNeeded = (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") -or
     (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired")
@@ -5531,6 +8660,9 @@ function Test-CrossCategoryHealth {
     }
 
     # 7. Schannel / TLS Errors
+    # Events 36870/36871 = TLS server/client credential creation failed,
+    # almost always due to private-key inaccessibility (MachineKeys ACL,
+    # missing key file, cert imported without 'mark exportable').
     Write-Info "7. TLS/Schannel Health:"
     try {
         $schannelEvts = Get-WinEvent -FilterHashtable @{
@@ -5550,6 +8682,9 @@ function Test-CrossCategoryHealth {
     catch { Write-Info "   Could not check" }
 
     # 8. Quorum Health (v3.0)
+    # Only runs on cluster nodes. Inspects the cached $script:ClusterEnv
+    # populated earlier by Get-ClusterEnvironmentInfo. Any node not in 'Up'
+    # state is flagged - includes Paused, Down, Joining, Isolated, Quarantined.
     if ($script:ClusterEnv.IsClusterNode) {
         Write-Info "8. Cluster Quorum Health:"
         try {
@@ -5574,6 +8709,10 @@ function Test-CrossCategoryHealth {
         }
 
         # 9. SQL AG Sync Health (v3.0)
+        # Only runs if SQL Always On Availability Groups are detected. Reads
+        # sys.dm_hadr_database_replica_states.synchronization_health (mapped to
+        # text by AGDetails query). HEALTHY = both sync_state=SYNCHRONIZED and
+        # database_state=ONLINE. Anything else = data movement issue.
         if ($script:ClusterEnv.IsAGInstalled -and $script:ClusterEnv.AGDetails.Count -gt 0) {
             Write-Info "9. SQL AG Synchronization:"
             foreach ($ag in $script:ClusterEnv.AGDetails) {
@@ -5609,6 +8748,20 @@ function Show-AdditionalScenarios {
         Provides options for reboot, crash, SQL, cluster, patching, and other scenarios
     #>
     Write-Header "Additional Troubleshooting Scenarios"
+    # ------------------------------------------------------------
+    # PURPOSE: Curated runbook menu for the 9 most common Microsoft Support
+    # case scenarios. Each option maps to a Microsoft TSS (Troubleshooting
+    # Script Suite) collection profile (-SDP / -Scenario / -Collectlog) plus
+    # any manual fall-back guidance.
+    #
+    # DESIGN: This is a USER-FACING runbook, not an automated diagnostic.
+    # We surface the exact TSS commands so the operator can copy-paste into
+    # their data-collection workflow. If TSS is not installed, we surface
+    # manual-equivalent guidance (procdump, sfc, DISM, perfmon, etc.).
+    #
+    # Cluster awareness: scenarios 6 (Cluster) and 7 (Patch) check $script:ClusterEnv
+    # to warn before destructive actions on an active cluster owner.
+    # ------------------------------------------------------------
     
     Write-Host "1. Unexpected Reboot" -ForegroundColor Yellow
     Write-Host "2. Boot Time Issues / Slow Logon" -ForegroundColor Yellow
@@ -5627,6 +8780,10 @@ function Show-AdditionalScenarios {
     
     switch ($choice) {
         "1" {
+            # Unexpected Reboot - SDP Perf for performance counters around the event,
+            # SDP Setup for OS/role context, DND_Setup for servicing logs. Memory.dmp
+            # at C:\Windows\Memory.dmp is the most valuable artifact if a complete
+            # memory dump was configured BEFORE the crash.
             Write-Info "Unexpected Reboot Log Collection:"
             if ($tssAvailable) {
                 Write-Info "Collect memory dump and run:"
@@ -5640,6 +8797,9 @@ function Show-AdditionalScenarios {
             Write-Info "Ensure to collect Memory.dmp from C:\Windows\ and minidump files from C:\Windows\Minidump\"
         }
         "2" {
+            # Slow Boot / Slow Logon - ADS_SBSL is a TSS auto-logger scenario that
+            # captures ETW traces across the boot phase. Requires reboot to start
+            # collecting; manual stop after the slow logon is reproduced.
             Write-Info "Slow Boot/Slow Logon (<30 minutes):"
             if ($tssAvailable) {
                 Write-Host "TSS.ps1 -Start -Scenario ADS_SBSL" -ForegroundColor Cyan
@@ -5657,6 +8817,10 @@ function Show-AdditionalScenarios {
             Write-Info "Restart (not shutdown), then stop after boot: TSS.ps1 -Stop"
         }
         "3" {
+            # Server Crash / BugCheck / Hang - the ONLY actionable artifact for kernel
+            # crashes is a complete memory dump. Active dump (Server 2016+) excludes
+            # zero pages so it's smaller. If the customer hasn't configured a complete
+            # dump beforehand, this scenario is mostly forward-looking guidance.
             Write-Info "Server Crash/BugCheck/Hang:"
             Write-Info "1. Configure Complete Memory Dump:"
             Write-Info "   Control Panel > System > Advanced > Startup and Recovery"
@@ -5668,6 +8832,10 @@ function Show-AdditionalScenarios {
             }
         }
         "4" {
+            # Application Crash - ProcDump in monitor mode (-i) registers itself
+            # as the postmortem debugger so subsequent crashes auto-generate a dump.
+            # -ma = full memory; collect 2-3 dumps so the support engineer can spot
+            # patterns vs one-off corruption. Always uninstall (-u) afterwards.
             Write-Info "Application Crash Log Collection:"
             Write-Info "1. Download ProcDump: https://learn.microsoft.com/en-us/sysinternals/downloads/procdump"
             Write-Info "2. Set as default debugger: procdump -ma -i -accepteula c:\dumps"
@@ -5678,6 +8846,10 @@ function Show-AdditionalScenarios {
             }
         }
         "5" {
+            # SQL Related Issues - SDP SQLBase grabs SQL Server error logs, default
+            # trace, system_health XEvent, sp_BlitzCache-equivalent diagnostics, and
+            # Windows perf data. -noPSR skips the slow PSR (Problem Steps Recorder).
+            # On FCI clusters, combine SDP Cluster + SDP SQLBase to get both views.
             Write-Info "SQL Related Issues:"
             if ($tssAvailable) {
                 Write-Host "TSS.ps1 -SDP SQLBase -noPSR -AcceptEula" -ForegroundColor Cyan
@@ -5690,6 +8862,11 @@ function Show-AdditionalScenarios {
             }
         }
         "6" {
+            # Cluster Related Issues - SDP Cluster is heavy; collect on ALL nodes
+            # so MS support can correlate timestamps. Pre-flight check: warn if THIS
+            # node owns active groups (collecting on owner can cause brief perf hit).
+            # SHA_MsCluster + WaitEvent is for INTERMITTENT issues - it idles waiting
+            # for the next 1135 event then captures everything around it.
             Write-Info "Cluster Related Issues:"
             if ($tssAvailable) {
                 Write-Host "TSS.ps1 -SDP Cluster -AcceptEula" -ForegroundColor Cyan
@@ -5718,6 +8895,12 @@ function Show-AdditionalScenarios {
             Write-Info "Generate Cluster Validation Report from Failover Cluster Manager"
         }
         "7" {
+            # OS Patch Issues - standard servicing-stack repair sequence:
+            # DISM /RestoreHealth (uses Windows Update; /Source: needed for offline)
+            # sfc /scannow (verifies + repairs system files from the component store)
+            # SoftwareDistribution rename forces WU to redownload the catalog.
+            # CRITICAL on cluster nodes: Cluster-Aware Updating (CAU) orchestrates
+            # patching - manually stopping wuauserv mid-CAU run will break the run.
             Write-Info "OS Patch Issues:"
             Write-Info "Basic Troubleshooting Steps:"
             Write-Info "1. Mount Windows ISO and run:"
@@ -5745,6 +8928,9 @@ function Show-AdditionalScenarios {
             Write-Info "5. Check logs: C:\Windows\Logs\CBS\CBS.log, C:\Windows\Logs\DISM\DISM.log, and Setup event log"
         }
         "8" {
+            # Server Assessment - 'baseline this server' workflow. Collects all SDPs
+            # plus a 4-hour perfmon at 1-minute interval (long enough to capture a
+            # peak load period). Shipped with the validator HTML report.
             Write-Info "Server Assessment:"
             Write-Info "Collect 4-hour perfmon with 1-minute interval + validator script"
             if ($tssAvailable) {
@@ -5754,6 +8940,10 @@ function Show-AdditionalScenarios {
             Show-PerfmonCommand "Assessment"
         }
         "9" {
+            # Export Event Logs - 'wevtutil epl' (Export Log) writes the binary .evtx
+            # file (preserves XML payload, can be re-opened in Event Viewer on any
+            # Windows machine). Default path is $script:DefaultLogPath\EventLogs.
+            # Security log export requires SeSecurityPrivilege (admin shell).
             Write-Info "Export Event Logs:"
             $exportPath = Read-Host "Enter export path (e.g., D:\EventLogs) or press Enter for default"
             
@@ -5834,7 +9024,11 @@ function Test-TLSConfiguration {
     
     Write-Info "Checking TLS Protocol Status..."
     Write-Info ""
-    
+
+    # Track which legacy protocols are explicitly enabled so the recommendations
+    # block at the bottom only fires when there is something to remediate.
+    $explicitlyEnabled = @{}
+
     foreach ($protocol in $tlsProtocols.GetEnumerator()) {
         $protocolName = $protocol.Key
         $regPath = $protocol.Value
@@ -5852,6 +9046,7 @@ function Test-TLSConfiguration {
                     
                     if ($clientEnabled.Enabled -eq 1 -and $clientDisabledByDefault.DisabledByDefault -eq 0) {
                         Write-Success "  Client: ENABLED"
+                        $explicitlyEnabled["$protocolName Client"] = $true
                     }
                     elseif ($clientEnabled.Enabled -eq 0 -or $clientDisabledByDefault.DisabledByDefault -eq 1) {
                         Write-DiagWarning "  Client: DISABLED"
@@ -5877,6 +9072,7 @@ function Test-TLSConfiguration {
                     
                     if ($serverEnabled.Enabled -eq 1 -and $serverDisabledByDefault.DisabledByDefault -eq 0) {
                         Write-Success "  Server: ENABLED"
+                        $explicitlyEnabled["$protocolName Server"] = $true
                     }
                     elseif ($serverEnabled.Enabled -eq 0 -or $serverDisabledByDefault.DisabledByDefault -eq 1) {
                         Write-DiagWarning "  Server: DISABLED"
@@ -5902,31 +9098,49 @@ function Test-TLSConfiguration {
     
     # Security Recommendations
     Write-Info "--- Security Recommendations ---"
-    Write-DiagWarning "TLS 1.0 and TLS 1.1 are deprecated and should be disabled"
+    $legacyEnabled = @($explicitlyEnabled.Keys | Where-Object { $_ -like 'TLS 1.0*' -or $_ -like 'TLS 1.1*' })
+    if ($legacyEnabled.Count -gt 0) {
+        Write-DiagWarning "TLS 1.0 / 1.1 are explicitly ENABLED on this host: $($legacyEnabled -join ', ')"
+        Write-Info "  Both protocols are deprecated by Microsoft, IETF (RFC 8996), and PCI-DSS."
+        Write-Info "  Remediation: Set 'Enabled'=0 and 'DisabledByDefault'=1 under each Protocol\Client and Protocol\Server key, then reboot."
+    }
+    else {
+        Write-Success "TLS 1.0 / 1.1 are not explicitly enabled (using OS-default disable / not present)"
+    }
     Write-Success "TLS 1.2 should be enabled (minimum requirement)"
     Write-Success "TLS 1.3 should be enabled for best security (Windows Server 2022+)"
     Write-Info ""
     
     # Check .NET Framework TLS support
     Write-Info "--- .NET Framework TLS Support ---"
+    Write-Info "  Note: On Server 2019+ / Windows 10 1809+, .NET Framework defaults to"
+    Write-Info "        SchUseStrongCrypto = ON and SystemDefaultTlsVersions = ON even when"
+    Write-Info "        the registry value is absent. We only flag it as a warning when the"
+    Write-Info "        value is explicitly set to 0 (i.e., legacy override is present)."
     try {
         $netFx4Path = "HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319"
         if (Test-Path $netFx4Path) {
             $schUseStrongCrypto = Get-ItemProperty -Path $netFx4Path -Name "SchUseStrongCrypto" -ErrorAction SilentlyContinue
             $systemDefaultTls = Get-ItemProperty -Path $netFx4Path -Name "SystemDefaultTlsVersions" -ErrorAction SilentlyContinue
-            
-            if ($schUseStrongCrypto.SchUseStrongCrypto -eq 1) {
+
+            if ($null -eq $schUseStrongCrypto) {
+                Write-Info ".NET 4.x (32-bit): Strong Crypto registry value not set (using OS default = ON)"
+            }
+            elseif ($schUseStrongCrypto.SchUseStrongCrypto -eq 1) {
                 Write-Success ".NET 4.x (32-bit): Strong Crypto ENABLED"
             }
             else {
-                Write-DiagWarning ".NET 4.x (32-bit): Strong Crypto NOT enabled"
+                Write-DiagWarning ".NET 4.x (32-bit): Strong Crypto explicitly DISABLED (value=0)"
             }
-            
-            if ($systemDefaultTls.SystemDefaultTlsVersions -eq 1) {
+
+            if ($null -eq $systemDefaultTls) {
+                Write-Info ".NET 4.x (32-bit): SystemDefaultTlsVersions not set (using OS default = ON)"
+            }
+            elseif ($systemDefaultTls.SystemDefaultTlsVersions -eq 1) {
                 Write-Success ".NET 4.x (32-bit): System Default TLS ENABLED"
             }
             else {
-                Write-DiagWarning ".NET 4.x (32-bit): System Default TLS NOT enabled"
+                Write-DiagWarning ".NET 4.x (32-bit): System Default TLS explicitly DISABLED (value=0)"
             }
         }
         
@@ -5934,19 +9148,25 @@ function Test-TLSConfiguration {
         if (Test-Path $netFx4Path64) {
             $schUseStrongCrypto64 = Get-ItemProperty -Path $netFx4Path64 -Name "SchUseStrongCrypto" -ErrorAction SilentlyContinue
             $systemDefaultTls64 = Get-ItemProperty -Path $netFx4Path64 -Name "SystemDefaultTlsVersions" -ErrorAction SilentlyContinue
-            
-            if ($schUseStrongCrypto64.SchUseStrongCrypto -eq 1) {
+
+            if ($null -eq $schUseStrongCrypto64) {
+                Write-Info ".NET 4.x (64-bit): Strong Crypto registry value not set (using OS default = ON)"
+            }
+            elseif ($schUseStrongCrypto64.SchUseStrongCrypto -eq 1) {
                 Write-Success ".NET 4.x (64-bit): Strong Crypto ENABLED"
             }
             else {
-                Write-DiagWarning ".NET 4.x (64-bit): Strong Crypto NOT enabled"
+                Write-DiagWarning ".NET 4.x (64-bit): Strong Crypto explicitly DISABLED (value=0)"
             }
-            
-            if ($systemDefaultTls64.SystemDefaultTlsVersions -eq 1) {
+
+            if ($null -eq $systemDefaultTls64) {
+                Write-Info ".NET 4.x (64-bit): SystemDefaultTlsVersions not set (using OS default = ON)"
+            }
+            elseif ($systemDefaultTls64.SystemDefaultTlsVersions -eq 1) {
                 Write-Success ".NET 4.x (64-bit): System Default TLS ENABLED"
             }
             else {
-                Write-DiagWarning ".NET 4.x (64-bit): System Default TLS NOT enabled"
+                Write-DiagWarning ".NET 4.x (64-bit): System Default TLS explicitly DISABLED (value=0)"
             }
         }
     }
@@ -6531,6 +9751,21 @@ function Test-IISHealth {
         Checks IIS services, AppPools, Websites, and Worker Processes.
     #>
     Write-Header "IIS Health Diagnostics"
+    # ------------------------------------------------------------
+    # PURPOSE: 8-point IIS health sweep covering core services, AppPool / Site
+    # state, worker processes, identity health, authentication config, SSL/TLS
+    # certificates, and IP-restriction rules.
+    #
+    # PRE-REQUISITES:
+    #   - IIS Web-Server role installed (we exit early if not)
+    #   - WebAdministration PowerShell module loadable (provides 'IIS:\' drive)
+    #   - Run from 64-bit PowerShell - the 32-bit module bitness mismatch
+    #     'There is no provider with the specified name' is a common gotcha
+    #
+    # NOTE: We declare $appPools and $sites at function scope so later sections
+    # (identities, auth, certs, IP restrictions) can reuse the enumeration
+    # rather than re-querying IIS:\ paths multiple times.
+    # ------------------------------------------------------------
     
     # Declare at function scope for reuse across check sections
     $appPools = $null
@@ -6558,7 +9793,21 @@ function Test-IISHealth {
     }
 
     # 1. Check IIS Services
+    # ------------------------------------------------------------
+    # IIS depends on three Windows services:
+    #   W3SVC    - World Wide Web Publishing Service (HTTP listener + request
+    #              dispatcher). Stopped = no sites respond.
+    #   WAS      - Windows Process Activation Service (manages w3wp.exe lifecycle
+    #              based on requests; replaces the IIS6 'aspnet_wp' model).
+    #              Stopped = AppPools cannot start, all sites fail with 503.
+    #   IISADMIN - IIS6 metabase compatibility service. Modern IIS (7.0+)
+    #              uses applicationHost.config instead, so this service may
+    #              legitimately not exist on 2019/2022 - we treat 'not found'
+    #              as informational, not an error.
+    # ------------------------------------------------------------
     Write-Section "IIS Core Services Status"
+    Write-Info "  Description: W3SVC = HTTP listener; WAS = AppPool process manager;"
+    Write-Info "               IISADMIN = legacy IIS6 metabase (often absent on modern OS)."
     $iisServices = @("W3SVC", "WAS", "IISADMIN")
     foreach ($svc in $iisServices) {
         try {
@@ -6581,7 +9830,22 @@ function Test-IISHealth {
     }
 
     # 2. Check AppPools
+    # ------------------------------------------------------------
+    # An Application Pool is the .NET CLR + worker-process container. Each
+    # pool runs in its own w3wp.exe instance under a chosen identity. State
+    # values:
+    #   Started   - healthy; w3wp will spawn on first request
+    #   Stopped   - admin disabled OR rapid-fail protection tripped (5 failures
+    #               in 5 minutes by default -> AppPool auto-stops to protect
+    #               the box). Look for events 5002/5117 in Application log.
+    #   Stopping  - in transition; usually transient
+    # Identity types: ApplicationPoolIdentity (default, virtual SID), LocalSystem,
+    # LocalService, NetworkService, SpecificUser (custom domain/local account).
+    # ------------------------------------------------------------
     Write-Section "Application Pools"
+    Write-Info "  Description: AppPool = .NET CLR container + w3wp.exe identity. Stopped"
+    Write-Info "               state may indicate rapid-fail protection (Application events"
+    Write-Info "               5002/5117) - auto-stops after 5 failures in 5 min."
     try {
         if (Test-Path "IIS:\AppPools") {
             $appPools = Get-ChildItem "IIS:\AppPools" -ErrorAction SilentlyContinue
@@ -6610,7 +9874,19 @@ function Test-IISHealth {
     }
 
     # 3. Check Websites
+    # ------------------------------------------------------------
+    # A Website binds protocol+IP+port+host to a physical path. Bindings format:
+    # protocol://IP:port:hostname (empty IP = '*' = all unassigned IPs).
+    # Common bindings issues:
+    #   - Two sites bound to *:80: + same host header -> port conflict (only
+    #     one will start; the other shows state=Stopped)
+    #   - HTTPS binding referencing a deleted certificate -> binding errors
+    #     in System log (HttpEvent 15301)
+    #   - Physical path on missing/dismounted drive -> 500.19 or 503 errors
+    # ------------------------------------------------------------
     Write-Section "Websites"
+    Write-Info "  Description: Site state + bindings + physical path. Stopped sites often"
+    Write-Info "               indicate port conflicts or missing physical path drives."
     try {
         if (Test-Path "IIS:\Sites") {
             $sites = Get-ChildItem "IIS:\Sites" -ErrorAction SilentlyContinue
@@ -6637,7 +9913,20 @@ function Test-IISHealth {
     }
 
     # 4. Check Worker Processes
+    # ------------------------------------------------------------
+    # w3wp.exe = the actual hosting process for a request. There can be:
+    #   0 instances per pool   - no requests received yet (pool warm-up pending)
+    #   1 instance per pool    - normal
+    #   N instances per pool   - 'Web Garden' (maxProcesses>1, rare)
+    # We extract the AppPool name from the command-line argument (-ap "PoolName")
+    # which is how WAS identifies which pool a w3wp belongs to.
+    # WorkingSet64 is the resident memory; very high values (>2-3 GB) suggest
+    # a memory leak in the application code or excessive caching.
+    # CPU time is cumulative since process start - not a 'right now' value.
+    # ------------------------------------------------------------
     Write-Section "IIS Worker Processes (w3wp.exe)"
+    Write-Info "  Description: w3wp.exe instances per AppPool. Memory >2-3 GB suggests leak"
+    Write-Info "               or excessive caching. CPU time is cumulative (not real-time %)."
     try {
         $w3wps = Get-Process -Name w3wp -ErrorAction SilentlyContinue
         if ($w3wps) {
@@ -6669,7 +9958,23 @@ function Test-IISHealth {
     }
 
     # 5. Check AppPool Identities & Permissions
+    # ------------------------------------------------------------
+    # SpecificUser identities are the #1 source of 'AppPool keeps stopping'
+    # tickets. Common failure modes:
+    #   - Account password expired (no reminder; AppPool just won't start)
+    #   - Account locked out (Event 4625 in Security log)
+    #   - Account missing 'Log on as a batch job' right (SeBatchLogonRight)
+    #     -> Event 1057 'failed to start because of an error in the
+    #     application configuration. Logon failure: the user has not been
+    #     granted the requested logon type at this computer.'
+    #   - Local user referenced as '.\name' but actually deleted
+    # We can verify local-user existence here; domain/external accounts we just
+    # surface a warning since we can't query AD reliably from a member server.
+    # ------------------------------------------------------------
     Write-Section "AppPool Identities & Permissions"
+    Write-Info "  Description: Custom (SpecificUser) identities - validate local accounts"
+    Write-Info "               exist; for domain accounts check 'Log on as a batch job' right"
+    Write-Info "               (Event 1057 if missing) and password expiry."
     try {
         if ($appPools) {
             foreach ($pool in $appPools) {
@@ -6706,7 +10011,20 @@ function Test-IISHealth {
     }
 
     # 6. Check Site Authentication Methods
+    # ------------------------------------------------------------
+    # Three primary IIS authentication providers (there are more, like Forms
+    # and Client Certificate, but these three cover ~95% of cases):
+    #   Anonymous  - default; uses IUSR identity. Required for public sites.
+    #   Basic      - HTTP Basic auth (base64-encoded username:password). MUST
+    #                only be used over HTTPS - sends credentials in plaintext.
+    #   Windows    - Integrated Windows Auth (NTLM/Kerberos). Best for
+    #                intranet sites with AD-joined clients.
+    # Sites with NO auth methods enabled are misconfigured (or admin couldn't
+    # read config - happens if running as a non-admin user).
+    # ------------------------------------------------------------
     Write-Section "Site Authentication Methods"
+    Write-Info "  Description: Surfaces enabled auth providers per site. Basic auth = MUST"
+    Write-Info "               be HTTPS-only. No methods enabled = misconfigured site."
     try {
         if ($sites) {
             foreach ($site in $sites) {
@@ -6736,7 +10054,21 @@ function Test-IISHealth {
     }
 
     # 7. Check SSL/TLS Certificate Validation
+    # ------------------------------------------------------------
+    # For each https binding we extract the certificate hash (thumbprint),
+    # search both Cert:\LocalMachine\My (Personal) and \WebHosting (CCS-style
+    # binding store), and report expiry. Common issues:
+    #   - Hash present in binding but cert deleted from store -> handshake
+    #     fails with Schannel 36870 / HttpEvent 15301
+    #   - Cert expired -> browser shows NET::ERR_CERT_DATE_INVALID
+    #   - <30 days remaining -> renew now to avoid weekend page-call
+    # We deduplicate by hash because most servers reuse the same wildcard cert
+    # across many sites - no point reporting the same cert N times.
+    # ------------------------------------------------------------
     Write-Section "SSL/TLS Certificates"
+    Write-Info "  Description: Per-binding cert lookup in LocalMachine\My + \WebHosting."
+    Write-Info "               Hash present but cert missing = Schannel 36870 / HttpEvent 15301."
+    Write-Info "               <30 days remaining = renew now; expired = production outage risk."
     try {
         if ($sites) {
             $checkedHashes = @()
@@ -6790,7 +10122,18 @@ function Test-IISHealth {
     }
 
     # 8. Check IP Restrictions
+    # ------------------------------------------------------------
+    # 'IP and Domain Restrictions' role feature lets you whitelist or blacklist
+    # client IPs at the IIS layer. Two modes:
+    #   allowUnlisted=true  + add[@allowed=false] entries -> blacklist mode
+    #   allowUnlisted=false + add[@allowed=true]  entries -> whitelist mode
+    # Whitelist mode is much stricter; we flag it explicitly because many
+    # 'site is down' tickets turn out to be whitelist + new client IP combo.
+    # ------------------------------------------------------------
     Write-Section "IP Security Restrictions"
+    Write-Info "  Description: Surfaces ipSecurity allowUnlisted + explicit deny rules."
+    Write-Info "               allowUnlisted=false = whitelist mode (strict); common cause of"
+    Write-Info "               '403 Forbidden' for legitimate clients with new IPs."
     try {
         if ($sites) {
             foreach ($site in $sites) {
@@ -6834,6 +10177,21 @@ function Test-TaskSchedulerHealth {
     param()
 
     Write-Header "Task Scheduler Diagnostics"
+    # ------------------------------------------------------------
+    # PURPOSE: 8-point Task Scheduler audit covering failures, stuck tasks,
+    # disabled tasks, privilege escalation surface, credential health, ACL
+    # permissions, orphaned executables, and trigger expiry.
+    #
+    # SCOPE FILTERING: Most checks exclude '\Microsoft\*' tasks because the
+    # OS ships with hundreds of inbox tasks (defrag, telemetry, defender, etc.)
+    # whose failures are usually benign or not under our control. We surface
+    # them as a count only - operator can use 'Get-ScheduledTask' to drill in.
+    #
+    # IMPLEMENTATION: We enumerate ALL tasks once via Get-ScheduledTask and
+    # cache (Task + Info) tuples in $allTaskInfo. Subsequent checks filter
+    # this cache rather than re-enumerating - saves significant time on
+    # servers with large task inventories.
+    # ------------------------------------------------------------
 
     $allTasks = $null
     try {
@@ -6865,7 +10223,26 @@ function Test-TaskSchedulerHealth {
     }
 
     # 1. Failed Tasks (Last Run Result != 0)
+    # ------------------------------------------------------------
+    # LastTaskResult is the HRESULT returned by the action's Execute call.
+    # 0 = success. We also exclude 0x00041325 = 'task is currently running'
+    # which is just informational, not a failure.
+    # Common error codes (decoded inline below):
+    #   0x8007052E - Logon failure (expired password, locked account, wrong
+    #                principal). Check Security log Event 4625.
+    #   0x80070005 - Access denied. Most often missing 'Log on as a batch job'
+    #                right (SeBatchLogonRight) or NTFS ACL on the script.
+    #   0x80041326 - Task not yet run (scheduled for future time).
+    #   0x800710E0 - 'Operator or admin refused' - usually triggered when a
+    #                'run only when user logged on' task fires while logged off.
+    #   0x00041306 - Task terminated by user (or by 'stop if runs longer than
+    #                X' setting in Settings tab).
+    #   0x00041301 - Task is currently running (informational).
+    # We surface non-Microsoft failures verbosely; Microsoft tasks get a count.
+    # ------------------------------------------------------------
     Write-Section "Failed Tasks (Last Run Result != 0)"
+    Write-Info "  Description: HRESULT-decoded analysis of LastTaskResult. Microsoft inbox"
+    Write-Info "               tasks are summarised as a count; non-Microsoft tasks shown verbosely."
     try {
         $failedTasks = $allTaskInfo | Where-Object {
             $_.Info -and $_.Info.LastTaskResult -ne 0 -and $_.Info.LastTaskResult -ne 0x00041325 -and
@@ -6906,7 +10283,19 @@ function Test-TaskSchedulerHealth {
     }
 
     # 2. Tasks Running Longer Than Expected (currently running)
+    # ------------------------------------------------------------
+    # State='Running' + LastRunTime is how long the current invocation has
+    # been executing. Heuristic thresholds:
+    #   < 1 hour    : informational (long-running batch jobs are normal)
+    #   1-4 hours   : warning (could be hung; could be legitimate ETL)
+    #   > 4 hours   : flagged as STUCK (most legit jobs finish well before this)
+    # Operators should cross-reference with the task's 'Stop the task if it
+    # runs longer than' setting in the Settings tab. If that's not configured,
+    # a hung action will run forever, blocking subsequent triggers.
+    # ------------------------------------------------------------
     Write-Section "Long-Running / Stuck Tasks"
+    Write-Info "  Description: Currently executing tasks + duration. >4h flagged as likely stuck."
+    Write-Info "               Mitigate via Settings tab > 'Stop task if runs longer than X'."
     try {
         $runningTasks = $allTaskInfo | Where-Object { $_.Task.State -eq 'Running' }
         if ($runningTasks) {
@@ -6940,7 +10329,16 @@ function Test-TaskSchedulerHealth {
     }
 
     # 3. Disabled Tasks (non-Microsoft)
+    # ------------------------------------------------------------
+    # Disabled tasks are tracked because they often represent forgotten
+    # remediation actions: 'we'll fix it later, just disable it for now'.
+    # Consider whether each one should be deleted, re-enabled, or left as is.
+    # Microsoft tasks are excluded - inbox tasks like 'XblGameSaveTask' are
+    # legitimately disabled on server SKUs and don't need attention.
+    # ------------------------------------------------------------
     Write-Section "Disabled Tasks"
+    Write-Info "  Description: Non-Microsoft tasks in Disabled state. Often forgotten remediation;"
+    Write-Info "               review whether to delete, re-enable, or leave alone."
     try {
         $disabledTasks = $allTasks | Where-Object {
             $_.State -eq 'Disabled' -and $_.TaskPath -notlike '\Microsoft\*'
@@ -6963,7 +10361,21 @@ function Test-TaskSchedulerHealth {
     }
 
     # 4. Tasks Running As SYSTEM / High Privilege
+    # ------------------------------------------------------------
+    # SYSTEM (S-1-5-18) + RunLevel=Highest = unrestricted local access.
+    # If the executable referenced by such a task is writable by a normal
+    # user, that user can effectively elevate to SYSTEM by replacing the
+    # binary - a classic privilege-escalation pattern (see CVE-2020-0796
+    # mitigation guidance and many AV/EDR detections).
+    # We flag these for REVIEW only - many legitimate enterprise tasks
+    # (backup agents, monitoring, patching) need SYSTEM. The follow-up step
+    # should be 'icacls <Execute path>' to confirm only privileged accounts
+    # can write to the target binary.
+    # ------------------------------------------------------------
     Write-Section "High-Privilege Task Audit"
+    Write-Info "  Description: SYSTEM + Highest RunLevel tasks. Privilege-escalation surface"
+    Write-Info "               IF the target executable is writable by non-admins. Verify with"
+    Write-Info "               'icacls <ExePath>' for each flagged task."
     try {
         $highPrivTasks = $allTasks | Where-Object {
             $_.Principal.UserId -in @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18') -and
@@ -6988,7 +10400,20 @@ function Test-TaskSchedulerHealth {
     }
 
     # 5. Tasks With Expired/Invalid Credentials (logon failure)
+    # ------------------------------------------------------------
+    # Specifically isolates the two error codes that map to credential issues:
+    #   0x8007052E - Logon failure: bad username or password. Most common
+    #                cause is a service-account password change where the
+    #                Task Scheduler reference wasn't updated.
+    #   0x80070005 - Access denied. Could be NTFS, but for tasks usually
+    #                means the principal is missing 'Log on as a batch job'
+    #                right (secpol.msc -> Local Policies -> User Rights
+    #                Assignment).
+    # We surface the principal so operator knows WHICH account to fix.
+    # ------------------------------------------------------------
     Write-Section "Credential Failures (Logon Error 0x8007052E)"
+    Write-Info "  Description: Tasks failing with 0x8007052E (bad creds) or 0x80070005 (access denied)."
+    Write-Info "               Top cause: service-account password change without updating task references."
     try {
         $credFailed = $allTaskInfo | Where-Object {
             $_.Info -and ($_.Info.LastTaskResult -eq 0x8007052E -or $_.Info.LastTaskResult -eq 0x80070005) -and
@@ -7017,7 +10442,22 @@ function Test-TaskSchedulerHealth {
     }
 
     # 6. Task SDDL Permission Audit
+    # ------------------------------------------------------------
+    # Each scheduled task has its own ACL stored as SDDL (Security Descriptor
+    # Definition Language). We use the COM 'Schedule.Service' API since the
+    # PS cmdlets don't expose this directly. SDDL ACE format we look for:
+    #   (A;;FA;;;S-1-1-0)   = Allow / Full Access / Everyone (S-1-1-0)
+    #   (A;;FA;;;S-1-5-11)  = Allow / Full Access / Authenticated Users
+    # Either pattern means anyone logged in can MODIFY the task definition
+    # (change the action, change the principal, etc.) which combined with a
+    # SYSTEM/Highest task = trivial privilege escalation.
+    # NOTE: We only scan the root folder. A full recursive scan is possible
+    # but expensive on large inventories - skipping for now.
+    # ------------------------------------------------------------
     Write-Section "Task Permission Audit (SDDL)"
+    Write-Info "  Description: Surfaces tasks where Everyone (S-1-1-0) or Authenticated Users"
+    Write-Info "               (S-1-5-11) have Full Access. Combined with SYSTEM run-level ="
+    Write-Info "               privilege escalation. Root folder only (recursive scan is expensive)."
     try {
         $service = New-Object -ComObject "Schedule.Service"
         $service.Connect()
@@ -7047,7 +10487,21 @@ function Test-TaskSchedulerHealth {
     }
 
     # 7. Orphaned Tasks (missing executables)
+    # ------------------------------------------------------------
+    # Tasks whose Execute path no longer exists on disk. Common causes:
+    #   - Application uninstalled but its task wasn't cleaned up
+    #   - Drive letter changed (D:\ became E:\ after disk add)
+    #   - Operator deleted the script but forgot the task
+    # Skips list:
+    #   - 'COM handler' (these have no .exe; they invoke a CLSID)
+    #   - Paths starting with '%' (env-var expansion - we don't resolve those)
+    #   - Built-in shells (powershell.exe / cmd.exe / wscript.exe / cscript.exe /
+    #     mshta.exe) which are guaranteed present in System32
+    #   - .com files (legacy DOS executables, often still extant)
+    # ------------------------------------------------------------
     Write-Section "Orphaned Tasks (Missing Executables)"
+    Write-Info "  Description: Tasks whose Execute path no longer exists on disk. Excludes"
+    Write-Info "               COM-handler tasks, env-var paths, and built-in shells."
     try {
         $orphaned = @()
         $tasksWithActions = $allTasks | Where-Object {
@@ -7088,7 +10542,22 @@ function Test-TaskSchedulerHealth {
     }
 
     # 8. Task Trigger Health (expired/no triggers)
+    # ------------------------------------------------------------
+    # Three trigger anti-patterns:
+    #   1. NO triggers defined - task can only be invoked manually or by
+    #      another process (Start-ScheduledTask). Often a leftover from a
+    #      'one-time run' that should now be deleted.
+    #   2. EndBoundary in the past - trigger is technically still configured
+    #      but will never fire again. Typically means a holiday/maintenance
+    #      window task whose end date wasn't cleared.
+    #   3. Trigger explicitly disabled - even if the task itself is enabled,
+    #      a disabled trigger won't fire. Easy to miss in the GUI.
+    # We don't currently flag overlapping triggers (e.g. two 'every 5 min'
+    # triggers); could be a future enhancement.
+    # ------------------------------------------------------------
     Write-Section "Task Trigger Health"
+    Write-Info "  Description: Detects 3 anti-patterns: no triggers, expired EndBoundary,"
+    Write-Info "               or per-trigger Enabled=false (easy to miss in the GUI)."
     try {
         $triggerIssues = @()
         $activeTasks = $allTasks | Where-Object {
@@ -7186,11 +10655,22 @@ function Test-ServerBaseline {
                     Write-Info "  OU: $ou"
                 }
                 else {
-                    Write-DiagWarning "  Computer object not found in AD"
+                    Write-Info "  Computer object not found in AD (search returned no results - may be a join issue)"
                 }
             }
             catch {
-                Write-DiagWarning "  Could not query AD: $($_.Exception.Message)"
+                # 'An operations error occurred' from LDAP usually means the local
+                # security context cannot bind anonymously and ADWS isn't reachable
+                # on this NIC - common on isolated mgmt VMs with default ACLs.
+                # Demote to INFO; this is not an actionable production issue.
+                $msg = $_.Exception.Message
+                if ($msg -match 'operations error|server is not operational|access is denied') {
+                    Write-Info "  AD lookup skipped (LDAP bind not permitted in this security context: $msg)"
+                    Write-Info "  Domain (from CimInstance): $domain"
+                }
+                else {
+                    Write-DiagWarning "  Could not query AD: $msg"
+                }
             }
         }
         else {
@@ -7317,6 +10797,7 @@ function Test-ServerBaseline {
     Write-Section "NIC Power Management (Allow Turn Off)"
     try {
         $netAdapters = Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' }
+        $checked = 0
         foreach ($nic in $netAdapters) {
             try {
                 $pnpDevice = Get-CimInstance Win32_NetworkAdapter -Filter "NetConnectionID='$($nic.Name)'" -ErrorAction SilentlyContinue
@@ -7324,6 +10805,7 @@ function Test-ServerBaseline {
                     $powerMgmt = Get-CimInstance MSPower_DeviceEnable -Namespace root\wmi -ErrorAction SilentlyContinue |
                         Where-Object { $_.InstanceName -like "*$($pnpDevice.PNPDeviceID)*" }
                     if ($powerMgmt) {
+                        $checked++
                         if ($powerMgmt.Enable) {
                             Write-DiagWarning "  $($nic.Name): Power save ENABLED — can cause intermittent disconnects on servers!"
                             Write-Info "    Disable: Device Manager → NIC → Power Management → Uncheck 'Allow to turn off'"
@@ -7336,6 +10818,10 @@ function Test-ServerBaseline {
             }
             catch { }
         }
+        if ($checked -eq 0) {
+            Write-Info "  No power-managed adapters reported MSPower_DeviceEnable data"
+            Write-Info "  (typical for Hyper-V synthetic / virtual NICs - host owns power policy)."
+        }
     }
     catch {
         Write-DiagWarning "  Could not check NIC power management"
@@ -7345,19 +10831,83 @@ function Test-ServerBaseline {
     Write-Section "Installed Windows Features"
     try {
         if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
-            $features = Get-WindowsFeature -ErrorAction Stop | Where-Object { $_.Installed -eq $true }
-            $roleFeatures = $features | Where-Object { $_.FeatureType -eq 'Role' }
-            $featureFeatures = $features | Where-Object { $_.FeatureType -eq 'Feature' -or $_.FeatureType -eq 'Role Service' }
-            Write-Info "  Installed Roles: $(@($roleFeatures).Count)"
-            foreach ($r in $roleFeatures) {
-                Write-Info "    [Role] $($r.DisplayName)"
+            $features = @(Get-WindowsFeature -ErrorAction Stop | Where-Object { $_.Installed -eq $true })
+
+            # Get-WindowsFeature.FeatureType: 'Role', 'Role Service', 'Feature'
+            #   Roles        : top-level workloads (e.g. File and Storage Services, Web Server)
+            #   Role Service : sub-component of a Role (Path starts with parent role Name)
+            #   Feature      : standalone OS feature (.NET, BitLocker, Failover Clustering, etc.)
+            $roles = @($features | Where-Object { $_.FeatureType -eq 'Role' })
+            $roleServices = @($features | Where-Object { $_.FeatureType -eq 'Role Service' })
+            $plainFeatures = @($features | Where-Object { $_.FeatureType -eq 'Feature' })
+
+            # Server 2016+ default OS components - always installed on Desktop Experience SKUs.
+            # Surfacing them in the "deliberately installed" list is noise; bucket separately.
+            $osBaselineNames = @(
+                'PowerShellRoot', 'PowerShell', 'PowerShell-V2', 'PowerShell-ISE',
+                'WoW64-Support', 'Server-Gui-Mgmt-Infra', 'Server-Gui-Shell',
+                'XPS-Viewer', 'Windows-Defender', 'Wireless-Networking',
+                'System-DataArchiver', 'PNRP', 'WAS', 'WAS-Process-Model',
+                'WAS-Config-APIs', 'Direct-Play', 'NET-Framework-Core',
+                'NET-Framework-Features'
+            )
+
+            # RSAT bucket: admin consoles for managing OTHER servers, not workload features
+            $rsatTools = @($plainFeatures | Where-Object { $_.Path -like 'Remote Server Administration Tools*' -or $_.Name -like 'RSAT*' -or $_.Name -in @('Hyper-V-Tools', 'Hyper-V-PowerShell') })
+
+            # Default OS components bucket
+            $remaining = @($plainFeatures | Where-Object {
+                $_.Path -notlike 'Remote Server Administration Tools*' -and $_.Name -notlike 'RSAT*' -and $_.Name -notin @('Hyper-V-Tools', 'Hyper-V-PowerShell')
+            })
+            $osBaseline = @($remaining | Where-Object { $_.Name -in $osBaselineNames })
+
+            # Workload features = what was deliberately added beyond the OS baseline
+            $workloadFeatures = @($remaining | Where-Object { $_.Name -notin $osBaselineNames })
+
+            # --- Roles + their Role Services (nested) ---
+            Write-Info "  Installed Roles: $($roles.Count)"
+            if ($roles.Count -eq 0) {
+                Write-Info "    (none - File and Storage Services is normally always present; if missing, server is a non-standard install)"
             }
-            Write-Info "  Installed Features/Role Services: $(@($featureFeatures).Count)"
-            $featureFeatures | Select-Object -First 15 | ForEach-Object {
-                Write-Info "    $($_.DisplayName)"
+            foreach ($role in $roles | Sort-Object DisplayName) {
+                Write-Info "    [Role] $($role.DisplayName) ($($role.Name))"
+                $childServices = @($roleServices | Where-Object { $_.Path -like "$($role.Name)\*" -or $_.Path -like "$($role.DisplayName)\*" })
+                foreach ($svc in $childServices | Sort-Object DisplayName) {
+                    Write-Info "         + $($svc.DisplayName)"
+                }
             }
-            if (@($featureFeatures).Count -gt 15) {
-                Write-Info "    ... and $(@($featureFeatures).Count - 15) more"
+            # Orphan role services (parent role not detected) - rare but possible
+            $orphanServices = @($roleServices | Where-Object {
+                $svcPath = $_.Path
+                $svcName = $_.Name
+                -not ($roles | Where-Object { $svcPath -like "$($_.Name)\*" -or $svcPath -like "$($_.DisplayName)\*" -or $svcName -like "$($_.Name)*" })
+            })
+            if ($orphanServices.Count -gt 0) {
+                Write-Info "  Other Role Services: $($orphanServices.Count)"
+                foreach ($svc in $orphanServices | Sort-Object DisplayName) {
+                    Write-Info "    - $($svc.DisplayName)"
+                }
+            }
+
+            # --- Workload features (what was DELIBERATELY installed) ---
+            Write-Info "  Workload Features Installed: $($workloadFeatures.Count)"
+            if ($workloadFeatures.Count -eq 0) {
+                Write-Info "    (none beyond OS baseline)"
+            }
+            else {
+                foreach ($f in $workloadFeatures | Sort-Object DisplayName) {
+                    Write-Info "    - $($f.DisplayName) ($($f.Name))"
+                }
+            }
+
+            # --- RSAT Tools (admin consoles, separate bucket) ---
+            if ($rsatTools.Count -gt 0) {
+                Write-Info "  RSAT Admin Tools: $($rsatTools.Count) installed (managing other servers - not workloads)"
+            }
+
+            # --- OS baseline (always-installed components) ---
+            if ($osBaseline.Count -gt 0) {
+                Write-Info "  Default OS Components: $($osBaseline.Count) (PowerShell, Defender, .NET, etc. - shipped with Server)"
             }
         }
         else {
@@ -7525,6 +11075,9 @@ $css
 Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Tool: WSTT v3.0 | OS: $((Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption)
 <span class="expand-all" onclick="toggleAll()">[Expand/Collapse All]</span>
 </div>
+<div class="meta" style="color:#9cdcfe;">
+SCOM-aligned thresholds in effect: CPU $($CPU_WARNING_THRESHOLD)%, Memory $($MEMORY_WARNING_THRESHOLD)%, System drive $($DISK_SYSTEM_WARNING_THRESHOLD)%, Non-system drive $($DISK_NONSYSTEM_WARNING_THRESHOLD)%. In-script CRITICAL fires at $($CPU_CRITICAL_THRESHOLD)%.
+</div>
 $js
 "@
 
@@ -7540,7 +11093,9 @@ $js
         $htmlOutput = [System.Net.WebUtility]::HtmlEncode($output)
         $htmlOutput = $htmlOutput -replace '\[SUCCESS\]', '<span class="success">[SUCCESS]</span>'
         $htmlOutput = $htmlOutput -replace '\[ERROR\]', '<span class="error">[ERROR]</span>'
-        $htmlOutput = $htmlOutput -replace 'WARNING:', '<span class="warning">WARNING:</span>'
+        # Match WARNING: only at start of a line (after optional whitespace) so
+        # we don't double-wrap occurrences inside message bodies.
+        $htmlOutput = $htmlOutput -replace '(?m)^(\s*)WARNING:', '$1<span class="warning">WARNING:</span>'
         $htmlOutput = $htmlOutput -replace '\[INFO\]', '<span class="info">[INFO]</span>'
         $htmlOutput = $htmlOutput -replace '---\s(.+?)\s---', '<span class="section-header">--- $1 ---</span>'
         $htmlOutput = $htmlOutput -replace '={40}', '<span class="section-header">========================================</span>'
@@ -7623,7 +11178,12 @@ UTILITIES:" -ForegroundColor Yellow
     Write-Host " 19. Task Scheduler Diagnostics" -ForegroundColor White
     Write-Host " 20. Server Baseline Validation" -ForegroundColor White
     Write-Host " 21. Generate HTML Diagnostic Report" -ForegroundColor Green
-    
+
+    Write-Host "
+CLUSTER:" -ForegroundColor Yellow
+    Write-Host " 22. WSFC Cluster Port Compliance Check" -ForegroundColor White
+    Write-Host "     (Live reachability + local firewall-rule audit for cluster ports)" -ForegroundColor Gray
+
     Write-Host "
   0. Exit" -ForegroundColor Red
     
@@ -7699,7 +11259,7 @@ function Start-TroubleshootingTool {
     try {
         do {
             Show-MainMenu
-            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-21)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21")
+            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-22)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22")
             
             switch ($choice) {
                 "1" {
@@ -7853,6 +11413,15 @@ function Start-TroubleshootingTool {
                 "21" {
                     Clear-Host
                     Export-HTMLReport
+                }
+                "22" {
+                    Clear-Host
+                    Test-WSFCClusterPortCompliance
+                    Write-Host "`n"
+                    $exportChoice = Get-ValidatedChoice -Prompt "Export WSFC port report (CSV + HTML)? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($exportChoice -eq "Y") {
+                        Test-WSFCClusterPortCompliance -ExportCsv -ExportHtml
+                    }
                 }
                 "0" {
                     Write-Host "`nExiting... Thank you for using the troubleshooting tool!" -ForegroundColor Cyan

@@ -2,8 +2,9 @@
 
 ## Overview
 
-A comprehensive PowerShell-based interactive diagnostic tool for **Windows Server 2019, 2022, and 2025**. Diagnoses and collects logs for Network, Memory, CPU, Disk, Services, Event Logs, DNS, Security & Authentication, Windows Update, TLS/SSL, IIS, and **Cluster/SQL AG environments**.
+A comprehensive PowerShell-based interactive diagnostic tool for **Windows Server 2019, 2022, and 2025**. Diagnoses and collects logs for Network, Memory, CPU, Disk, Services, Event Logs, DNS, Security & Authentication, Windows Update, TLS/SSL, IIS, **WSFC Cluster Port Compliance**, and **Cluster/SQL AG environments**.
 
+**Author:** Kaustubh Sharma  
 **Version:** 3.0  
 **Requires:** Administrator privileges, PowerShell 5.1+  
 **Tested On:** Windows Server 2019 (Build 17763), 2022 (Build 20348), 2025 (Build 26100)
@@ -14,6 +15,47 @@ A comprehensive PowerShell-based interactive diagnostic tool for **Windows Serve
 ---
 
 ## What's New in v3.0 (from v2.5)
+
+### 🔌 WSFC Cluster Port Compliance Check (NEW — Option 22)
+
+Local-only validator for the network ports required by Windows Server Failover Clusters. Designed for change-control evidence in regulated environments (banking, healthcare, gov).
+
+**Two evidence streams per required port:**
+
+| Stream | Mechanism | Purpose |
+|--------|-----------|---------|
+| **Live reachability** | TCP via `TcpClient.ConnectAsync` (2s timeout), ICMP via `Test-Connection`, UDP best-effort via `UdpClient` | Proves traffic actually flows from this node to each peer right now |
+| **Local firewall audit** | `Get-NetFirewallRule` + `Get-NetFirewallPortFilter` for inbound + outbound | Proves Allow rules exist and surfaces any enabled Block rules |
+
+**Required port matrix (validated):**
+
+| Service | Protocol | Port | Direction | Purpose |
+|---------|----------|------|-----------|---------|
+| Cluster Service | UDP | 3343 | Bidirectional | Cluster heartbeat / intra-cluster comms (DTLS-encrypted) |
+| Cluster Service | TCP | 3343 | Bidirectional | Required during node-join operations |
+| Cluster Service | ICMP | Echo | Bidirectional | Add Node Wizard connectivity test |
+| Cluster Service | TCP | 445 | Bidirectional | SMB during cluster join, file-share witness, validation |
+| RPC Endpoint Mapper | TCP | 135 | Bidirectional | RPC endpoint mapper for cluster management |
+| Cluster Admin (NetBIOS) | UDP | 137 | Bidirectional | NetBIOS name service (legacy admin discovery) |
+| SMB / NetBIOS Datagram | UDP | 138 | Bidirectional | NetBIOS datagram service (legacy SMB over NetBIOS) |
+| SMB / NetBIOS Session | TCP | 139 | Bidirectional | NetBIOS session service (legacy SMB over NetBIOS) |
+| WinRM (Cloud Witness) | TCP | 5985 | Bidirectional | WinRM HTTP — required for Azure cloud witness |
+
+**Out of scope by design:**
+- Trojan-port overlap analysis (e.g. Example Trojan list comparison) — environment-specific, not in this tool.
+- Dynamic RPC range 49152–65535 live testing — testing 16K ports is impractical; cluster picks random ports at runtime.
+
+**How it works:**
+- Auto-discovers peer nodes from `$script:ClusterEnv.ClusterNodes` when run on a cluster member.
+- Falls back to interactive prompt or `-TargetNode <hostname[],ip[]>` parameter on standalone hosts.
+- All hostnames/IPs validated against an RFC 1123 + IPv4 regex before any network I/O.
+- UDP results are explicitly reported as `Inconclusive` (UDP is connectionless — silent ports are indistinguishable from open).
+- Console summary table + per-port CSV exports + dark-themed HTML report.
+
+**Outputs (under `%TEMP%\ServerDiagnostics\Logs\`):**
+- `WSFC_PortReachability_yyyyMMdd_HHmmss.csv`
+- `WSFC_FirewallAudit_yyyyMMdd_HHmmss.csv`
+- `WSFC_PortCompliance_yyyyMMdd_HHmmss.html`
 
 ### 🌐 Network Diagnostics — 15 New Checks
 | # | Check | What It Detects |
@@ -205,7 +247,7 @@ A comprehensive PowerShell-based interactive diagnostic tool for **Windows Serve
 - PowerShell TLS configuration
 - Remediation commands and export
 
-### 📊 Utilities (Options 12-21)
+### 📊 Utilities (Options 12-22)
 | Option | Feature |
 |--------|---------|
 | 12 | Generate System Report |
@@ -218,6 +260,7 @@ A comprehensive PowerShell-based interactive diagnostic tool for **Windows Serve
 | 19 | Task Scheduler Diagnostics |
 | 20 | Server Baseline Validation |
 | **21** | **Generate HTML Diagnostic Report** |
+| **22** | **WSFC Cluster Port Compliance Check** |
 
 ---
 
@@ -298,6 +341,10 @@ UTILITIES:
  19. Task Scheduler Diagnostics
  20. Server Baseline Validation
  21. Generate HTML Diagnostic Report
+
+CLUSTER:
+ 22. WSFC Cluster Port Compliance Check
+     (Live reachability + local firewall-rule audit for cluster ports)
 
   0. Exit
 =================================================================
@@ -416,6 +463,9 @@ Filter Drivers: 🟡 >10 active (latency impact)
 | File Type | Default Location | Format |
 |-----------|------------------|--------|
 | **HTML Diagnostic Report** | **`%TEMP%\ServerDiagnostics\Logs\`** | **.html** |
+| **WSFC Port Compliance HTML** | **`%TEMP%\ServerDiagnostics\Logs\`** | **.html** |
+| **WSFC Reachability CSV** | **`%TEMP%\ServerDiagnostics\Logs\`** | **.csv** |
+| **WSFC Firewall Audit CSV** | **`%TEMP%\ServerDiagnostics\Logs\`** | **.csv** |
 | Diagnostic reports | `%TEMP%\ServerDiagnostics\Logs\` | .txt |
 | System reports | `%TEMP%\ServerDiagnostics\Logs\` | .txt |
 | TLS reports | `%TEMP%\ServerDiagnostics\Logs\` | .txt |
@@ -491,17 +541,21 @@ $script:DefaultLogPath = Join-Path $script:TempBasePath "Logs"
 
 | Metric | Value |
 |--------|-------|
-| Total lines | ~7,760 |
-| Functions | 57 |
-| Total diagnostic checks | 150+ |
-| Menu options | 22 (0-21) |
+| Total lines | ~11,470 |
+| Functions | 63 |
+| Total diagnostic checks | 159+ |
+| Menu options | 23 (0-22) |
 | OS versions supported | 2019, 2022, 2025 |
-| Cluster-safe checks | 12 |
-| New in v3.0 | 27 network, 24 CPU, 24 disk, 19 memory, 8 task scheduler, 9 baseline, HTML report, cluster/AG awareness |
+| Cluster-safe checks | 13 |
+| New in v3.0 | 27 network, 24 CPU, 24 disk, 19 memory, 8 task scheduler, 9 baseline, HTML report, cluster/AG awareness, **9 WSFC port-compliance checks** |
+| Pester test coverage | 51 tests (33 base + 18 WSFC) — all passing |
 
 ---
 
 ## License & Support
+
+### Maintainer
+**Kaustubh Sharma** — author and maintainer of WSTT v3.0.
 
 ### Reporting Issues
 When reporting issues, include:

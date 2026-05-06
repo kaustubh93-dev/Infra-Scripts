@@ -221,6 +221,156 @@ Describe 'Test-PathOnCSV — cluster safety helper' {
     }
 }
 
+Describe 'WSFC Cluster Port Compliance — port matrix constant' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '_WSTT-TestHelpers.ps1')
+        $script:ScriptContent = Get-Content -Path $script:ScriptPath -Raw
+    }
+
+    It 'Defines $script:WSFC_REQUIRED_PORTS' {
+        $script:ScriptContent | Should -Match '\$script:WSFC_REQUIRED_PORTS\s*='
+    }
+
+    It 'Defines $script:HOSTNAME_REGEX' {
+        $script:ScriptContent | Should -Match '\$script:HOSTNAME_REGEX\s*='
+    }
+
+    It 'Includes TCP/UDP 3343 (cluster heartbeat)' {
+        $script:ScriptContent | Should -Match "Port\s*=\s*3343"
+    }
+
+    It 'Includes ICMP entry (Add Node Wizard)' {
+        $script:ScriptContent | Should -Match "Protocol\s*=\s*'ICMP'"
+    }
+
+    It 'Includes WinRM 5985 (cloud witness)' {
+        $script:ScriptContent | Should -Match "Port\s*=\s*5985"
+    }
+
+    It 'Does NOT include dynamic RPC range 49152-65535 (out of scope by design)' {
+        $script:ScriptContent | Should -Not -Match 'Port\s*=\s*49152'
+    }
+}
+
+Describe 'WSFC Cluster Port Compliance — function definitions' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '_WSTT-TestHelpers.ps1')
+        $tokens = $null; $errors = $null
+        $script:Ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:ScriptPath, [ref]$tokens, [ref]$errors
+        )
+        $script:Functions = $script:Ast.FindAll(
+            { $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true
+        )
+    }
+
+    It 'Defines Test-WSFCPortReachability' {
+        ($script:Functions.Name) | Should -Contain 'Test-WSFCPortReachability'
+    }
+
+    It 'Defines Get-WSFCFirewallRuleStatus' {
+        ($script:Functions.Name) | Should -Contain 'Get-WSFCFirewallRuleStatus'
+    }
+
+    It 'Defines Test-WSFCClusterPortCompliance (orchestrator)' {
+        ($script:Functions.Name) | Should -Contain 'Test-WSFCClusterPortCompliance'
+    }
+
+    It 'Defines Show-WSFCPortSummaryTable' {
+        ($script:Functions.Name) | Should -Contain 'Show-WSFCPortSummaryTable'
+    }
+
+    It 'Defines Export-WSFCPortReportToCsv' {
+        ($script:Functions.Name) | Should -Contain 'Export-WSFCPortReportToCsv'
+    }
+
+    It 'Defines Export-WSFCPortReportToHtml' {
+        ($script:Functions.Name) | Should -Contain 'Export-WSFCPortReportToHtml'
+    }
+
+    It 'Test-WSFCClusterPortCompliance has [CmdletBinding()]' {
+        $func = $script:Functions | Where-Object { $_.Name -eq 'Test-WSFCClusterPortCompliance' } | Select-Object -First 1
+        $func.Body.ParamBlock.Attributes.TypeName.Name | Should -Contain 'CmdletBinding'
+    }
+}
+
+Describe 'WSFC menu wiring' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '_WSTT-TestHelpers.ps1')
+        $script:ScriptContent = Get-Content -Path $script:ScriptPath -Raw
+    }
+
+    It 'Show-MainMenu lists option 22' {
+        $script:ScriptContent | Should -Match '22\.\s+WSFC Cluster Port Compliance'
+    }
+
+    It 'Get-ValidatedChoice accepts "22"' {
+        $script:ScriptContent | Should -Match 'Select an option \(0-22\)'
+    }
+
+    It 'Dispatcher has a "22" case that calls Test-WSFCClusterPortCompliance' {
+        $script:ScriptContent | Should -Match '"22"\s*\{[^}]*Test-WSFCClusterPortCompliance'
+    }
+}
+
+Describe 'WSFC Get-WSFCFirewallRuleStatus — module-missing fallback' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '_WSTT-TestHelpers.ps1')
+        function Write-DiagError   { param($msg) }
+        function Write-DiagWarning { param($msg) }
+        function Write-Success     { param($msg) }
+        function Write-Info        { param($msg) }
+        . ([scriptblock]::Create((Import-WSTTFunction -Name 'Get-WSFCFirewallRuleStatus')))
+    }
+
+    It 'Returns Unknown with explanatory ErrorMessage when NetSecurity is missing' {
+        Mock Get-Command { $null } -ParameterFilter { $Name -eq 'Get-NetFirewallRule' }
+        $r = Get-WSFCFirewallRuleStatus -PortDefinition @{ Service='Test'; Protocol='TCP'; Port=445 }
+        $r.InboundAllow  | Should -Be 'Unknown'
+        $r.OutboundAllow | Should -Be 'Unknown'
+        $r.ErrorMessage  | Should -Match 'NetSecurity'
+    }
+}
+
+Describe 'WSFC Test-WSFCPortReachability — protocol dispatch' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '_WSTT-TestHelpers.ps1')
+        function Write-DiagError   { param($msg) }
+        function Write-DiagWarning { param($msg) }
+        function Write-Success     { param($msg) }
+        function Write-Info        { param($msg) }
+        . ([scriptblock]::Create((Import-WSTTFunction -Name 'Test-WSFCPortReachability')))
+    }
+
+    It 'Returns a PSCustomObject with TargetNode/Protocol/Port/Status' {
+        $r = Test-WSFCPortReachability -TargetNode 'unreachable.invalid' `
+            -PortDefinition @{ Service='Test'; Protocol='TCP'; Port=1 } -TimeoutMs 250
+        $r | Should -Not -BeNullOrEmpty
+        $r.TargetNode | Should -Be 'unreachable.invalid'
+        $r.Protocol   | Should -Be 'TCP'
+        $r.Port       | Should -Be 1
+        $r.Status     | Should -BeIn @('Pass','Fail','Inconclusive')
+    }
+
+    It 'UDP probe returns Inconclusive (connectionless)' {
+        $r = Test-WSFCPortReachability -TargetNode '127.0.0.1' `
+            -PortDefinition @{ Service='Test'; Protocol='UDP'; Port=137 } -TimeoutMs 250
+        $r.Status | Should -Be 'Inconclusive'
+    }
+
+    It 'Unknown protocol returns Fail with explanatory message' {
+        $r = Test-WSFCPortReachability -TargetNode '127.0.0.1' `
+            -PortDefinition @{ Service='Test'; Protocol='XYZ'; Port=1 } -TimeoutMs 250
+        $r.Status       | Should -Be 'Fail'
+        $r.ErrorMessage | Should -Match 'Unknown protocol'
+    }
+}
+
 Describe 'PSScriptAnalyzer lint gate' {
 
     BeforeAll {
