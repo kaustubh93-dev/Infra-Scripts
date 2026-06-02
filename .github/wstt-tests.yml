@@ -1,0 +1,29 @@
+name: WSTT Pre-Publish Checks
+
+on:
+  push:
+    paths:
+      - 'Windows Server Troubleshooting Tool/**'
+      - '.github/workflows/wstt-tests.yml'
+  pull_request:
+    paths:
+      - 'Windows Server Troubleshooting Tool/**'
+
+jobs:
+  test:
+    name: Lint + Pester (Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: 'Windows Server Troubleshooting Tool'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer + Pester 5
+        run: |
+          Install-Module PSScriptAnalyzer -MinimumVersion 1.20.0 -Scope CurrentUser -Force -SkipPublisherCheck
+          Install-Module Pester           -MinimumVersion 5.0.0  -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Run pre-publish checks
+        run: ./Tests/Invoke-PrePublishChecks.ps1
