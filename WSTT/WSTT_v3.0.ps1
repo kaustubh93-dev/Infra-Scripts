@@ -77,6 +77,11 @@
                   disk/storage, firewall, scheduled tasks, Defender, RDP and Security-audit signals.
                   Sources: Event logs, registry key LastWriteTime (RegQueryInfoKey P/Invoke) and install
                   dates. Included in save-to-file and the HTML report. (GitHub issue #5)
+      [Changes+]  EXPANDED Recent Server Changes to 30 categories — added hosts/DNS, Group Policy,
+                  roles/features (servicing), local Administrators snapshot, trusted Root/CA store,
+                  modified driver files, SMB shares, power/time-zone/pagefile, autorun (Run keys),
+                  WinRM, Hyper-V VM config, failover cluster config, BitLocker state and pending-reboot
+                  context. Environment-specific checks (Hyper-V/cluster/BitLocker) are gated on detection.
 #>
 
 param(
@@ -11251,7 +11256,7 @@ function Add-ChangeEventSignal {
     param(
         [Parameter(Mandatory = $true)][string]$Category,
         [object[]]$Events,
-        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$Timeline,
+        [System.Collections.Generic.List[object]]$Timeline,
         [int]$ShowMax = 5
     )
 
@@ -11293,7 +11298,7 @@ function Add-ChangeRegistrySignal {
         [Parameter(Mandatory = $true)][string]$Category,
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][datetime]$StartTime,
-        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$Timeline,
+        [System.Collections.Generic.List[object]]$Timeline,
         [string]$CurrentState
     )
 
@@ -11326,8 +11331,11 @@ function Get-RecentServerChange {
         Surfaces detectable changes made on the local server within a lookback window.
     .DESCRIPTION
         Correlates recent modifications (patches, reboots, services, drivers,
-        software, TLS/SChannel, NIC, routes, disk/storage, env vars, proxy, plus
-        firewall/scheduled-task/local-account/time/Defender/RDP signals) to speed
+        software, TLS/SChannel, NIC, routes, disk/storage, env vars, proxy,
+        firewall/scheduled-task/local-account/time/Defender/RDP signals, plus
+        hosts/DNS, Group Policy, roles/features, local admins, root/CA store,
+        driver files, SMB shares, power/time-zone/pagefile, autorun, WinRM,
+        Hyper-V, failover cluster, BitLocker and pending-reboot context) to speed
         up issue identification. Evidence is drawn from Windows Event Logs, registry
         key LastWriteTimes, and install/validity dates, and is presented as
         confidence-rated CHANGE SIGNALS rather than definitive change history.
@@ -11496,7 +11504,7 @@ function Get-RecentServerChange {
             $netshProxy = (netsh winhttp show proxy) 2>$null
             if ($netshProxy) { $proxyState = (($netshProxy | Where-Object { $_ -match '\S' }) -join ' | ') }
         }
-        catch { }
+        catch { Write-Verbose "netsh winhttp show proxy unavailable: $($_.Exception.Message)" }
         Add-ChangeRegistrySignal -Category "WinINET Proxy (Internet Settings)" -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings' -StartTime $startTime -Timeline $timeline -CurrentState "WinHTTP: $proxyState"
         Add-ChangeRegistrySignal -Category "WinHTTP Proxy" -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Connections' -StartTime $startTime -Timeline $timeline
     }
@@ -11538,7 +11546,7 @@ function Get-RecentServerChange {
     # 16. Security-audit signals (local accounts/groups, privileges, time, policy) - queried LAST (Security log can be large/slow)
     Write-Section "Security Audit Signals (local accounts / privileges / time / policy)"
     try {
-        $secIds = @(4720, 4722, 4725, 4726, 4732, 4733, 4738, 4670, 4616, 4719, 4704, 4705)
+        $secIds = @(4720, 4722, 4725, 4726, 4732, 4733, 4738, 4616, 4719, 4704, 4705)
         $sec = Get-RecentEvents -LogName 'Security' -EventIds $secIds -HoursBack $Hours -MaxEvents 60
         if (@($sec).Count -eq 0) {
             Write-Info "  No matching Security events in window (requires the relevant audit policies to be enabled and read access to the Security log)"
@@ -11549,14 +11557,229 @@ function Get-RecentServerChange {
     }
     catch { Write-DiagWarning "  Security-audit check skipped: $($_.Exception.Message)" }
 
+    # 17. Hosts file & DNS client configuration
+    Write-Section "Hosts File & DNS Client"
+    try {
+        $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+        if (Test-Path $hostsPath) {
+            $hostsItem = Get-Item $hostsPath -ErrorAction SilentlyContinue
+            if ($hostsItem -and $hostsItem.LastWriteTime -ge $startTime) {
+                $activeEntries = @(Get-Content $hostsPath -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*[^#\s]' })
+                Write-DiagWarning "  hosts file modified $($hostsItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) ($($activeEntries.Count) active entr(ies))"
+                $timeline.Add([pscustomobject]@{ Time = $hostsItem.LastWriteTime; Category = "Hosts File"; Source = "File"; Detail = "hosts modified ($($activeEntries.Count) active entries)" })
+            }
+            else {
+                $hostsLw = if ($hostsItem) { $hostsItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss') } else { 'unknown' }
+                Write-Info "  hosts file: no change in window (last write $hostsLw)"
+            }
+        }
+        else { Write-Info "  hosts file not found" }
+        $dnsServers = @(Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Where-Object { $_.ServerAddresses -and @($_.ServerAddresses).Count -gt 0 } |
+                ForEach-Object { "$($_.InterfaceAlias)=$([string]::Join(',', $_.ServerAddresses))" })
+        if ($dnsServers.Count -gt 0) { Write-Info "  DNS servers (snapshot): $([string]::Join(' | ', $dnsServers))" }
+    }
+    catch { Write-DiagWarning "  Hosts/DNS check failed: $($_.Exception.Message)" }
+
+    # 18. Group Policy changes
+    Write-Section "Group Policy"
+    try {
+        $gpo = Get-RecentEvents -LogName 'Microsoft-Windows-GroupPolicy/Operational' -EventIds @(1500, 1501, 1502, 1503, 4016, 5016, 5312) -HoursBack $Hours -MaxEvents 50
+        Add-ChangeEventSignal -Category "Group Policy" -Events $gpo -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  Group Policy check failed: $($_.Exception.Message)" }
+
+    # 19. Windows roles / features added or removed (servicing)
+    Write-Section "Roles & Features (Servicing)"
+    try {
+        $svcng = Get-RecentEvents -LogName 'Setup' -EventIds @(1, 2, 3, 4, 5) -HoursBack $Hours -MaxEvents 50
+        Add-ChangeEventSignal -Category "Roles/Features" -Events $svcng -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  Roles/Features check failed: $($_.Exception.Message)" }
+
+    # 20. Local Administrators group membership (snapshot + 4732/4733 correlation in Security section)
+    Write-Section "Local Administrators (snapshot)"
+    try {
+        $adminMembers = @()
+        if (Get-Command Get-LocalGroup -ErrorAction SilentlyContinue) {
+            $adminGrp = Get-LocalGroup -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue
+            if ($adminGrp) {
+                $adminMembers = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+            }
+        }
+        if ($adminMembers.Count -eq 0) {
+            $adminGroupName = (Get-CimInstance Win32_Group -Filter "SID='S-1-5-32-544' AND LocalAccount=True" -ErrorAction SilentlyContinue).Name
+            if (-not $adminGroupName) { $adminGroupName = 'administrators' }
+            $netOut = @(& net localgroup $adminGroupName 2>$null)
+            $adminMembers = @($netOut | Where-Object {
+                    $_ -and $_.Trim() -ne '' -and
+                    $_ -notmatch '^(Alias name|Comment|Members|-{3,}|The command completed)'
+                } | ForEach-Object { $_.Trim() })
+        }
+        if ($adminMembers.Count -gt 0) {
+            Write-Info "  Administrators members (snapshot): $([string]::Join(', ', $adminMembers))"
+            Write-Info "    Correlate add/remove with Security events 4732/4733 (see Security section)."
+        }
+        else { Write-Info "  Could not enumerate local Administrators membership" }
+    }
+    catch { Write-DiagWarning "  Local Administrators check failed: $($_.Exception.Message)" }
+
+    # 21. Trusted Root / CA store changes (newly-valid certs + store-key signal)
+    Write-Section "Trusted Root / CA Store"
+    try {
+        foreach ($store in @('Root', 'CA')) {
+            $newRoot = @(Get-ChildItem "Cert:\LocalMachine\$store" -ErrorAction SilentlyContinue | Where-Object { $_.NotBefore -ge $startTime })
+            if ($newRoot.Count -gt 0) {
+                Write-DiagWarning "  $($newRoot.Count) cert(s) in LocalMachine\$store became valid within window:"
+                foreach ($rc in @($newRoot | Select-Object -First 10)) {
+                    Write-Info "    Subject: $($rc.Subject) | NotBefore: $($rc.NotBefore.ToString('yyyy-MM-dd HH:mm:ss')) | Thumbprint: $($rc.Thumbprint)"
+                    $timeline.Add([pscustomobject]@{ Time = $rc.NotBefore; Category = "Root/CA Store"; Source = "Cert:\LocalMachine\$store"; Detail = $rc.Subject })
+                }
+            }
+            else { Write-Info "  No certs in LocalMachine\$store with NotBefore in window" }
+        }
+        Add-ChangeRegistrySignal -Category "Trusted Root Store" -Path 'HKLM:\SOFTWARE\Microsoft\SystemCertificates\Root\Certificates' -StartTime $startTime -Timeline $timeline
+        Add-ChangeRegistrySignal -Category "Intermediate CA Store" -Path 'HKLM:\SOFTWARE\Microsoft\SystemCertificates\CA\Certificates' -StartTime $startTime -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  Root/CA store check failed: $($_.Exception.Message)" }
+
+    # 22. Recently modified driver files (System32\drivers\*.sys)
+    Write-Section "Recently Modified Driver Files"
+    try {
+        $driverDir = Join-Path $env:SystemRoot 'System32\drivers'
+        $changedDrivers = @(Get-ChildItem -Path $driverDir -Filter '*.sys' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -ge $startTime } |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 20)
+        if ($changedDrivers.Count -gt 0) {
+            Write-DiagWarning "  $($changedDrivers.Count) driver file(s) written within window (top 20 shown):"
+            foreach ($d in $changedDrivers) {
+                Write-Info "    $($d.Name)  $($d.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+                $timeline.Add([pscustomobject]@{ Time = $d.LastWriteTime; Category = "Driver File"; Source = "drivers\$($d.Name)"; Detail = "driver file written" })
+            }
+        }
+        else { Write-Info "  No *.sys driver files modified within window" }
+    }
+    catch { Write-DiagWarning "  Driver-file check failed: $($_.Exception.Message)" }
+
+    # 23. SMB share add / remove (registry signal + snapshot)
+    Write-Section "SMB Shares"
+    try {
+        Add-ChangeRegistrySignal -Category "SMB Shares (LanmanServer)" -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Shares' -StartTime $startTime -Timeline $timeline
+        $shares = @(Get-SmbShare -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '\$$' })
+        if ($shares.Count -gt 0) {
+            Write-Info "  Non-admin shares (snapshot): $([string]::Join(', ', @($shares | ForEach-Object { $_.Name })))"
+        }
+        else { Write-Info "  No non-administrative SMB shares (snapshot)" }
+    }
+    catch { Write-DiagWarning "  SMB share check failed: $($_.Exception.Message)" }
+
+    # 24. Power plan / time zone / pagefile changes
+    Write-Section "Power / Time Zone / Pagefile"
+    try {
+        $activeScheme = "unknown"
+        try {
+            $pc = (& powercfg /getactivescheme) 2>$null
+            if ($pc) { $activeScheme = ([string]::Join(' ', @($pc))).Trim() }
+        }
+        catch { Write-Verbose "powercfg unavailable: $($_.Exception.Message)" }
+        Write-Info "  Active power scheme (snapshot): $activeScheme"
+        $tzCaption = (Get-CimInstance Win32_TimeZone -ErrorAction SilentlyContinue).Caption
+        if ($tzCaption) { Write-Info "  Time zone (snapshot): $tzCaption" }
+        Add-ChangeRegistrySignal -Category "Time Zone" -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation' -StartTime $startTime -Timeline $timeline -CurrentState $tzCaption
+        Add-ChangeRegistrySignal -Category "Memory Mgmt / Pagefile" -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -StartTime $startTime -Timeline $timeline
+        Add-ChangeRegistrySignal -Category "Power Settings" -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -StartTime $startTime -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  Power/TZ/pagefile check failed: $($_.Exception.Message)" }
+
+    # 25. Autorun / persistence (Run / RunOnce keys)
+    Write-Section "Autorun / Persistence (Run keys)"
+    try {
+        Add-ChangeRegistrySignal -Category "Autorun (HKLM Run)" -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -StartTime $startTime -Timeline $timeline
+        Add-ChangeRegistrySignal -Category "Autorun (HKLM RunOnce)" -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -StartTime $startTime -Timeline $timeline
+        Add-ChangeRegistrySignal -Category "Autorun (HKCU Run)" -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -StartTime $startTime -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  Autorun check failed: $($_.Exception.Message)" }
+
+    # 26. WinRM / remote management configuration
+    Write-Section "WinRM / Remote Management"
+    try {
+        Add-ChangeRegistrySignal -Category "WinRM (WSMAN)" -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WSMAN' -StartTime $startTime -Timeline $timeline
+        Add-ChangeRegistrySignal -Category "WinRM (Service params)" -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WinRM\Parameters' -StartTime $startTime -Timeline $timeline
+        $winrmSvc = Get-Service -Name 'WinRM' -ErrorAction SilentlyContinue
+        if ($winrmSvc) { Write-Info "  WinRM service (snapshot): Status=$($winrmSvc.Status) StartType=$($winrmSvc.StartType)" }
+    }
+    catch { Write-DiagWarning "  WinRM check failed: $($_.Exception.Message)" }
+
+    # 27. Hyper-V VM configuration changes (host only)
+    Write-Section "Hyper-V VM Configuration"
+    try {
+        $vmms = Get-Service -Name 'vmms' -ErrorAction SilentlyContinue
+        if ($vmms) {
+            $hv = Get-RecentEvents -LogName 'Microsoft-Windows-Hyper-V-VMMS-Admin' -EventIds @(13002, 13003, 13000, 18304, 18500, 18502, 18504, 18510) -HoursBack $Hours -MaxEvents 50
+            Add-ChangeEventSignal -Category "Hyper-V VM" -Events $hv -Timeline $timeline
+        }
+        else { Write-Info "  Hyper-V (vmms service) not present - skipped" }
+    }
+    catch { Write-DiagWarning "  Hyper-V check failed: $($_.Exception.Message)" }
+
+    # 28. Failover Cluster configuration changes (cluster nodes only)
+    Write-Section "Failover Cluster Configuration"
+    try {
+        if ($script:ClusterEnv -and $script:ClusterEnv.IsClusterNode) {
+            $clus = Get-RecentEvents -LogName 'Microsoft-Windows-FailoverClustering/Operational' -EventIds @(1592, 1635, 1636, 1201, 1204, 5142, 5121, 1153) -HoursBack $Hours -MaxEvents 50
+            Add-ChangeEventSignal -Category "Cluster Config" -Events $clus -Timeline $timeline
+        }
+        else { Write-Info "  Not a failover cluster node - skipped" }
+    }
+    catch { Write-DiagWarning "  Cluster check failed: $($_.Exception.Message)" }
+
+    # 29. BitLocker / encryption state (snapshot)
+    Write-Section "BitLocker / Encryption State (snapshot)"
+    try {
+        if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+            $bvols = @(Get-BitLockerVolume -ErrorAction SilentlyContinue)
+            if ($bvols.Count -gt 0) {
+                foreach ($v in $bvols) {
+                    Write-Info "    $($v.MountPoint)  Protection=$($v.ProtectionStatus)  Volume=$($v.VolumeStatus)  Encrypted=$($v.EncryptionPercentage)%"
+                }
+            }
+            else { Write-Info "  No BitLocker volumes reported" }
+        }
+        else { Write-Info "  Get-BitLockerVolume not available - skipped" }
+    }
+    catch { Write-DiagWarning "  BitLocker check failed: $($_.Exception.Message)" }
+
+    # 30. Pending-reboot context (snapshot)
+    Write-Section "Pending-Reboot Context (snapshot)"
+    try {
+        $pending = [System.Collections.Generic.List[string]]::new()
+        if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pending.Add('CBS RebootPending') }
+        if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pending.Add('WindowsUpdate RebootRequired') }
+        $sessionMgr = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction SilentlyContinue
+        $pfro = if ($sessionMgr -and ($sessionMgr.PSObject.Properties.Name -contains 'PendingFileRenameOperations')) { $sessionMgr.PendingFileRenameOperations } else { $null }
+        if ($pfro) { $pending.Add('PendingFileRenameOperations') }
+        $cnActive = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -Name 'ComputerName' -ErrorAction SilentlyContinue).ComputerName
+        $cnConfig = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -Name 'ComputerName' -ErrorAction SilentlyContinue).ComputerName
+        if ($cnActive -and $cnConfig -and ($cnActive -ne $cnConfig)) { $pending.Add('Pending computer rename') }
+        if ($pending.Count -gt 0) {
+            Write-DiagWarning "  Pending-reboot indicator(s) present: $([string]::Join(', ', $pending))"
+        }
+        else { Write-Info "  No pending-reboot indicators detected" }
+    }
+    catch { Write-DiagWarning "  Pending-reboot check failed: $($_.Exception.Message)" }
+
     # Consolidated chronological timeline
     Write-Section "Consolidated Change Timeline (most recent first)"
     if ($timeline.Count -eq 0) {
         Write-Info "  No change signals detected in the last $Hours hours."
     }
     else {
-        Write-Info "  $($timeline.Count) total change signal(s). Top 30 shown:"
-        $ordered = @($timeline | Where-Object { $_.Time } | Sort-Object Time -Descending | Select-Object -First 30)
+        Write-Info "  $($timeline.Count) total change signal(s). Most recent (deduplicated, top 30):"
+        $ordered = @($timeline | Where-Object { $_.Time } |
+            Sort-Object Time -Descending |
+            Group-Object { "{0:yyyyMMddHHmmss}|{1}|{2}" -f $_.Time, $_.Category, $_.Detail } |
+            ForEach-Object { $_.Group[0] } |
+            Sort-Object Time -Descending | Select-Object -First 30)
         foreach ($row in $ordered) {
             Write-Host ("    {0:yyyy-MM-dd HH:mm:ss}  [{1}]  {2} - {3}" -f $row.Time, $row.Category, $row.Source, $row.Detail) -ForegroundColor White
         }

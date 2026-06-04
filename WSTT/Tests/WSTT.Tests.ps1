@@ -308,11 +308,95 @@ Describe 'WSFC menu wiring' {
     }
 
     It 'Get-ValidatedChoice accepts "22"' {
-        $script:ScriptContent | Should -Match 'Select an option \(0-22\)'
+        $script:ScriptContent | Should -Match 'Select an option \(0-23\)'
     }
 
     It 'Dispatcher has a "22" case that calls Test-WSFCClusterPortCompliance' {
         $script:ScriptContent | Should -Match '"22"\s*\{[^}]*Test-WSFCClusterPortCompliance'
+    }
+}
+
+Describe 'Recent Server Changes (24h) feature' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '_WSTT-TestHelpers.ps1')
+        $script:ScriptContent = Get-Content -Path $script:ScriptPath -Raw
+        $tokens = $null; $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:ScriptPath, [ref]$tokens, [ref]$errors)
+        $script:RcFunctions = $ast.FindAll(
+            { $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+    }
+
+    It 'Defines Get-RecentServerChange' {
+        ($script:RcFunctions.Name) | Should -Contain 'Get-RecentServerChange'
+    }
+
+    It 'Defines the Get-RegistryKeyLastWriteTime helper' {
+        ($script:RcFunctions.Name) | Should -Contain 'Get-RegistryKeyLastWriteTime'
+    }
+
+    It 'Get-RecentServerChange has [CmdletBinding()] and an -Hours parameter' {
+        $func = $script:RcFunctions | Where-Object { $_.Name -eq 'Get-RecentServerChange' } | Select-Object -First 1
+        $func.Body.ParamBlock.Attributes.TypeName.Name | Should -Contain 'CmdletBinding'
+        ($func.Body.ParamBlock.Parameters.Name.VariablePath.UserPath) | Should -Contain 'Hours'
+    }
+
+    It 'Show-MainMenu lists option 23' {
+        $script:ScriptContent | Should -Match '23\.\s+Recent Server Changes'
+    }
+
+    It 'Dispatcher has a "23" case that calls Get-RecentServerChange' {
+        $script:ScriptContent | Should -Match '"23"\s*\{[\s\S]*?Get-RecentServerChange'
+    }
+
+    It 'P/Invoke type registration is idempotent' {
+        $script:ScriptContent | Should -Match "Wstt\.Native\.RegInfo' -as \[type\]"
+    }
+
+    It 'HTML report includes the Recent Server Changes section' {
+        $script:ScriptContent | Should -Match 'Recent Server Changes \(24h\)"; Cmd = \{ Get-RecentServerChange'
+    }
+
+    It 'Defines all 14 expanded change categories (sections 17-30)' {
+        $func = $script:RcFunctions | Where-Object { $_.Name -eq 'Get-RecentServerChange' } | Select-Object -First 1
+        $body = $func.Extent.Text
+        foreach ($section in @(
+                'Hosts File & DNS Client',
+                'Group Policy',
+                'Roles & Features (Servicing)',
+                'Local Administrators (snapshot)',
+                'Trusted Root / CA Store',
+                'Recently Modified Driver Files',
+                'SMB Shares',
+                'Power / Time Zone / Pagefile',
+                'Autorun / Persistence (Run keys)',
+                'WinRM / Remote Management',
+                'Hyper-V VM Configuration',
+                'Failover Cluster Configuration',
+                'BitLocker / Encryption State (snapshot)',
+                'Pending-Reboot Context (snapshot)')) {
+            $body | Should -Match ([regex]::Escape($section))
+        }
+    }
+
+    It 'Gates Hyper-V on the vmms service and cluster on ClusterEnv.IsClusterNode' {
+        $func = $script:RcFunctions | Where-Object { $_.Name -eq 'Get-RecentServerChange' } | Select-Object -First 1
+        $body = $func.Extent.Text
+        $body | Should -Match "Get-Service -Name 'vmms'"
+        $body | Should -Match 'ClusterEnv.+IsClusterNode'
+    }
+
+    It 'Gates BitLocker snapshot on Get-BitLockerVolume availability' {
+        $func = $script:RcFunctions | Where-Object { $_.Name -eq 'Get-RecentServerChange' } | Select-Object -First 1
+        $func.Extent.Text | Should -Match 'Get-Command Get-BitLockerVolume'
+    }
+
+    It 'Each expanded category is wrapped in its own try/catch (no unguarded blocks)' {
+        $func = $script:RcFunctions | Where-Object { $_.Name -eq 'Get-RecentServerChange' } | Select-Object -First 1
+        $tryCount = ([regex]::Matches($func.Extent.Text, '(?m)^\s*try\s*\{')).Count
+        # 16 original + 14 new category blocks (some share a try) => at least 28
+        $tryCount | Should -BeGreaterThan 27
     }
 }
 
