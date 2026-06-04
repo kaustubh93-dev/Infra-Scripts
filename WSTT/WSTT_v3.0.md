@@ -167,7 +167,7 @@ Local-only validator for the network ports required by Windows Server Failover C
 ### 🕒 Recent Server Changes — last 24h (NEW — Option 23)
 - New utility `Get-RecentServerChange` that proactively surfaces **what changed on the server within a configurable lookback window** (default 24h, 1-720h) to speed up issue correlation and root-cause triage
 - Presents findings as **confidence-rated change signals** (not a guaranteed change log) plus a consolidated, de-duplicated **chronological timeline**
-- Detects across 16 categories:
+- Detects across 30 categories:
   - OS patch installs/updates (Windows Update events + `Get-HotFix`)
   - Reboot / restart activity (System events + last boot time)
   - Service add / start-type changes (SCM 7045 / 7040)
@@ -178,6 +178,8 @@ Local-only validator for the network ports required by Windows Server Failover C
   - Disk / storage configuration events
   - Firewall rule, scheduled task, Windows Defender, and RDP/Terminal Server changes
   - Security-audit signals (local accounts/groups, user rights, time changes — when auditing is enabled)
+  - **Expanded set:** hosts file & DNS client, Group Policy, Windows roles/features (servicing), local Administrators membership snapshot, Trusted Root/CA store, recently modified driver files (`drivers\*.sys`), SMB shares, power plan / time zone / pagefile, autorun (Run/RunOnce), WinRM / remote management
+  - **Environment-gated:** Hyper-V VM config (when `vmms` present), Failover Cluster config (cluster nodes only), BitLocker / encryption state (when `Get-BitLockerVolume` available), and pending-reboot context (CBS / Windows Update / `PendingFileRenameOperations`)
 - **Evidence sources:** Windows Event Logs, registry key `LastWriteTime` (via idempotent `RegQueryInfoKey` P/Invoke), and install/validity dates
 - Per-category error isolation, save-to-file support, and inclusion in the HTML Diagnostic Report
 - Categories without a native change history additionally show a **current-state snapshot** with a clearly-labelled limitation (a registry `LastWriteTime` indicates a key was touched, not which value changed)

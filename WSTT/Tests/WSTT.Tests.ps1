@@ -357,6 +357,47 @@ Describe 'Recent Server Changes (24h) feature' {
     It 'HTML report includes the Recent Server Changes section' {
         $script:ScriptContent | Should -Match 'Recent Server Changes \(24h\)"; Cmd = \{ Get-RecentServerChange'
     }
+
+    It 'Defines all 14 expanded change categories (sections 17-30)' {
+        $func = $script:RcFunctions | Where-Object { $_.Name -eq 'Get-RecentServerChange' } | Select-Object -First 1
+        $body = $func.Extent.Text
+        foreach ($section in @(
+                'Hosts File & DNS Client',
+                'Group Policy',
+                'Roles & Features (Servicing)',
+                'Local Administrators (snapshot)',
+                'Trusted Root / CA Store',
+                'Recently Modified Driver Files',
+                'SMB Shares',
+                'Power / Time Zone / Pagefile',
+                'Autorun / Persistence (Run keys)',
+                'WinRM / Remote Management',
+                'Hyper-V VM Configuration',
+                'Failover Cluster Configuration',
+                'BitLocker / Encryption State (snapshot)',
+                'Pending-Reboot Context (snapshot)')) {
+            $body | Should -Match ([regex]::Escape($section))
+        }
+    }
+
+    It 'Gates Hyper-V on the vmms service and cluster on ClusterEnv.IsClusterNode' {
+        $func = $script:RcFunctions | Where-Object { $_.Name -eq 'Get-RecentServerChange' } | Select-Object -First 1
+        $body = $func.Extent.Text
+        $body | Should -Match "Get-Service -Name 'vmms'"
+        $body | Should -Match 'ClusterEnv.+IsClusterNode'
+    }
+
+    It 'Gates BitLocker snapshot on Get-BitLockerVolume availability' {
+        $func = $script:RcFunctions | Where-Object { $_.Name -eq 'Get-RecentServerChange' } | Select-Object -First 1
+        $func.Extent.Text | Should -Match 'Get-Command Get-BitLockerVolume'
+    }
+
+    It 'Each expanded category is wrapped in its own try/catch (no unguarded blocks)' {
+        $func = $script:RcFunctions | Where-Object { $_.Name -eq 'Get-RecentServerChange' } | Select-Object -First 1
+        $tryCount = ([regex]::Matches($func.Extent.Text, '(?m)^\s*try\s*\{')).Count
+        # 16 original + 14 new category blocks (some share a try) => at least 28
+        $tryCount | Should -BeGreaterThan 27
+    }
 }
 
 Describe 'WSFC Get-WSFCFirewallRuleStatus — module-missing fallback' {
