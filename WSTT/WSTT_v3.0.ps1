@@ -70,6 +70,13 @@
       [Report]    HTML diagnostic report: dark-themed, collapsible sections, color-coded
                   output, runs all 12 diagnostics, opens in browser
       [Fix]       System.Web.HttpUtility→System.Net.WebUtility for Server 2019/Core compat
+      [Changes]   NEW Utility (menu option 23) "Recent Server Changes (last Nh)": Get-RecentServerChange
+                  surfaces detectable changes in a configurable lookback window (default 24h) as
+                  confidence-rated change signals — OS patches, reboots, service/driver/software/VM Tools
+                  installs, TLS certs & SChannel/cipher hardening, NIC/route/proxy/env-var changes,
+                  disk/storage, firewall, scheduled tasks, Defender, RDP and Security-audit signals.
+                  Sources: Event logs, registry key LastWriteTime (RegQueryInfoKey P/Invoke) and install
+                  dates. Included in save-to-file and the HTML report. (GitHub issue #5)
 #>
 
 param(
@@ -6418,6 +6425,40 @@ function Test-ServicesHealth {
             if ($stratumText) { Write-Info "  $stratumText" }
             if ($lastSyncText){ Write-Info "  $lastSyncText" }
 
+            # Configured sync mode (W32Time 'Type') and NTP peer list.
+            # Type values:
+            #   NT5DS   = sync from the AD domain hierarchy (correct for domain members)
+            #   NTP     = sync from a manually configured NtpServer (correct for the PDC Emulator)
+            #   NoSync  = the time service does not synchronize with any source
+            #   AllSync = sync from both the domain hierarchy and configured NtpServer
+            try {
+                $w32TimeParams = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' -ErrorAction Stop
+                $typeValue = $w32TimeParams.Type
+                if ($typeValue) {
+                    $typeDescription = switch ($typeValue) {
+                        'NT5DS'   { 'sync from AD domain hierarchy' }
+                        'NTP'     { 'sync from manually configured NtpServer' }
+                        'NoSync'  { 'no time synchronization' }
+                        'AllSync' { 'sync from both domain hierarchy and NtpServer' }
+                        default   { 'unknown mode' }
+                    }
+                    Write-Info "  Type: $typeValue ($typeDescription)"
+                    if ($typeValue -eq 'NoSync') {
+                        Write-DiagWarning "  W32Time Type is NoSync - the clock will not be corrected from any source"
+                        Write-Info "    Remediation: For a domain member 'w32tm /config /syncfromflags:domhier /update';"
+                        Write-Info "                 for the PDC 'w32tm /config /syncfromflags:manual /manualpeerlist:<ntp> /update';"
+                        Write-Info "                 then 'Restart-Service W32Time'."
+                    }
+                }
+                $ntpServerValue = $w32TimeParams.NtpServer
+                if ($ntpServerValue) {
+                    Write-Info "  NtpServer: $ntpServerValue"
+                }
+            }
+            catch {
+                Write-Info "  Type/NtpServer: not available ($($_.Exception.Message))"
+            }
+
             # Stratum classification
             $stratumValue = $null
             if ($stratumText -match 'Stratum:\s*(\d+)') { $stratumValue = [int]$Matches[1] }
@@ -11019,6 +11060,7 @@ function Export-HTMLReport {
         @{ Title = "Security & Authentication"; Cmd = { Test-SecurityAuthentication } },
         @{ Title = "Windows Update Status"; Cmd = { Test-WindowsUpdateStatus } },
         @{ Title = "TLS Configuration"; Cmd = { Test-TLSConfiguration } },
+        @{ Title = "Recent Server Changes (24h)"; Cmd = { Get-RecentServerChange -Hours 24 } },
         @{ Title = "Cross-Category Scorecard"; Cmd = { Test-CrossCategoryHealth } }
     )
 
@@ -11126,6 +11168,405 @@ $js
     }
 }
 
+#region Recent Server Changes (24h)
+function Get-RegistryKeyLastWriteTime {
+    <#
+    .SYNOPSIS
+        Returns the LastWriteTime of a registry key (no native cmdlet exists).
+    .DESCRIPTION
+        Uses advapi32!RegQueryInfoKey via an idempotently-defined P/Invoke type.
+        Returns $null if the key is missing/unreadable rather than throwing, so a
+        single failed lookup never aborts the calling change-detection section.
+    .PARAMETER Path
+        Registry path in PowerShell drive form, e.g. 'HKLM:\SYSTEM\...'.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path
+    )
+
+    if (-not ('Wstt.Native.RegInfo' -as [type])) {
+        try {
+            Add-Type -ErrorAction Stop -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+namespace Wstt.Native {
+    public static class RegInfo {
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern int RegQueryInfoKey(
+            SafeRegistryHandle hKey, IntPtr lpClass, IntPtr lpcchClass, IntPtr lpReserved,
+            IntPtr lpcSubKeys, IntPtr lpcbMaxSubKeyLen, IntPtr lpcbMaxClassLen,
+            IntPtr lpcValues, IntPtr lpcbMaxValueNameLen, IntPtr lpcbMaxValueLen,
+            IntPtr lpcbSecurityDescriptor, out long lpftLastWriteTime);
+    }
+}
+"@
+        }
+        catch {
+            return $null
+        }
+    }
+
+    $key = $null
+    try {
+        $parts = $Path -split ':\\', 2
+        if ($parts.Count -ne 2) { return $null }
+        $hive = switch ($parts[0].ToUpperInvariant()) {
+            'HKLM' { [Microsoft.Win32.Registry]::LocalMachine }
+            'HKCU' { [Microsoft.Win32.Registry]::CurrentUser }
+            'HKCR' { [Microsoft.Win32.Registry]::ClassesRoot }
+            'HKU'  { [Microsoft.Win32.Registry]::Users }
+            default { $null }
+        }
+        if ($null -eq $hive) { return $null }
+
+        $key = $hive.OpenSubKey($parts[1])
+        if ($null -eq $key) { return $null }
+
+        $ft = [long]0
+        $z = [IntPtr]::Zero
+        $rc = [Wstt.Native.RegInfo]::RegQueryInfoKey($key.Handle, $z, $z, $z, $z, $z, $z, $z, $z, $z, $z, [ref]$ft)
+        if ($rc -eq 0) { return [DateTime]::FromFileTime($ft) }
+        return $null
+    }
+    catch {
+        return $null
+    }
+    finally {
+        if ($null -ne $key) { $key.Close() }
+    }
+}
+
+function Add-ChangeEventSignal {
+    <#
+    .SYNOPSIS
+        Renders recent event-log entries for a change category and records them on
+        the shared timeline. Console-only output (no pipeline objects) so the HTML
+        report's *>&1 | Out-String capture stays stable.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Category,
+        [object[]]$Events,
+        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$Timeline,
+        [int]$ShowMax = 5
+    )
+
+    $list = @($Events | Where-Object { $null -ne $_ })
+    if ($list.Count -eq 0) {
+        Write-Info "  No '$Category' change events in window"
+        return
+    }
+
+    Write-Success "  $($list.Count) '$Category' event(s) found"
+    $shown = @($list | Sort-Object TimeCreated -Descending | Select-Object -First $ShowMax)
+    foreach ($e in $shown) {
+        $snippet = Get-EventSnippet -Event $e -MaxLength 120
+        Write-Info ("    {0:yyyy-MM-dd HH:mm:ss}  EID {1}  {2}" -f $e.TimeCreated, $e.Id, $snippet)
+        $Timeline.Add([pscustomobject]@{
+                Time     = $e.TimeCreated
+                Category = $Category
+                Source   = "EventID $($e.Id)"
+                Detail   = $snippet
+            })
+    }
+    if ($list.Count -gt $ShowMax) {
+        Write-Info "    ... and $($list.Count - $ShowMax) more (query the full log for detail)"
+    }
+}
+
+function Add-ChangeRegistrySignal {
+    <#
+    .SYNOPSIS
+        Reports a low-confidence change signal based on a registry key's
+        LastWriteTime. Console-only output; records the signal on the timeline.
+    .DESCRIPTION
+        Registry LastWriteTime indicates the key was written, NOT which value
+        changed (and it can update for unrelated writes). Output is labelled
+        accordingly so findings are not over-interpreted.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Category,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][datetime]$StartTime,
+        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$Timeline,
+        [string]$CurrentState
+    )
+
+    $lw = Get-RegistryKeyLastWriteTime -Path $Path
+    if ($null -eq $lw) {
+        Write-Info "  $($Category): registry key not found or unreadable ($Path)"
+        return
+    }
+
+    if ($lw -ge $StartTime) {
+        Write-DiagWarning "  $($Category): registry key modified $($lw.ToString('yyyy-MM-dd HH:mm:ss')) [LOW-confidence signal]"
+        Write-Info "    Key: $Path"
+        Write-Info "    Note: LastWriteTime shows the key was touched, not which value changed."
+        if ($CurrentState) { Write-Info "    Current state: $CurrentState" }
+        $Timeline.Add([pscustomobject]@{
+                Time     = $lw
+                Category = $Category
+                Source   = "Registry"
+                Detail   = "Key modified: $Path"
+            })
+    }
+    else {
+        Write-Info "  $($Category): no registry change in window (last write $($lw.ToString('yyyy-MM-dd HH:mm:ss')))"
+    }
+}
+
+function Get-RecentServerChange {
+    <#
+    .SYNOPSIS
+        Surfaces detectable changes made on the local server within a lookback window.
+    .DESCRIPTION
+        Correlates recent modifications (patches, reboots, services, drivers,
+        software, TLS/SChannel, NIC, routes, disk/storage, env vars, proxy, plus
+        firewall/scheduled-task/local-account/time/Defender/RDP signals) to speed
+        up issue identification. Evidence is drawn from Windows Event Logs, registry
+        key LastWriteTimes, and install/validity dates, and is presented as
+        confidence-rated CHANGE SIGNALS rather than definitive change history.
+        Categories without a native change log additionally show a current-state
+        snapshot and a clearly-labelled limitation.
+
+        Console-only output (no pipeline objects) so it can be captured cleanly by
+        the HTML report and the save-to-file flow.
+    .PARAMETER Hours
+        Lookback window in hours (1-720). Default 24.
+    .EXAMPLE
+        Get-RecentServerChange
+    .EXAMPLE
+        Get-RecentServerChange -Hours 72
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateRange(1, 720)]
+        [int]$Hours = 24
+    )
+
+    Write-Header "Recent Server Changes (last $Hours h)"
+    $startTime = (Get-Date).AddHours(-$Hours)
+    Write-Info "Window: $($startTime.ToString('yyyy-MM-dd HH:mm:ss')) -> $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))  (Computer: $env:COMPUTERNAME)"
+    Write-Info "Findings are evidence-based CHANGE SIGNALS, not a guaranteed change log. Correlate with the reported issue time."
+    $timeline = [System.Collections.Generic.List[object]]::new()
+
+    # 1. OS patches / updates (WU events primary; Get-HotFix supplemental)
+    Write-Section "OS Patches & Updates"
+    try {
+        $wu = Get-RecentEvents -LogName 'Microsoft-Windows-WindowsUpdateClient/Operational' -EventIds @(19, 20, 43) -HoursBack $Hours -MaxEvents 50
+        Add-ChangeEventSignal -Category "Windows Update" -Events $wu -Timeline $timeline
+        $recentHotfix = @(Get-HotFix -ErrorAction SilentlyContinue | Where-Object {
+                $_.InstalledOn -and ($_.InstalledOn -ge $startTime)
+            })
+        if ($recentHotfix.Count -gt 0) {
+            Write-Success "  $($recentHotfix.Count) hotfix(es) with InstalledOn in window (supplemental):"
+            foreach ($hf in $recentHotfix) {
+                Write-Info "    $($hf.HotFixID)  $($hf.Description)  $($hf.InstalledOn.ToString('yyyy-MM-dd'))"
+                $timeline.Add([pscustomobject]@{ Time = $hf.InstalledOn; Category = "Windows Update"; Source = "Get-HotFix"; Detail = "$($hf.HotFixID) $($hf.Description)" })
+            }
+        }
+        else {
+            Write-Info "  No hotfixes with a parseable InstalledOn date in window (InstalledOn can be null/locale-dependent on some builds)"
+        }
+    }
+    catch { Write-DiagWarning "  Patch check failed: $($_.Exception.Message)" }
+
+    # 2. Reboot / restart activity
+    Write-Section "Reboot & Restart Activity"
+    try {
+        $reboot = Get-RecentEvents -LogName 'System' -EventIds @(6005, 6006, 6008, 1074, 109, 41) -HoursBack $Hours -MaxEvents 50
+        Add-ChangeEventSignal -Category "Reboot/Shutdown" -Events $reboot -Timeline $timeline
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+        if ($os) {
+            $boot = $os.LastBootUpTime
+            $within = if ($boot -ge $startTime) { "WITHIN window" } else { "before window" }
+            Write-Info "  Last boot: $($boot.ToString('yyyy-MM-dd HH:mm:ss')) ($within)"
+        }
+    }
+    catch { Write-DiagWarning "  Reboot check failed: $($_.Exception.Message)" }
+
+    # 3. OS service add / remove / config changes
+    Write-Section "Service Changes (install / start-type)"
+    try {
+        $svc = Get-RecentEvents -LogName 'System' -EventIds @(7045, 7040) -HoursBack $Hours -MaxEvents 50
+        Add-ChangeEventSignal -Category "Service Change" -Events $svc -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  Service-change check failed: $($_.Exception.Message)" }
+
+    # 4. Driver / GPU / firmware updates
+    Write-Section "Driver / GPU / Firmware"
+    try {
+        $pnp = Get-RecentEvents -LogName 'Microsoft-Windows-Kernel-PnP/Configuration' -EventIds @(400, 410, 411, 420, 430, 442) -HoursBack $Hours -MaxEvents 50
+        Add-ChangeEventSignal -Category "Driver/PnP" -Events $pnp -Timeline $timeline
+        $gpus = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue)
+        foreach ($gpu in $gpus) {
+            $dDate = if ($gpu.DriverDate) { $gpu.DriverDate.ToString('yyyy-MM-dd') } else { 'unknown' }
+            Write-Info "  GPU snapshot: $($gpu.Name) | driver $($gpu.DriverVersion) | date $dDate"
+        }
+    }
+    catch { Write-DiagWarning "  Driver/GPU check failed: $($_.Exception.Message)" }
+
+    # 5. Software & VM Tools installs / updates
+    Write-Section "Software & VM Tools Installs"
+    try {
+        $msi = Get-RecentEvents -LogName 'Application' -EventIds @(1033, 1034, 11707, 11724) -HoursBack $Hours -MaxEvents 50
+        Add-ChangeEventSignal -Category "Software Install" -Events $msi -Timeline $timeline
+        $cutoff = $startTime.Date
+        $uninstallPaths = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        )
+        $recentApps = @(Get-ItemProperty $uninstallPaths -ErrorAction SilentlyContinue | Where-Object {
+                $_.DisplayName -and $_.InstallDate -match '^\d{8}$' -and
+                ([datetime]::ParseExact($_.InstallDate, 'yyyyMMdd', $null) -ge $cutoff)
+            })
+        if ($recentApps.Count -gt 0) {
+            Write-Success "  $($recentApps.Count) installed product(s) with InstallDate in window (date granularity only):"
+            foreach ($app in ($recentApps | Sort-Object DisplayName -Unique)) {
+                Write-Info "    $($app.DisplayName)  $($app.DisplayVersion)  $($app.InstallDate)"
+            }
+        }
+        else {
+            Write-Info "  No products with InstallDate in window (registry InstallDate is date-granular only)"
+        }
+    }
+    catch { Write-DiagWarning "  Software check failed: $($_.Exception.Message)" }
+
+    # 6. TLS / SSL certificate changes (newly-valid certs as a snapshot signal)
+    Write-Section "TLS / SSL Certificates"
+    try {
+        $newCerts = @(Get-ChildItem 'Cert:\LocalMachine\My' -ErrorAction SilentlyContinue | Where-Object { $_.NotBefore -ge $startTime })
+        if ($newCerts.Count -gt 0) {
+            Write-DiagWarning "  $($newCerts.Count) machine cert(s) became valid within window (possible cert change):"
+            foreach ($c in $newCerts) {
+                Write-Info "    Subject: $($c.Subject) | NotBefore: $($c.NotBefore.ToString('yyyy-MM-dd HH:mm:ss')) | Thumbprint: $($c.Thumbprint)"
+                $timeline.Add([pscustomobject]@{ Time = $c.NotBefore; Category = "TLS Certificate"; Source = "Cert:\LocalMachine\My"; Detail = $c.Subject })
+            }
+        }
+        else {
+            Write-Info "  No LocalMachine\My certificates with NotBefore in window"
+        }
+        Add-ChangeRegistrySignal -Category "SChannel / Cipher Hardening" -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols' -StartTime $startTime -Timeline $timeline
+        Add-ChangeRegistrySignal -Category "SChannel Ciphers" -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Cryptography\Configuration\Local\SSL\00010002' -StartTime $startTime -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  TLS/cert check failed: $($_.Exception.Message)" }
+
+    # 7. NIC configuration changes
+    Write-Section "NIC Configuration"
+    try {
+        $nicSnap = @(Get-CimInstance Win32_NetworkAdapterConfiguration -ErrorAction SilentlyContinue | Where-Object { $_.IPEnabled })
+        $nicState = ($nicSnap | ForEach-Object { ($_.IPAddress | Select-Object -First 1) }) -join ', '
+        Add-ChangeRegistrySignal -Category "NIC / TCPIP Interfaces" -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces' -StartTime $startTime -Timeline $timeline -CurrentState "Active IPs: $nicState"
+    }
+    catch { Write-DiagWarning "  NIC check failed: $($_.Exception.Message)" }
+
+    # 8. Route changes (no native history -> registry signal + current snapshot)
+    Write-Section "Routing Table"
+    try {
+        $routeCount = @(Get-NetRoute -ErrorAction SilentlyContinue).Count
+        Add-ChangeRegistrySignal -Category "Persistent Routes" -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\PersistentRoutes' -StartTime $startTime -Timeline $timeline -CurrentState "$routeCount active routes (no native route-change history exists)"
+    }
+    catch { Write-DiagWarning "  Route check failed: $($_.Exception.Message)" }
+
+    # 9. Disk / storage configuration changes
+    Write-Section "Disk / Storage"
+    try {
+        $disk = Get-RecentEvents -LogName 'System' -EventIds @(98, 140, 153, 157) -HoursBack $Hours -MaxEvents 50
+        Add-ChangeEventSignal -Category "Disk/Storage" -Events $disk -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  Disk/storage check failed: $($_.Exception.Message)" }
+
+    # 10. Environment variable changes
+    Write-Section "Environment Variables"
+    try {
+        Add-ChangeRegistrySignal -Category "System Environment Variables" -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -StartTime $startTime -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  Environment check failed: $($_.Exception.Message)" }
+
+    # 11. Proxy configuration changes
+    Write-Section "Proxy Configuration"
+    try {
+        $proxyState = "unknown"
+        try {
+            $netshProxy = (netsh winhttp show proxy) 2>$null
+            if ($netshProxy) { $proxyState = (($netshProxy | Where-Object { $_ -match '\S' }) -join ' | ') }
+        }
+        catch { }
+        Add-ChangeRegistrySignal -Category "WinINET Proxy (Internet Settings)" -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings' -StartTime $startTime -Timeline $timeline -CurrentState "WinHTTP: $proxyState"
+        Add-ChangeRegistrySignal -Category "WinHTTP Proxy" -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Connections' -StartTime $startTime -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  Proxy check failed: $($_.Exception.Message)" }
+
+    # 12. Firewall rule / profile changes
+    Write-Section "Firewall Changes"
+    try {
+        $fw = Get-RecentEvents -LogName 'Microsoft-Windows-Windows Firewall With Advanced Security/Firewall' -EventIds @(2004, 2005, 2006, 2033, 2052) -HoursBack $Hours -MaxEvents 50
+        Add-ChangeEventSignal -Category "Firewall Change" -Events $fw -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  Firewall check failed: $($_.Exception.Message)" }
+
+    # 13. Scheduled task changes
+    Write-Section "Scheduled Task Changes"
+    try {
+        $task = Get-RecentEvents -LogName 'Microsoft-Windows-TaskScheduler/Operational' -EventIds @(106, 140, 141) -HoursBack $Hours -MaxEvents 50
+        Add-ChangeEventSignal -Category "Scheduled Task Change" -Events $task -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  Scheduled-task check failed: $($_.Exception.Message)" }
+
+    # 14. Windows Defender configuration changes
+    Write-Section "Windows Defender Configuration"
+    try {
+        $def = Get-RecentEvents -LogName 'Microsoft-Windows-Windows Defender/Operational' -EventIds @(5007) -HoursBack $Hours -MaxEvents 50
+        Add-ChangeEventSignal -Category "Defender Config" -Events $def -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  Defender check failed: $($_.Exception.Message)" }
+
+    # 15. RDP / Terminal Server changes (registry signal + current state)
+    Write-Section "RDP / Terminal Server"
+    try {
+        $denyTs = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -ErrorAction SilentlyContinue).fDenyTSConnections
+        $rdpState = if ($denyTs -eq 0) { "RDP enabled" } elseif ($denyTs -eq 1) { "RDP disabled" } else { "unknown" }
+        Add-ChangeRegistrySignal -Category "Terminal Server / RDP" -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -StartTime $startTime -Timeline $timeline -CurrentState $rdpState
+    }
+    catch { Write-DiagWarning "  RDP check failed: $($_.Exception.Message)" }
+
+    # 16. Security-audit signals (local accounts/groups, privileges, time, policy) - queried LAST (Security log can be large/slow)
+    Write-Section "Security Audit Signals (local accounts / privileges / time / policy)"
+    try {
+        $secIds = @(4720, 4722, 4725, 4726, 4732, 4733, 4738, 4670, 4616, 4719, 4704, 4705)
+        $sec = Get-RecentEvents -LogName 'Security' -EventIds $secIds -HoursBack $Hours -MaxEvents 60
+        if (@($sec).Count -eq 0) {
+            Write-Info "  No matching Security events in window (requires the relevant audit policies to be enabled and read access to the Security log)"
+        }
+        else {
+            Add-ChangeEventSignal -Category "Security/Audit" -Events $sec -Timeline $timeline -ShowMax 8
+        }
+    }
+    catch { Write-DiagWarning "  Security-audit check skipped: $($_.Exception.Message)" }
+
+    # Consolidated chronological timeline
+    Write-Section "Consolidated Change Timeline (most recent first)"
+    if ($timeline.Count -eq 0) {
+        Write-Info "  No change signals detected in the last $Hours hours."
+    }
+    else {
+        Write-Info "  $($timeline.Count) total change signal(s). Top 30 shown:"
+        $ordered = @($timeline | Where-Object { $_.Time } | Sort-Object Time -Descending | Select-Object -First 30)
+        foreach ($row in $ordered) {
+            Write-Host ("    {0:yyyy-MM-dd HH:mm:ss}  [{1}]  {2} - {3}" -f $row.Time, $row.Category, $row.Source, $row.Detail) -ForegroundColor White
+        }
+    }
+
+    Write-Host ""
+    Write-Info "Reminder: low-confidence registry signals indicate a key was modified, not which value changed. Correlate findings with the incident time before acting."
+}
+#endregion
+
 #region Main Menu and Execution
 function Show-MainMenu {
     <#
@@ -11174,6 +11615,8 @@ UTILITIES:" -ForegroundColor Yellow
     Write-Host " 19. Task Scheduler Diagnostics" -ForegroundColor White
     Write-Host " 20. Server Baseline Validation" -ForegroundColor White
     Write-Host " 21. Generate HTML Diagnostic Report" -ForegroundColor Green
+    Write-Host " 23. Recent Server Changes (last 24h)" -ForegroundColor Green
+    Write-Host "     (Patches, reboots, services, drivers, TLS, NIC, routes, proxy & more)" -ForegroundColor Gray
 
     Write-Host "
 CLUSTER:" -ForegroundColor Yellow
@@ -11255,7 +11698,7 @@ function Start-TroubleshootingTool {
     try {
         do {
             Show-MainMenu
-            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-22)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22")
+            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-23)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23")
             
             switch ($choice) {
                 "1" {
@@ -11417,6 +11860,26 @@ function Start-TroubleshootingTool {
                     $exportChoice = Get-ValidatedChoice -Prompt "Export WSFC port report (CSV + HTML)? (Y/N)" -ValidChoices @("Y", "N")
                     if ($exportChoice -eq "Y") {
                         Test-WSFCClusterPortCompliance -ExportCsv -ExportHtml
+                    }
+                }
+                "23" {
+                    Clear-Host
+                    $hoursInput = Read-Host "Lookback window in hours (1-720, press Enter for 24)"
+                    $lookbackHours = 24
+                    if (-not [string]::IsNullOrWhiteSpace($hoursInput)) {
+                        $parsed = 0
+                        if ([int]::TryParse($hoursInput, [ref]$parsed) -and $parsed -ge 1 -and $parsed -le 720) {
+                            $lookbackHours = $parsed
+                        }
+                        else {
+                            Write-DiagWarning "Invalid hours value '$hoursInput'; using default of 24."
+                        }
+                    }
+                    Get-RecentServerChange -Hours $lookbackHours
+                    Write-Host "`n"
+                    $saveChoice = Get-ValidatedChoice -Prompt "Save recent-changes report to file? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($saveChoice -eq "Y") {
+                        Export-DiagnosticSection -Title "Recent_Server_Changes" -ScriptBlock { Get-RecentServerChange -Hours $lookbackHours }
                     }
                 }
                 "0" {
