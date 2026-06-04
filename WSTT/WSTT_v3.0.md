@@ -1,4 +1,4 @@
-# Windows Server Troubleshooting & Log Collection Tool
+# Windows Server Troubleshooting & Log Collection Tool (WSTT)
 
 ## Overview
 
@@ -42,7 +42,7 @@ Local-only validator for the network ports required by Windows Server Failover C
 | WinRM (Cloud Witness) | TCP | 5985 | Bidirectional | WinRM HTTP — required for Azure cloud witness |
 
 **Out of scope by design:**
-- Trojan-port overlap analysis (e.g. Example Trojan list comparison) — environment-specific, not in this tool.
+- Trojan-port overlap analysis (e.g. environment-specific Trojan list comparison) — not in this tool.
 - Dynamic RPC range 49152–65535 live testing — testing 16K ports is impractical; cluster picks random ports at runtime.
 
 **How it works:**
@@ -399,11 +399,16 @@ The script calls `Get-ClusterEnvironmentInfo` once at startup and caches the res
 
 ## Thresholds Reference
 
-### Resource Thresholds
+### Resource Thresholds (SCOM-aligned)
+
+WARNING tiers match the SCOM Management Pack alert triggers (May 2026) so WSTT triage corroborates SCOM at the same threshold. The in-script CRITICAL tier (95%) acts as a red-flag above SCOM.
+
 ```
-Memory:   🟢 <80%  🟡 80-90%  🔴 >90%
-CPU:      🟢 <80%  🟡 80-90%  🔴 >90%
-Disk:     🟢 <80%  🟡 80-90%  🔴 >90%
+                       SCOM alert (WARNING)   In-script CRITICAL
+CPU                    🟡 85%                 🔴 95%
+Memory                 🟡 85%                 🔴 95%
+Disk (system drive)    🟡 85%                 🔴 95%
+Disk (non-system)      🟡 90%                 🔴 95%
 ```
 
 ### Disk Latency
@@ -481,20 +486,28 @@ Filter Drivers: 🟡 >10 active (latency impact)
 ## Configuration
 
 ### Threshold Customization
-Edit constants at the top of the script (lines 33-63):
+Edit the `Set-Variable` constants at the top of the script (lines 103-137). All are declared `-Option ReadOnly` and reflect the SCOM-aligned defaults:
 
 ```powershell
-# Resource Thresholds (ReadOnly)
-$MEMORY_CRITICAL_THRESHOLD = 90      # Memory usage % critical
-$CPU_CRITICAL_THRESHOLD = 90         # CPU usage % critical
-$DISK_CRITICAL_THRESHOLD = 90        # Disk usage % critical
-$DISK_LATENCY_CRITICAL_MS = 50       # Read/write latency critical (ms)
-$NONPAGED_POOL_CRITICAL_MB = 300     # NonPaged pool critical (MB)
-$PAGED_POOL_CRITICAL_MB = 400        # Paged pool critical (MB)
-$AVAILABLE_MB_CRITICAL = 500         # Available memory critical (MB)
-$HANDLE_LEAK_WARNING = 10000         # Handle count warning per process
-$PAGEFILE_USAGE_CRITICAL_PERCENT = 90 # Page file usage critical %
+# Resource Thresholds (ReadOnly, SCOM-aligned)
+Set-Variable -Name MEMORY_CRITICAL_THRESHOLD         -Value 95   # Memory usage % critical
+Set-Variable -Name MEMORY_WARNING_THRESHOLD          -Value 85   # Memory usage % warning (SCOM alert)
+Set-Variable -Name CPU_CRITICAL_THRESHOLD            -Value 95   # CPU usage % critical
+Set-Variable -Name CPU_WARNING_THRESHOLD             -Value 85   # CPU usage % warning (SCOM alert)
+Set-Variable -Name DISK_SYSTEM_CRITICAL_THRESHOLD    -Value 95   # System drive % critical
+Set-Variable -Name DISK_SYSTEM_WARNING_THRESHOLD     -Value 85   # System drive % warning (SCOM alert)
+Set-Variable -Name DISK_NONSYSTEM_CRITICAL_THRESHOLD -Value 95   # Non-system drive % critical
+Set-Variable -Name DISK_NONSYSTEM_WARNING_THRESHOLD  -Value 90   # Non-system drive % warning (SCOM alert)
+Set-Variable -Name DISK_LATENCY_CRITICAL_MS          -Value 50   # Read/write latency critical (ms)
+Set-Variable -Name NONPAGED_POOL_CRITICAL_MB         -Value 300  # NonPaged pool critical (MB)
+Set-Variable -Name PAGED_POOL_CRITICAL_MB            -Value 400  # Paged pool critical (MB)
+Set-Variable -Name AVAILABLE_MB_CRITICAL             -Value 500  # Available memory critical (MB)
+Set-Variable -Name HANDLE_LEAK_WARNING               -Value 10000 # Handle count warning per process
+Set-Variable -Name PAGEFILE_USAGE_CRITICAL_PERCENT   -Value 90   # Page file usage critical %
 ```
+
+> [!NOTE]
+> Legacy aliases `DISK_CRITICAL_THRESHOLD` (95) and `DISK_WARNING_THRESHOLD` (90) are retained for external/test consumers that still reference the original names.
 
 ### TSS Path
 ```powershell
@@ -542,7 +555,7 @@ $script:DefaultLogPath = Join-Path $script:TempBasePath "Logs"
 | Metric | Value |
 |--------|-------|
 | Total lines | ~11,470 |
-| Functions | 63 |
+| Functions | 62 (PowerShell) |
 | Total diagnostic checks | 159+ |
 | Menu options | 23 (0-22) |
 | OS versions supported | 2019, 2022, 2025 |

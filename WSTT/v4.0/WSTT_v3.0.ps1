@@ -87,8 +87,8 @@ param(
 #region Constants and Configuration
 # Threshold Constants (ReadOnly to prevent accidental reassignment)
 # ----------------------------------------------------------------------------
-# SCOM-aligned thresholds (Example Management Pack defaults, May 2026).
-# Source: Example SCOM team - monitoring is metric-driven (no Event-ID
+# SCOM-aligned thresholds (enterprise Management Pack defaults, May 2026).
+# Source: SCOM monitoring team - monitoring is metric-driven (no Event-ID
 # correlation). WARNING tier is set to the SCOM alert trigger so WSTT triage
 # corroborates SCOM at the same threshold. CRITICAL tier (95%) acts as an
 # in-script red-flag above SCOM.

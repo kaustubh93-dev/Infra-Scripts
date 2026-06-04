@@ -20,7 +20,7 @@ Infra-Scripts/
 ├── 100+ upgrade/                          # Windows Server 2022 in-place upgrade automation
 ├── Cloud-Hybrid Scripts/ArcMonitor/       # Azure Arc monitoring & onboarding suite
 ├── Cluster script/                        # Windows Failover Cluster health & FSW management
-├── Security-DSC/                              # PowerShell DSC security baselines (banking compliance)
+├── Security-DSC/                          # PowerShell DSC security baselines (compliance)
 ├── Hyper-V BIOS GUID Change Script/       # Hyper-V VM BIOS GUID manipulation
 ├── Secure Boot Status Checker/            # Multi-server Secure Boot compliance auditing
 ├── SecureBoot_2026_UpdateScripts_v1.0/    # UEFI Secure Boot 2026 cert expiry preparation
@@ -39,7 +39,7 @@ Infra-Scripts/
 | **100+ upgrade** | OS Upgrade | `Upgrade-Server2022.ps1`, `v3.ps1` | Automated Windows Server 2022 in-place upgrade (v1→v3) |
 | **Cloud-Hybrid Scripts/ArcMonitor** | Hybrid Cloud | `Start-ArcMonitor.ps1`, `ArcMonitor.psm1` | Azure Arc monitoring, onboarding, pre-req checks & TUI dashboard |
 | **Cluster script** | HA/Clustering | `GetClusterServicestatus-remotely.ps1` | Failover Cluster health checks, FSW share & witness ACL management |
-| **Security-DSC** | Compliance | `SecurityBaseline.ps1`, `Run-BaselineAudit.ps1` | PowerShell DSC configurations for banking security baselines |
+| **Security-DSC** | Compliance | `SecurityBaseline.ps1`, `Run-BaselineAudit.ps1` | PowerShell DSC configurations for security baselines |
 | **Hyper-V BIOS GUID Change Script** | Virtualization | `Set-VMBiosGuid.ps1` | Programmatically change Hyper-V VM BIOS GUIDs for licensing |
 | **Secure Boot Status Checker** | Security | `README.md` | Remote multi-server Secure Boot compliance auditing |
 | **SecureBoot_2026_UpdateScripts** | Security | `Detect-SecureBootCertReadiness.ps1` | Prepare for June 2026 UEFI cert expiry (CVE-2023-24932) |

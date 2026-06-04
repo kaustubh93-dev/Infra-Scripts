@@ -156,7 +156,7 @@ Always produce a structured review report with the following sections:
 
 - [ ] **Multi-site cluster awareness**: Flag scripts that do not account
       for cross-site latency (e.g., missing `-Timeout` parameters on
-      remote calls across sites like Site-B/SA/Site-C nodes).
+      remote calls across sites like Site-A/Site-B/Site-C nodes).
 
 - [ ] **SQL Always On awareness**: Flag cluster scripts that stop/restart
       services or nodes without checking AG (Availability Group) role

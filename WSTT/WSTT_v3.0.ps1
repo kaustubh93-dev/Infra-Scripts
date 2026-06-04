@@ -88,8 +88,8 @@ param(
 #region Constants and Configuration
 # Threshold Constants (ReadOnly to prevent accidental reassignment)
 # ----------------------------------------------------------------------------
-# SCOM-aligned thresholds (Example Management Pack defaults, May 2026).
-# Source: Example SCOM team - monitoring is metric-driven (no Event-ID
+# SCOM-aligned thresholds (enterprise Management Pack defaults, May 2026).
+# Source: SCOM monitoring team - monitoring is metric-driven (no Event-ID
 # correlation). WARNING tier is set to the SCOM alert trigger so WSTT triage
 # corroborates SCOM at the same threshold. CRITICAL tier (95%) acts as an
 # in-script red-flag above SCOM.
@@ -1090,6 +1090,10 @@ function Show-WSFCPortSummaryTable {
     )
 
     Write-Header "Summary"
+
+    if ($Peers -and $Peers.Count -gt 0) {
+        Write-Info "  Peers evaluated: $($Peers.Count) ($($Peers -join ', '))"
+    }
 
     if ($ReachabilityResults.Count -gt 0) {
         Write-Section "Reachability Matrix"
@@ -3412,7 +3416,6 @@ function Test-MemoryUsage {
             $speeds = @()
             $types = @()
             foreach ($mod in $memModules) {
-                $sizeMB = [math]::Round($mod.Capacity / 1MB, 0)
                 $sizeGB = [math]::Round($mod.Capacity / 1GB, 1)
                 $speed = $mod.Speed
                 $manufacturer = if ($mod.Manufacturer) { $mod.Manufacturer.Trim() } else { "Unknown" }
@@ -3622,13 +3625,6 @@ function Test-MemoryUsage {
             ForEach-Object {
                 $wsMB = [math]::Round($_.WorkingSet64 / 1MB, 0)
                 $privateMB = [math]::Round($_.PrivateMemorySize64 / 1MB, 0)
-                $gdiObjects = 0
-                $userObjects = 0
-                try {
-                    $gdiObjects = $_.GDI_Objects
-                    $userObjects = $_.USER_Objects
-                }
-                catch { }
                 [PSCustomObject]@{
                     Name      = $_.Name
                     PID       = $_.Id
