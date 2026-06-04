@@ -11251,7 +11251,7 @@ function Add-ChangeEventSignal {
     param(
         [Parameter(Mandatory = $true)][string]$Category,
         [object[]]$Events,
-        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$Timeline,
+        [System.Collections.Generic.List[object]]$Timeline,
         [int]$ShowMax = 5
     )
 
@@ -11293,7 +11293,7 @@ function Add-ChangeRegistrySignal {
         [Parameter(Mandatory = $true)][string]$Category,
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][datetime]$StartTime,
-        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$Timeline,
+        [System.Collections.Generic.List[object]]$Timeline,
         [string]$CurrentState
     )
 
@@ -11496,7 +11496,7 @@ function Get-RecentServerChange {
             $netshProxy = (netsh winhttp show proxy) 2>$null
             if ($netshProxy) { $proxyState = (($netshProxy | Where-Object { $_ -match '\S' }) -join ' | ') }
         }
-        catch { }
+        catch { Write-Verbose "netsh winhttp show proxy unavailable: $($_.Exception.Message)" }
         Add-ChangeRegistrySignal -Category "WinINET Proxy (Internet Settings)" -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings' -StartTime $startTime -Timeline $timeline -CurrentState "WinHTTP: $proxyState"
         Add-ChangeRegistrySignal -Category "WinHTTP Proxy" -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Connections' -StartTime $startTime -Timeline $timeline
     }
@@ -11538,7 +11538,7 @@ function Get-RecentServerChange {
     # 16. Security-audit signals (local accounts/groups, privileges, time, policy) - queried LAST (Security log can be large/slow)
     Write-Section "Security Audit Signals (local accounts / privileges / time / policy)"
     try {
-        $secIds = @(4720, 4722, 4725, 4726, 4732, 4733, 4738, 4670, 4616, 4719, 4704, 4705)
+        $secIds = @(4720, 4722, 4725, 4726, 4732, 4733, 4738, 4616, 4719, 4704, 4705)
         $sec = Get-RecentEvents -LogName 'Security' -EventIds $secIds -HoursBack $Hours -MaxEvents 60
         if (@($sec).Count -eq 0) {
             Write-Info "  No matching Security events in window (requires the relevant audit policies to be enabled and read access to the Security log)"
@@ -11555,8 +11555,12 @@ function Get-RecentServerChange {
         Write-Info "  No change signals detected in the last $Hours hours."
     }
     else {
-        Write-Info "  $($timeline.Count) total change signal(s). Top 30 shown:"
-        $ordered = @($timeline | Where-Object { $_.Time } | Sort-Object Time -Descending | Select-Object -First 30)
+        Write-Info "  $($timeline.Count) total change signal(s). Most recent (deduplicated, top 30):"
+        $ordered = @($timeline | Where-Object { $_.Time } |
+            Sort-Object Time -Descending |
+            Group-Object { "{0:yyyyMMddHHmmss}|{1}|{2}" -f $_.Time, $_.Category, $_.Detail } |
+            ForEach-Object { $_.Group[0] } |
+            Sort-Object Time -Descending | Select-Object -First 30)
         foreach ($row in $ordered) {
             Write-Host ("    {0:yyyy-MM-dd HH:mm:ss}  [{1}]  {2} - {3}" -f $row.Time, $row.Category, $row.Source, $row.Detail) -ForegroundColor White
         }

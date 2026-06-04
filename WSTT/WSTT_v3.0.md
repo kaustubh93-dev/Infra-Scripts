@@ -164,6 +164,24 @@ Local-only validator for the network ports required by Windows Server Failover C
 - Opens in default browser on completion
 - Uses `System.Net.WebUtility` (compatible with Server 2019/Core)
 
+### 🕒 Recent Server Changes — last 24h (NEW — Option 23)
+- New utility `Get-RecentServerChange` that proactively surfaces **what changed on the server within a configurable lookback window** (default 24h, 1-720h) to speed up issue correlation and root-cause triage
+- Presents findings as **confidence-rated change signals** (not a guaranteed change log) plus a consolidated, de-duplicated **chronological timeline**
+- Detects across 16 categories:
+  - OS patch installs/updates (Windows Update events + `Get-HotFix`)
+  - Reboot / restart activity (System events + last boot time)
+  - Service add / start-type changes (SCM 7045 / 7040)
+  - Driver / GPU / firmware updates (Kernel-PnP events + GPU snapshot)
+  - Software & VM Tools installs (MsiInstaller events + Uninstall registry)
+  - TLS/SSL certificate changes + SChannel/cipher hardening
+  - NIC configuration, routing table, environment variables, proxy configuration
+  - Disk / storage configuration events
+  - Firewall rule, scheduled task, Windows Defender, and RDP/Terminal Server changes
+  - Security-audit signals (local accounts/groups, user rights, time changes — when auditing is enabled)
+- **Evidence sources:** Windows Event Logs, registry key `LastWriteTime` (via idempotent `RegQueryInfoKey` P/Invoke), and install/validity dates
+- Per-category error isolation, save-to-file support, and inclusion in the HTML Diagnostic Report
+- Categories without a native change history additionally show a **current-state snapshot** with a clearly-labelled limitation (a registry `LastWriteTime` indicates a key was touched, not which value changed)
+
 ### 🔄 Cluster & SQL AG Awareness (NEW)
 | Feature | Description |
 |---------|-------------|
@@ -247,7 +265,7 @@ Local-only validator for the network ports required by Windows Server Failover C
 - PowerShell TLS configuration
 - Remediation commands and export
 
-### 📊 Utilities (Options 12-22)
+### 📊 Utilities (Options 12-23)
 | Option | Feature |
 |--------|---------|
 | 12 | Generate System Report |
@@ -261,6 +279,7 @@ Local-only validator for the network ports required by Windows Server Failover C
 | 20 | Server Baseline Validation |
 | **21** | **Generate HTML Diagnostic Report** |
 | **22** | **WSFC Cluster Port Compliance Check** |
+| **23** | **Recent Server Changes (last 24h)** |
 
 ---
 
@@ -341,6 +360,7 @@ UTILITIES:
  19. Task Scheduler Diagnostics
  20. Server Baseline Validation
  21. Generate HTML Diagnostic Report
+ 23. Recent Server Changes (last 24h)
 
 CLUSTER:
  22. WSFC Cluster Port Compliance Check

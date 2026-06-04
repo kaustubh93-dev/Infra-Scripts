@@ -308,11 +308,54 @@ Describe 'WSFC menu wiring' {
     }
 
     It 'Get-ValidatedChoice accepts "22"' {
-        $script:ScriptContent | Should -Match 'Select an option \(0-22\)'
+        $script:ScriptContent | Should -Match 'Select an option \(0-23\)'
     }
 
     It 'Dispatcher has a "22" case that calls Test-WSFCClusterPortCompliance' {
         $script:ScriptContent | Should -Match '"22"\s*\{[^}]*Test-WSFCClusterPortCompliance'
+    }
+}
+
+Describe 'Recent Server Changes (24h) feature' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '_WSTT-TestHelpers.ps1')
+        $script:ScriptContent = Get-Content -Path $script:ScriptPath -Raw
+        $tokens = $null; $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:ScriptPath, [ref]$tokens, [ref]$errors)
+        $script:RcFunctions = $ast.FindAll(
+            { $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+    }
+
+    It 'Defines Get-RecentServerChange' {
+        ($script:RcFunctions.Name) | Should -Contain 'Get-RecentServerChange'
+    }
+
+    It 'Defines the Get-RegistryKeyLastWriteTime helper' {
+        ($script:RcFunctions.Name) | Should -Contain 'Get-RegistryKeyLastWriteTime'
+    }
+
+    It 'Get-RecentServerChange has [CmdletBinding()] and an -Hours parameter' {
+        $func = $script:RcFunctions | Where-Object { $_.Name -eq 'Get-RecentServerChange' } | Select-Object -First 1
+        $func.Body.ParamBlock.Attributes.TypeName.Name | Should -Contain 'CmdletBinding'
+        ($func.Body.ParamBlock.Parameters.Name.VariablePath.UserPath) | Should -Contain 'Hours'
+    }
+
+    It 'Show-MainMenu lists option 23' {
+        $script:ScriptContent | Should -Match '23\.\s+Recent Server Changes'
+    }
+
+    It 'Dispatcher has a "23" case that calls Get-RecentServerChange' {
+        $script:ScriptContent | Should -Match '"23"\s*\{[\s\S]*?Get-RecentServerChange'
+    }
+
+    It 'P/Invoke type registration is idempotent' {
+        $script:ScriptContent | Should -Match "Wstt\.Native\.RegInfo' -as \[type\]"
+    }
+
+    It 'HTML report includes the Recent Server Changes section' {
+        $script:ScriptContent | Should -Match 'Recent Server Changes \(24h\)"; Cmd = \{ Get-RecentServerChange'
     }
 }
 
