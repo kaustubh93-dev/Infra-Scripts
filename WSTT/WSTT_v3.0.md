@@ -2,7 +2,7 @@
 
 ## Overview
 
-A comprehensive PowerShell-based interactive diagnostic tool for **Windows Server 2019, 2022, and 2025**. Diagnoses and collects logs for Network, Memory, CPU, Disk, Services, Event Logs, DNS, Security & Authentication, Windows Update, TLS/SSL, IIS, **WSFC Cluster Port Compliance**, and **Cluster/SQL AG environments**.
+A comprehensive PowerShell-based interactive diagnostic tool for **Windows Server 2019, 2022, and 2025**. Diagnoses and collects logs for Network, Memory, CPU, Disk, Services, Event Logs, DNS, Security & Authentication, Windows Update, TLS/SSL, IIS, **WSFC Cluster Port Compliance**, and **Cluster/SQL AG environments** — plus a **Known Issues Tracker** and **incident-derived proactive checks** that map real RCA signatures to live on-box detection.
 
 **Author:** Kaustubh Sharma  
 **Version:** 3.0  
@@ -156,7 +156,7 @@ Local-only validator for the network ports required by Windows Server Failover C
 | 9 | Critical System Driver Versions | tcpip.sys, afd.sys, storport.sys, ntfs.sys, etc. |
 
 ### 📄 HTML Diagnostic Report (Option 21)
-- Runs **all 12 diagnostic functions** automatically
+- Runs **all 15 diagnostic sections** automatically (now includes Task Scheduler Diagnostics, Recent Server Changes, and the Known Issues Tracker)
 - Produces a **dark-themed, collapsible HTML** report
 - Color-coded: `[SUCCESS]` green, `[ERROR]` red, `WARNING:` orange
 - Section headers are **clickable** to expand/collapse
@@ -166,8 +166,8 @@ Local-only validator for the network ports required by Windows Server Failover C
 
 ### 🕒 Recent Server Changes — last 24h (NEW — Option 23)
 - New utility `Get-RecentServerChange` that proactively surfaces **what changed on the server within a configurable lookback window** (default 24h, 1-720h) to speed up issue correlation and root-cause triage
-- Presents findings as **confidence-rated change signals** (not a guaranteed change log) plus a consolidated, de-duplicated **chronological timeline**
-- Detects across 30 categories:
+- Presents findings as **confidence-rated change signals** (not a guaranteed change log) plus a consolidated, de-duplicated **chronological timeline** (top 50)
+- Detects across 40 categories:
   - OS patch installs/updates (Windows Update events + `Get-HotFix`)
   - Reboot / restart activity (System events + last boot time)
   - Service add / start-type changes (SCM 7045 / 7040)
@@ -180,9 +180,53 @@ Local-only validator for the network ports required by Windows Server Failover C
   - Security-audit signals (local accounts/groups, user rights, time changes — when auditing is enabled)
   - **Expanded set:** hosts file & DNS client, Group Policy, Windows roles/features (servicing), local Administrators membership snapshot, Trusted Root/CA store, recently modified driver files (`drivers\*.sys`), SMB shares, power plan / time zone / pagefile, autorun (Run/RunOnce), WinRM / remote management
   - **Environment-gated:** Hyper-V VM config (when `vmms` present), Failover Cluster config (cluster nodes only), BitLocker / encryption state (when `Get-BitLockerVolume` available), and pending-reboot context (CBS / Windows Update / `PendingFileRenameOperations`)
+  - **Security & policy set (10 additional):** Windows Update/WSUS policy, W32Time/NTP source, LSA/NTLM policy (`LmCompatibilityLevel`), RDP-Tcp listener security (port/NLA/SecurityLayer), DCOM/OLE hardening (KB5004442), print service/spooler + driver store, scheduled-task definition files (file-system), Microsoft Defender exclusions & real-time-protection state, Winlogon/IFEO persistence keys, and local user-account snapshot (recent password changes)
 - **Evidence sources:** Windows Event Logs, registry key `LastWriteTime` (via idempotent `RegQueryInfoKey` P/Invoke), and install/validity dates
 - Per-category error isolation, save-to-file support, and inclusion in the HTML Diagnostic Report
 - Categories without a native change history additionally show a **current-state snapshot** with a clearly-labelled limitation (a registry `LastWriteTime` indicates a key was touched, not which value changed)
+
+### 🧭 Known Issues Tracker (NEW — Option 24)
+
+Maps documented Windows Server issues to **live on-box detection**, so common root causes are surfaced in seconds with a deep-dive pointer and remediation. Backed by an **extensible catalog** (`Get-KnownIssueCatalog`) — add a row to track your own issues.
+
+- Each entry: `Id, Title, Category, Severity, WSTTOption (deep-dive), Reference, Remediation, Applies (gate), Detect (scriptblock)`
+- Verdicts per issue: **HIT** (signature found) / **MANUAL** (needs judgement) / **CLEAR** (not detected) / **SKIP** (not applicable to this host) / **ERR**
+- Lookback window: `-DaysBack <1-365>` (default 7); ends with a summary scorecard
+- Console-only output → flows into save-to-file and the HTML Diagnostic Report
+
+**Seeded catalog (12 entries):**
+
+| Id | Issue | Category | Deep-dive |
+|----|-------|----------|-----------|
+| KI-0001 | Paged-pool exhaustion / registry hive-flush failure (Event 333) | Memory | Option 2 |
+| KI-0002 | Schannel TLS private-key inaccessible (36870/36871) | Security / TLS | Option 8 / 13 |
+| KI-0003 | Cluster instability: heartbeat/quarantine + RHS/resource/quorum | Cluster | Option 22 / 10 |
+| KI-0004 | Storage transport errors: bus reset / I/O retry (129/153) | Disk | Option 4 |
+| KI-0005 | Restrictive NTLM policy may break legacy auth (`LmCompatibilityLevel`) | Security | Option 8 |
+| KI-0006 | DCOM hardening authentication mismatch (KB5004442, 10036/7/8) | Security / App | Option 6 |
+| KI-0007 | Scheduled task logon failure (stored creds, 0x8007052E) | Task Scheduler | Option 19 |
+| KI-0008 | Patch staleness (no KB installed recently) | Windows Update | Option 9 |
+| KI-0009 | Time service not synchronizing (W32Time NoSync / stopped) | Time / Auth | Option 5 / 8 |
+| KI-0010 | Pending reboot blocking patch / role installs | Servicing | Option 9 |
+| KI-0011 | System volume critically low on free space | Disk | Option 4 |
+| KI-0012 | WHEA hardware errors (CPU/memory/PCIe silicon degrading) | Hardware / CPU | Option 3 |
+
+### 🚨 Proactive / Incident-Derived Checks (NEW)
+
+Detection functions derived from real production RCAs, each targeting a signal the core diagnostics did not previously catch. They are **wired into their category's primary check** (so they appear under the relevant menu option and flow into the HTML report automatically).
+
+| Check | Detects | Wired into (Option) |
+|-------|---------|---------------------|
+| `Get-ServiceControlHang` | SCM stop/start hangs & start failures (7011/7009/7000/7022/7043) | Services (5) |
+| `Get-HungProcessAndService` | Not-responding GUI processes + services stuck START/STOP_PENDING | Services (5) |
+| `Get-ApplicationHang` | GUI application hangs (Event 1002 — taskmgr/mmc) | Event Log (6) |
+| `Get-DirtyShutdownHistory` | Dirty/unclean restarts (Kernel-Power 41 / 6008), recurrence count | Event Log (6) |
+| `Get-StorageResetStorm` | Clustered bursts of 129/153 within a sliding window (reset storm) | Disk (4) |
+| `Get-AccountLockoutSource` | 4740 enrichment — caller machine + service running as locked acct | Security (8) |
+| `Get-ScheduledTaskMissedRun` | Enabled recurring tasks overdue or stuck 'running' (silent stop) | Task Scheduler (19) |
+| `Test-CrashDumpReadiness` | volmgr 46/49 + pagefile sized for the CONFIGURED dump type | Baseline (20) |
+
+> Watch-list (`$script:KnownCriticalEventIDs`) extended with **System** 7011/7009/7000/7022/7043/41/46/49 and **Application** 1002, so these also surface in the cross-section event scan (Option 6).
 
 ### 🔄 Cluster & SQL AG Awareness (NEW)
 | Feature | Description |
@@ -267,7 +311,7 @@ Local-only validator for the network ports required by Windows Server Failover C
 - PowerShell TLS configuration
 - Remediation commands and export
 
-### 📊 Utilities (Options 12-23)
+### 📊 Utilities (Options 12-24)
 | Option | Feature |
 |--------|---------|
 | 12 | Generate System Report |
@@ -282,6 +326,7 @@ Local-only validator for the network ports required by Windows Server Failover C
 | **21** | **Generate HTML Diagnostic Report** |
 | **22** | **WSFC Cluster Port Compliance Check** |
 | **23** | **Recent Server Changes (last 24h)** |
+| **24** | **Known Issues Tracker** |
 
 ---
 
@@ -363,6 +408,7 @@ UTILITIES:
  20. Server Baseline Validation
  21. Generate HTML Diagnostic Report
  23. Recent Server Changes (last 24h)
+ 24. Known Issues Tracker (documented WS issues → live detection)
 
 CLUSTER:
  22. WSFC Cluster Port Compliance Check
@@ -576,14 +622,14 @@ $script:DefaultLogPath = Join-Path $script:TempBasePath "Logs"
 
 | Metric | Value |
 |--------|-------|
-| Total lines | ~11,470 |
-| Functions | 62 (PowerShell) |
-| Total diagnostic checks | 159+ |
-| Menu options | 23 (0-22) |
+| Total lines | ~13,220 |
+| Functions | 77 (PowerShell) |
+| Total diagnostic checks | 180+ |
+| Menu options | 25 (0-24) |
 | OS versions supported | 2019, 2022, 2025 |
 | Cluster-safe checks | 13 |
-| New in v3.0 | 27 network, 24 CPU, 24 disk, 19 memory, 8 task scheduler, 9 baseline, HTML report, cluster/AG awareness, **9 WSFC port-compliance checks** |
-| Pester test coverage | 51 tests (33 base + 18 WSFC) — all passing |
+| New in v3.0 | 27 network, 24 CPU, 24 disk, 19 memory, 8 task scheduler, 9 baseline, HTML report, cluster/AG awareness, 9 WSFC port-compliance checks, 40-category Recent Server Changes, Known Issues Tracker (12 seeded), 8 incident-derived proactive checks |
+| Pester test coverage | 81 tests — all passing |
 
 ---
 

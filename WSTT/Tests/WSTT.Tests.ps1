@@ -308,7 +308,7 @@ Describe 'WSFC menu wiring' {
     }
 
     It 'Get-ValidatedChoice accepts "22"' {
-        $script:ScriptContent | Should -Match 'Select an option \(0-23\)'
+        $script:ScriptContent | Should -Match 'Select an option \(0-24\)'
     }
 
     It 'Dispatcher has a "22" case that calls Test-WSFCClusterPortCompliance' {
@@ -380,6 +380,24 @@ Describe 'Recent Server Changes (24h) feature' {
         }
     }
 
+    It 'Defines all 10 additional change categories (sections 31-40)' {
+        $func = $script:RcFunctions | Where-Object { $_.Name -eq 'Get-RecentServerChange' } | Select-Object -First 1
+        $body = $func.Extent.Text
+        foreach ($section in @(
+                'Windows Update / WSUS Policy',
+                'Windows Time (NTP) Configuration',
+                'LSA / NTLM Authentication Policy',
+                'RDP Listener (RDP-Tcp) Security',
+                'DCOM / OLE Security',
+                'Print Service / Spooler',
+                'Scheduled Task Files (file system)',
+                'Microsoft Defender Exclusions & State (snapshot)',
+                'Logon & Persistence Keys (Winlogon / IFEO)',
+                'Local User Accounts (snapshot)')) {
+            $body | Should -Match ([regex]::Escape($section))
+        }
+    }
+
     It 'Gates Hyper-V on the vmms service and cluster on ClusterEnv.IsClusterNode' {
         $func = $script:RcFunctions | Where-Object { $_.Name -eq 'Get-RecentServerChange' } | Select-Object -First 1
         $body = $func.Extent.Text
@@ -397,6 +415,135 @@ Describe 'Recent Server Changes (24h) feature' {
         $tryCount = ([regex]::Matches($func.Extent.Text, '(?m)^\s*try\s*\{')).Count
         # 16 original + 14 new category blocks (some share a try) => at least 28
         $tryCount | Should -BeGreaterThan 27
+    }
+}
+
+Describe 'Known Issues Tracker feature' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '_WSTT-TestHelpers.ps1')
+        $script:ScriptContent = Get-Content -Path $script:ScriptPath -Raw
+        $tokens = $null; $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:ScriptPath, [ref]$tokens, [ref]$errors)
+        $script:KiFunctions = $ast.FindAll(
+            { $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+    }
+
+    It 'Defines Get-KnownIssueCatalog and Test-KnownIssue' {
+        ($script:KiFunctions.Name) | Should -Contain 'Get-KnownIssueCatalog'
+        ($script:KiFunctions.Name) | Should -Contain 'Test-KnownIssue'
+    }
+
+    It 'Test-KnownIssue has [CmdletBinding()] and a -DaysBack parameter' {
+        $func = $script:KiFunctions | Where-Object { $_.Name -eq 'Test-KnownIssue' } | Select-Object -First 1
+        $func.Body.ParamBlock.Attributes.TypeName.Name | Should -Contain 'CmdletBinding'
+        ($func.Body.ParamBlock.Parameters.Name.VariablePath.UserPath) | Should -Contain 'DaysBack'
+    }
+
+    It 'Show-MainMenu lists option 24' {
+        $script:ScriptContent | Should -Match '24\.\s+Known Issues Tracker'
+    }
+
+    It 'Menu dispatcher prompt accepts 0-24' {
+        $script:ScriptContent | Should -Match 'Select an option \(0-24\)'
+    }
+
+    It 'Dispatcher has a "24" case that calls Test-KnownIssue' {
+        $script:ScriptContent | Should -Match '"24"\s*\{[\s\S]*?Test-KnownIssue'
+    }
+
+    It 'HTML report includes the Known Issues Tracker section' {
+        $script:ScriptContent | Should -Match 'Known Issues Tracker"; Cmd = \{ Test-KnownIssue'
+    }
+
+    It 'Get-KnownIssueCatalog returns entries with the required contract' {
+        . ([scriptblock]::Create((Import-WSTTFunction -Name 'Get-KnownIssueCatalog')))
+        $catalog = Get-KnownIssueCatalog
+        @($catalog).Count | Should -BeGreaterThan 0
+        foreach ($entry in $catalog) {
+            $entry.Id          | Should -Not -BeNullOrEmpty
+            $entry.Title       | Should -Not -BeNullOrEmpty
+            $entry.Category    | Should -Not -BeNullOrEmpty
+            $entry.Severity    | Should -Not -BeNullOrEmpty
+            $entry.WSTTOption  | Should -Not -BeNullOrEmpty
+            $entry.Remediation | Should -Not -BeNullOrEmpty
+            $entry.Detect      | Should -BeOfType [scriptblock]
+        }
+    }
+
+    It 'Known issue Ids are unique' {
+        . ([scriptblock]::Create((Import-WSTTFunction -Name 'Get-KnownIssueCatalog')))
+        $ids = @((Get-KnownIssueCatalog).Id)
+        ($ids | Select-Object -Unique).Count | Should -Be ($ids.Count)
+    }
+}
+
+Describe 'Proactive / Incident-Derived Checks feature' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '_WSTT-TestHelpers.ps1')
+        $script:ScriptContent = Get-Content -Path $script:ScriptPath -Raw
+        $tokens = $null; $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:ScriptPath, [ref]$tokens, [ref]$errors)
+        $script:PcFunctions = $ast.FindAll(
+            { $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+    }
+
+    It 'Defines all 8 proactive check functions' {
+        foreach ($fn in @(
+                'Get-ServiceControlHang', 'Get-ApplicationHang', 'Get-DirtyShutdownHistory',
+                'Test-CrashDumpReadiness', 'Get-HungProcessAndService', 'Get-StorageResetStorm',
+                'Get-ScheduledTaskMissedRun', 'Get-AccountLockoutSource')) {
+            ($script:PcFunctions.Name) | Should -Contain $fn
+        }
+    }
+
+    It 'Extends KnownCriticalEventIDs with the new System IDs' {
+        foreach ($id in 7011, 7009, 7000, 7022, 7043, 41, 46, 49) {
+            $script:ScriptContent | Should -Match "Id = $id;"
+        }
+    }
+
+    It 'Extends KnownCriticalEventIDs with Application Hang 1002' {
+        $script:ScriptContent | Should -Match 'Id = 1002;'
+    }
+
+    It 'Wires Get-StorageResetStorm into Test-DiskPerformance' {
+        $f = $script:PcFunctions | Where-Object { $_.Name -eq 'Test-DiskPerformance' } | Select-Object -First 1
+        $f.Extent.Text | Should -Match 'Get-StorageResetStorm'
+    }
+
+    It 'Wires SCM-hang and hung-process checks into Test-ServicesHealth' {
+        $f = $script:PcFunctions | Where-Object { $_.Name -eq 'Test-ServicesHealth' } | Select-Object -First 1
+        $f.Extent.Text | Should -Match 'Get-ServiceControlHang'
+        $f.Extent.Text | Should -Match 'Get-HungProcessAndService'
+    }
+
+    It 'Wires app-hang and dirty-shutdown checks into Test-EventLogHealth' {
+        $f = $script:PcFunctions | Where-Object { $_.Name -eq 'Test-EventLogHealth' } | Select-Object -First 1
+        $f.Extent.Text | Should -Match 'Get-ApplicationHang'
+        $f.Extent.Text | Should -Match 'Get-DirtyShutdownHistory'
+    }
+
+    It 'Wires Get-AccountLockoutSource into Test-SecurityAuthentication' {
+        $f = $script:PcFunctions | Where-Object { $_.Name -eq 'Test-SecurityAuthentication' } | Select-Object -First 1
+        $f.Extent.Text | Should -Match 'Get-AccountLockoutSource'
+    }
+
+    It 'Wires Get-ScheduledTaskMissedRun into Test-TaskSchedulerHealth' {
+        $f = $script:PcFunctions | Where-Object { $_.Name -eq 'Test-TaskSchedulerHealth' } | Select-Object -First 1
+        $f.Extent.Text | Should -Match 'Get-ScheduledTaskMissedRun'
+    }
+
+    It 'Wires Test-CrashDumpReadiness into Test-ServerBaseline' {
+        $f = $script:PcFunctions | Where-Object { $_.Name -eq 'Test-ServerBaseline' } | Select-Object -First 1
+        $f.Extent.Text | Should -Match 'Test-CrashDumpReadiness'
+    }
+
+    It 'HTML report includes Task Scheduler Diagnostics' {
+        $script:ScriptContent | Should -Match 'Task Scheduler Diagnostics"; Cmd = \{ Test-TaskSchedulerHealth'
     }
 }
 

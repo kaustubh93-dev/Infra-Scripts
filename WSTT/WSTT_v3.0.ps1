@@ -82,6 +82,19 @@
                   modified driver files, SMB shares, power/time-zone/pagefile, autorun (Run keys),
                   WinRM, Hyper-V VM config, failover cluster config, BitLocker state and pending-reboot
                   context. Environment-specific checks (Hyper-V/cluster/BitLocker) are gated on detection.
+      [Changes++] EXPANDED Recent Server Changes to 40 categories — added Windows Update/WSUS policy,
+                  W32Time/NTP source, LSA/NTLM policy, RDP-Tcp listener security, DCOM/OLE hardening,
+                  print service/spooler, scheduled-task definition files, Defender exclusions & RTP state,
+                  Winlogon/IFEO persistence keys, and local user-account snapshot. Each new section is
+                  individually try/catch-guarded and degrades gracefully when a key/log/module is absent.
+      [Proactive] NEW incident-derived (RCA) proactive checks wired into their categories: SCM stop/start
+                  hangs (7011/7009/7000/7022) + hung/orphaned processes & stuck services (Services),
+                  Application Hang 1002 + dirty/unclean shutdown history (Kernel-Power 41/6008) (Event Log),
+                  clustered storage-reset STORM detection (129/153 bursts) (Disk), overdue/missed recurring
+                  scheduled-task runs (Task Scheduler), account-lockout source attribution (4740) (Security),
+                  and crash-dump readiness (volmgr 46/49 + pagefile sizing) (Baseline). Watch-list extended
+                  with 7011/7009/7000/7022/7043/41/46/49 (System) and 1002 (Application); Task Scheduler
+                  added to the HTML report.
 #>
 
 param(
@@ -188,7 +201,15 @@ $script:KnownCriticalEventIDs = @{
         @{ Id = 36870; Desc = "Schannel TLS fatal error (certificate/key)" },
         @{ Id = 6008; Desc = "Unexpected shutdown" },
         @{ Id = 8018; Desc = "DNS dynamic update failure" },
-        @{ Id = 8019; Desc = "DNS dynamic update failure (access denied)" }
+        @{ Id = 8019; Desc = "DNS dynamic update failure (access denied)" },
+        @{ Id = 7011; Desc = "SCM timeout - service stuck stopping/starting (30s)" },
+        @{ Id = 7009; Desc = "SCM timeout connecting to service at start" },
+        @{ Id = 7000; Desc = "Service failed to start" },
+        @{ Id = 7022; Desc = "Service hung on starting" },
+        @{ Id = 7043; Desc = "Service did not shut down cleanly" },
+        @{ Id = 41;   Desc = "Kernel-Power - dirty/unexpected restart (no clean shutdown)" },
+        @{ Id = 46;   Desc = "volmgr - crash dump initialization failed" },
+        @{ Id = 49;   Desc = "volmgr - pagefile too small for crash dump" }
     )
     Security    = @(
         @{ Id = 4625; Desc = "Failed logon attempt" },
@@ -196,7 +217,8 @@ $script:KnownCriticalEventIDs = @{
     )
     Application = @(
         @{ Id = 1000; Desc = "Application crash" },
-        @{ Id = 1026; Desc = ".NET runtime error" }
+        @{ Id = 1026; Desc = ".NET runtime error" },
+        @{ Id = 1002; Desc = "Application Hang (e.g. Task Manager / MMC not responding)" }
     )
 }
 
@@ -388,6 +410,43 @@ function Get-RecentEvents {
 #endregion
 
 #region Helper Functions
+function Get-IcmpLatencyMs {
+    <#
+    .SYNOPSIS
+        Returns average ICMP round-trip latency in milliseconds, PowerShell 5.1 and 7+ safe.
+    .DESCRIPTION
+        Windows PowerShell 5.1 'Test-Connection' emits Win32_PingStatus objects exposing a
+        '.ResponseTime' property, whereas PowerShell 7+ emits objects exposing '.Latency'.
+        This helper normalizes both shapes and returns $null when the target is unreachable
+        or any error occurs, so callers can branch on a single, edition-independent contract.
+    .PARAMETER TargetName
+        Hostname or IP address to ping.
+    .PARAMETER Count
+        Number of echo requests (default 2).
+    .OUTPUTS
+        [double] average latency in ms, or $null when unreachable / on error.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetName,
+        [int]$Count = 2
+    )
+    try {
+        $replies = Test-Connection -ComputerName $TargetName -Count $Count -ErrorAction Stop
+        if (-not $replies) { return $null }
+        $vals = foreach ($r in $replies) {
+            if ($null -ne $r.ResponseTime) { $r.ResponseTime }   # Windows PowerShell 5.1
+            elseif ($null -ne $r.Latency) { $r.Latency }         # PowerShell 7+
+        }
+        $vals = @($vals | Where-Object { $null -ne $_ })
+        if ($vals.Count -eq 0) { return 0 }
+        return [math]::Round(($vals | Measure-Object -Average).Average, 1)
+    }
+    catch {
+        return $null
+    }
+}
+
 function Initialize-DiagnosticPaths {
     <#
     .SYNOPSIS
@@ -1937,26 +1996,23 @@ function Test-NetworkConfiguration {
                 $ifIndex = $gw.InterfaceIndex
                 $ifAlias = (Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.ifIndex -eq $ifIndex }).Name
                 if ([string]::IsNullOrWhiteSpace($ifAlias)) { $ifAlias = "ifIndex $ifIndex" }
-                try {
-                    $ping = Test-Connection -ComputerName $gwIP -Count 2 -ErrorAction Stop
-                    $avgMs = [math]::Round(($ping.ResponseTime | Measure-Object -Average).Average, 1)
-                    if ($avgMs -lt 5) {
-                        Write-Success "  Gateway $gwIP ($ifAlias): Reachable (avg ${avgMs}ms)"
-                    }
-                    elseif ($avgMs -lt 50) {
-                        Write-Info "  Gateway $gwIP ($ifAlias): Reachable (avg ${avgMs}ms)"
-                    }
-                    else {
-                        Write-DiagWarning "  Gateway $gwIP ($ifAlias): Reachable but HIGH latency (avg ${avgMs}ms)"
-                        Write-Info "    Likely cause: Saturated uplink, switch CPU overload, or QoS"
-                        Write-Info "                  policy delaying ICMP. Affects ALL off-subnet traffic."
-                    }
-                }
-                catch {
+                $avgMs = Get-IcmpLatencyMs -TargetName $gwIP -Count 2
+                if ($null -eq $avgMs) {
                     Write-DiagError "  Gateway $gwIP ($ifAlias): NOT Reachable"
                     Write-Info "    Impact: Server has lost off-subnet connectivity."
                     Write-Info "    Remediation: Verify physical link, switch port, VLAN tag,"
                     Write-Info "                 and that the gateway IP itself is up (ping from another host)."
+                }
+                elseif ($avgMs -lt 5) {
+                    Write-Success "  Gateway $gwIP ($ifAlias): Reachable (avg ${avgMs}ms)"
+                }
+                elseif ($avgMs -lt 50) {
+                    Write-Info "  Gateway $gwIP ($ifAlias): Reachable (avg ${avgMs}ms)"
+                }
+                else {
+                    Write-DiagWarning "  Gateway $gwIP ($ifAlias): Reachable but HIGH latency (avg ${avgMs}ms)"
+                    Write-Info "    Likely cause: Saturated uplink, switch CPU overload, or QoS"
+                    Write-Info "                  policy delaying ICMP. Affects ALL off-subnet traffic."
                 }
             }
         }
@@ -6041,6 +6097,9 @@ function Test-DiskPerformance {
     }
 
     #endregion v3.0 Disk Checks
+
+    # Proactive (incident-derived): clustered storage-reset STORM detection (129/153 bursts)
+    Get-StorageResetStorm
 }
 
 function Start-DiskLogCollection {
@@ -6687,6 +6746,10 @@ function Test-ServicesHealth {
         }
     }
     catch { }
+
+    # Proactive (incident-derived): SCM stop/start hangs + hung/orphaned processes & stuck services
+    Get-ServiceControlHang
+    Get-HungProcessAndService
 }
 
 function Start-ServicesLogCollection {
@@ -7027,6 +7090,10 @@ function Test-EventLogHealth {
     if (-not $foundAny) {
         Write-Success "  No high-priority events found in the last 24 hours"
     }
+
+    # Proactive (incident-derived): application hangs (1002) + dirty/unclean shutdown history
+    Get-ApplicationHang
+    Get-DirtyShutdownHistory
 }
 
 function Start-EventLogCollection {
@@ -7161,18 +7228,15 @@ function Test-DNSHealth {
 
                 # Ping each DNS server
                 foreach ($dns in $dnsServers.ServerAddresses) {
-                    try {
-                        $ping = Test-Connection -ComputerName $dns -Count 1 -ErrorAction Stop
-                        $latency = $ping.ResponseTime
-                        if ($latency -lt 50) {
-                            Write-Success "    $dns - Reachable (${latency}ms)"
-                        }
-                        else {
-                            Write-DiagWarning "    $dns - Reachable but slow (${latency}ms)"
-                        }
-                    }
-                    catch {
+                    $latency = Get-IcmpLatencyMs -TargetName $dns -Count 1
+                    if ($null -eq $latency) {
                         Write-DiagError "    $dns - NOT Reachable"
+                    }
+                    elseif ($latency -lt 50) {
+                        Write-Success "    $dns - Reachable (${latency}ms)"
+                    }
+                    else {
+                        Write-DiagWarning "    $dns - Reachable but slow (${latency}ms)"
                     }
                 }
             }
@@ -8002,6 +8066,9 @@ function Test-SecurityAuthentication {
     catch {
         Write-Info "  Could not check MachineKeys permissions: $($_.Exception.Message)"
     }
+
+    # Proactive (incident-derived): account-lockout source attribution (4740 enrichment)
+    Get-AccountLockoutSource
 }
 
 function Start-SecurityLogCollection {
@@ -10663,6 +10730,9 @@ function Test-TaskSchedulerHealth {
         Disabled = @($allTasks | Where-Object { $_.State -eq 'Disabled' }).Count
     }
     Write-Info "Task Summary: Total=$($taskSummary.Total) Ready=$($taskSummary.Ready) Running=$($taskSummary.Running) Disabled=$($taskSummary.Disabled)"
+
+    # Proactive (incident-derived): overdue / missed recurring task runs (silent stop)
+    Get-ScheduledTaskMissedRun
 }
 #endregion
 
@@ -11030,6 +11100,9 @@ function Test-ServerBaseline {
     catch {
         Write-DiagWarning "  Could not check driver versions"
     }
+
+    # Proactive (incident-derived): crash-dump readiness (so the NEXT hang is capturable)
+    Test-CrashDumpReadiness
 }
 
 function Export-HTMLReport {
@@ -11065,8 +11138,10 @@ function Export-HTMLReport {
         @{ Title = "Security & Authentication"; Cmd = { Test-SecurityAuthentication } },
         @{ Title = "Windows Update Status"; Cmd = { Test-WindowsUpdateStatus } },
         @{ Title = "TLS Configuration"; Cmd = { Test-TLSConfiguration } },
+        @{ Title = "Task Scheduler Diagnostics"; Cmd = { Test-TaskSchedulerHealth } },
         @{ Title = "Recent Server Changes (24h)"; Cmd = { Get-RecentServerChange -Hours 24 } },
-        @{ Title = "Cross-Category Scorecard"; Cmd = { Test-CrossCategoryHealth } }
+        @{ Title = "Cross-Category Scorecard"; Cmd = { Test-CrossCategoryHealth } },
+        @{ Title = "Known Issues Tracker"; Cmd = { Test-KnownIssue -DaysBack 7 } }
     )
 
     # Build HTML
@@ -11335,7 +11410,10 @@ function Get-RecentServerChange {
         firewall/scheduled-task/local-account/time/Defender/RDP signals, plus
         hosts/DNS, Group Policy, roles/features, local admins, root/CA store,
         driver files, SMB shares, power/time-zone/pagefile, autorun, WinRM,
-        Hyper-V, failover cluster, BitLocker and pending-reboot context) to speed
+        Hyper-V, failover cluster, BitLocker, pending-reboot context, WSUS/WU
+        policy, W32Time/NTP source, LSA/NTLM policy, RDP-Tcp listener, DCOM/OLE
+        hardening, print spooler, scheduled-task files, Defender exclusions,
+        Winlogon/IFEO persistence and local-account changes) to speed
         up issue identification. Evidence is drawn from Windows Event Logs, registry
         key LastWriteTimes, and install/validity dates, and is presented as
         confidence-rated CHANGE SIGNALS rather than definitive change history.
@@ -11768,18 +11846,220 @@ function Get-RecentServerChange {
     }
     catch { Write-DiagWarning "  Pending-reboot check failed: $($_.Exception.Message)" }
 
+    # 31. Windows Update / WSUS policy configuration
+    # ------------------------------------------------------------
+    # A changed WUServer / disabled Automatic Updates policy is one of the most
+    # common reasons "patching suddenly stopped" on managed servers. These keys
+    # only exist when WU is GPO-managed; absence is normal on Microsoft-Update /
+    # direct-connected servers and is reported benignly as "key not found".
+    # ------------------------------------------------------------
+    Write-Section "Windows Update / WSUS Policy"
+    try {
+        $wuPolicy = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -ErrorAction SilentlyContinue
+        $wuState = if ($wuPolicy -and $wuPolicy.WUServer) { "WSUS: $($wuPolicy.WUServer)" } else { "No WSUS policy (Microsoft Update / direct)" }
+        Add-ChangeRegistrySignal -Category "Windows Update Policy" -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -StartTime $startTime -Timeline $timeline -CurrentState $wuState
+        Add-ChangeRegistrySignal -Category "Windows Update AU Policy" -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -StartTime $startTime -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  Windows Update policy check failed: $($_.Exception.Message)" }
+
+    # 32. Windows Time (W32Time / NTP) configuration
+    # ------------------------------------------------------------
+    # A changed time source or sync mode (Type=NT5DS/NTP/NoSync) drifts the clock;
+    # >5 min skew breaks Kerberos => mass auth failures. Complements the Power /
+    # Time-Zone check (which covers TZ, not the NTP peer/source).
+    # ------------------------------------------------------------
+    Write-Section "Windows Time (NTP) Configuration"
+    try {
+        $w32Params = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' -ErrorAction SilentlyContinue
+        $ntpType = if ($w32Params -and $w32Params.Type) { $w32Params.Type } else { 'unknown' }
+        $ntpPeer = if ($w32Params -and $w32Params.NtpServer) { $w32Params.NtpServer } else { '(none)' }
+        Add-ChangeRegistrySignal -Category "W32Time Parameters (NTP source)" -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' -StartTime $startTime -Timeline $timeline -CurrentState "Type=$ntpType Peer=$ntpPeer"
+        Add-ChangeRegistrySignal -Category "W32Time Config (polling/skew)" -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Config' -StartTime $startTime -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  W32Time check failed: $($_.Exception.Message)" }
+
+    # 33. LSA / NTLM authentication policy
+    # ------------------------------------------------------------
+    # LmCompatibilityLevel, RestrictSendingNTLMTraffic and related LSA hardening
+    # changes frequently break legacy app auth or, conversely, weaken security.
+    # Surfaces the current LmCompatibilityLevel alongside the change signal.
+    # ------------------------------------------------------------
+    Write-Section "LSA / NTLM Authentication Policy"
+    try {
+        $lsa = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -ErrorAction SilentlyContinue
+        $lmCompat = if ($lsa -and $null -ne $lsa.LmCompatibilityLevel) { $lsa.LmCompatibilityLevel } else { 'default(not set)' }
+        Add-ChangeRegistrySignal -Category "LSA Policy" -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -StartTime $startTime -Timeline $timeline -CurrentState "LmCompatibilityLevel=$lmCompat"
+        Add-ChangeRegistrySignal -Category "LSA MSV1_0 (NTLM restrictions)" -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' -StartTime $startTime -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  LSA policy check failed: $($_.Exception.Message)" }
+
+    # 34. RDP listener (RDP-Tcp) security configuration
+    # ------------------------------------------------------------
+    # More specific than the Terminal Server root check: surfaces the actual
+    # listener port, SecurityLayer and NLA (UserAuthentication) settings. A
+    # changed port or disabled NLA is a common remote-access / hardening change.
+    # ------------------------------------------------------------
+    Write-Section "RDP Listener (RDP-Tcp) Security"
+    try {
+        $rdpTcp = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction SilentlyContinue
+        $rdpPort = if ($rdpTcp -and $rdpTcp.PortNumber) { $rdpTcp.PortNumber } else { 'default(3389)' }
+        $secLayer = if ($rdpTcp -and $null -ne $rdpTcp.SecurityLayer) { $rdpTcp.SecurityLayer } else { 'default' }
+        $nla = if ($rdpTcp -and $null -ne $rdpTcp.UserAuthentication) { $rdpTcp.UserAuthentication } else { 'default' }
+        Add-ChangeRegistrySignal -Category "RDP-Tcp Listener" -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -StartTime $startTime -Timeline $timeline -CurrentState "Port=$rdpPort SecurityLayer=$secLayer NLA=$nla"
+    }
+    catch { Write-DiagWarning "  RDP listener check failed: $($_.Exception.Message)" }
+
+    # 35. DCOM / OLE security hardening
+    # ------------------------------------------------------------
+    # The DCOM hardening rollout (KB5004442) writes to HKLM\SOFTWARE\Microsoft\Ole
+    # (RequireIntegrityActivationAuthenticationLevel). A change here can break
+    # legacy DCOM/COM+ apps with 0x80070005 / Event 10036 errors.
+    # ------------------------------------------------------------
+    Write-Section "DCOM / OLE Security"
+    try {
+        $ole = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Ole' -ErrorAction SilentlyContinue
+        $dcomState = if ($ole -and $null -ne $ole.EnableDCOM) { "EnableDCOM=$($ole.EnableDCOM)" } else { 'EnableDCOM not set' }
+        Add-ChangeRegistrySignal -Category "DCOM / OLE" -Path 'HKLM:\SOFTWARE\Microsoft\Ole' -StartTime $startTime -Timeline $timeline -CurrentState $dcomState
+    }
+    catch { Write-DiagWarning "  DCOM/OLE check failed: $($_.Exception.Message)" }
+
+    # 36. Print Service / spooler changes
+    # ------------------------------------------------------------
+    # Printer add/delete/modify events plus print-driver store changes. Relevant
+    # operationally and for security (PrintNightmare-class driver installs).
+    # PrintService/Operational may be disabled by default - absence is reported
+    # benignly. The driver-store registry signal is the reliable fallback.
+    # ------------------------------------------------------------
+    Write-Section "Print Service / Spooler"
+    try {
+        $printEvents = Get-RecentEvents -LogName 'Microsoft-Windows-PrintService/Operational' -EventIds @(300, 301, 302) -HoursBack $Hours -MaxEvents 50
+        Add-ChangeEventSignal -Category "Print Service" -Events $printEvents -Timeline $timeline
+        Add-ChangeRegistrySignal -Category "Print Drivers (x64)" -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Environments\Windows x64\Drivers' -StartTime $startTime -Timeline $timeline
+    }
+    catch { Write-DiagWarning "  Print service check failed: $($_.Exception.Message)" }
+
+    # 37. Scheduled-task definition files (file system)
+    # ------------------------------------------------------------
+    # Complements the event-based scheduled-task check: each task is an XML file
+    # under %SystemRoot%\System32\Tasks. A recent LastWriteTime = task created or
+    # modified, and works even when TaskScheduler/Operational logging is disabled.
+    # ------------------------------------------------------------
+    Write-Section "Scheduled Task Files (file system)"
+    try {
+        $taskDir = Join-Path $env:SystemRoot 'System32\Tasks'
+        if (Test-Path $taskDir) {
+            $changedTasks = @(Get-ChildItem -Path $taskDir -Recurse -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTime -ge $startTime } |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 20)
+            if ($changedTasks.Count -gt 0) {
+                Write-DiagWarning "  $($changedTasks.Count) task definition file(s) created/modified within window (top 20 shown):"
+                foreach ($tf in $changedTasks) {
+                    $rel = $tf.FullName.Substring($taskDir.Length).TrimStart('\')
+                    Write-Info "    \$rel  $($tf.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+                    $timeline.Add([pscustomobject]@{ Time = $tf.LastWriteTime; Category = "Scheduled Task File"; Source = "Tasks\$rel"; Detail = "task definition written" })
+                }
+                Write-Info "    Note: complements the event-based scheduled-task check (works even if its Operational log is off)."
+            }
+            else { Write-Info "  No scheduled task definition files modified within window" }
+        }
+        else { Write-Info "  Tasks directory not found" }
+    }
+    catch { Write-DiagWarning "  Scheduled-task file check failed: $($_.Exception.Message)" }
+
+    # 38. Microsoft Defender exclusions & protection state (snapshot)
+    # ------------------------------------------------------------
+    # Exclusion ADD/REMOVE timestamps surface as Event 5007 (Defender Config
+    # check); here we snapshot the CURRENT exclusion set + real-time-protection
+    # state, which answers "why isn't AV scanning X" and surfaces attacker-added
+    # exclusions. Skipped cleanly when Defender is replaced by 3rd-party AV.
+    # ------------------------------------------------------------
+    Write-Section "Microsoft Defender Exclusions & State (snapshot)"
+    try {
+        if (Get-Command Get-MpPreference -ErrorAction SilentlyContinue) {
+            $pref = Get-MpPreference -ErrorAction SilentlyContinue
+            if ($pref) {
+                $exPath = @($pref.ExclusionPath); $exProc = @($pref.ExclusionProcess); $exExt = @($pref.ExclusionExtension)
+                Write-Info "  Exclusions - Paths: $($exPath.Count), Processes: $($exProc.Count), Extensions: $($exExt.Count)"
+                if ($exPath.Count -gt 0) { Write-Info "    Paths: $([string]::Join(', ', ($exPath | Select-Object -First 10)))" }
+                if ($exProc.Count -gt 0) { Write-Info "    Processes: $([string]::Join(', ', ($exProc | Select-Object -First 10)))" }
+                if ($exExt.Count -gt 0) { Write-Info "    Extensions: $([string]::Join(', ', ($exExt | Select-Object -First 10)))" }
+            }
+            $mpStatus = Get-MpComputerStatus -ErrorAction SilentlyContinue
+            if ($mpStatus) {
+                if (-not $mpStatus.RealTimeProtectionEnabled) {
+                    Write-DiagWarning "  Real-time protection is DISABLED (snapshot)"
+                }
+                else {
+                    Write-Success "  Real-time protection enabled (sig $($mpStatus.AntivirusSignatureVersion), updated $($mpStatus.AntivirusSignatureLastUpdated))"
+                }
+            }
+            Write-Info "    Note: exclusion add/remove timestamps appear as Event 5007 (see Defender Config check)."
+        }
+        else { Write-Info "  Defender module not available (3rd-party AV or Defender removed) - skipped" }
+    }
+    catch { Write-DiagWarning "  Defender exclusions check failed: $($_.Exception.Message)" }
+
+    # 39. Logon & persistence keys (Winlogon / IFEO)
+    # ------------------------------------------------------------
+    # Winlogon Shell/Userinit and Image File Execution Options "Debugger" values
+    # are classic persistence / hijack vectors and also legitimately change with
+    # some software. Surfaces non-default Winlogon values + a change signal.
+    # ------------------------------------------------------------
+    Write-Section "Logon & Persistence Keys (Winlogon / IFEO)"
+    try {
+        Add-ChangeRegistrySignal -Category "Winlogon (Shell/Userinit)" -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -StartTime $startTime -Timeline $timeline
+        Add-ChangeRegistrySignal -Category "Image File Execution Options" -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options' -StartTime $startTime -Timeline $timeline
+        $wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
+        if ($wl) {
+            if ($wl.Shell -and $wl.Shell -ne 'explorer.exe') {
+                Write-DiagWarning "    Non-default Winlogon Shell: $($wl.Shell)"
+            }
+            if ($wl.Userinit -and $wl.Userinit -notmatch '(?i)userinit\.exe') {
+                Write-DiagWarning "    Non-default Winlogon Userinit: $($wl.Userinit)"
+            }
+        }
+    }
+    catch { Write-DiagWarning "  Logon/persistence check failed: $($_.Exception.Message)" }
+
+    # 40. Local user accounts (snapshot; recent password/creation correlation)
+    # ------------------------------------------------------------
+    # Snapshot of local accounts, flagging any whose password was set/changed in
+    # the window (new account or password reset). Account CREATION is captured as
+    # Security event 4720 (see Security check) - cross-reference the two.
+    # ------------------------------------------------------------
+    Write-Section "Local User Accounts (snapshot)"
+    try {
+        if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
+            $localUsers = @(Get-LocalUser -ErrorAction SilentlyContinue)
+            $enabledCount = @($localUsers | Where-Object { $_.Enabled }).Count
+            Write-Info "  Local users: $($localUsers.Count) total, $enabledCount enabled"
+            $recentPwd = @($localUsers | Where-Object { $_.PasswordLastSet -and $_.PasswordLastSet -ge $startTime })
+            if ($recentPwd.Count -gt 0) {
+                Write-DiagWarning "  $($recentPwd.Count) local account(s) with password set/changed in window:"
+                foreach ($u in $recentPwd) {
+                    Write-Info "    $($u.Name)  PasswordLastSet=$($u.PasswordLastSet.ToString('yyyy-MM-dd HH:mm:ss'))  Enabled=$($u.Enabled)"
+                    $timeline.Add([pscustomobject]@{ Time = $u.PasswordLastSet; Category = "Local Account"; Source = "Get-LocalUser"; Detail = "password set/changed: $($u.Name)" })
+                }
+                Write-Info "    Correlate account CREATION with Security event 4720 (see Security check)."
+            }
+            else { Write-Info "  No local accounts with password changes in window" }
+        }
+        else { Write-Info "  Get-LocalUser not available - skipped" }
+    }
+    catch { Write-DiagWarning "  Local user check failed: $($_.Exception.Message)" }
+
     # Consolidated chronological timeline
     Write-Section "Consolidated Change Timeline (most recent first)"
     if ($timeline.Count -eq 0) {
         Write-Info "  No change signals detected in the last $Hours hours."
     }
     else {
-        Write-Info "  $($timeline.Count) total change signal(s). Most recent (deduplicated, top 30):"
+        Write-Info "  $($timeline.Count) total change signal(s). Most recent (deduplicated, top 50):"
         $ordered = @($timeline | Where-Object { $_.Time } |
             Sort-Object Time -Descending |
             Group-Object { "{0:yyyyMMddHHmmss}|{1}|{2}" -f $_.Time, $_.Category, $_.Detail } |
             ForEach-Object { $_.Group[0] } |
-            Sort-Object Time -Descending | Select-Object -First 30)
+            Sort-Object Time -Descending | Select-Object -First 50)
         foreach ($row in $ordered) {
             Write-Host ("    {0:yyyy-MM-dd HH:mm:ss}  [{1}]  {2} - {3}" -f $row.Time, $row.Category, $row.Source, $row.Detail) -ForegroundColor White
         }
@@ -11787,6 +12067,774 @@ function Get-RecentServerChange {
 
     Write-Host ""
     Write-Info "Reminder: low-confidence registry signals indicate a key was modified, not which value changed. Correlate findings with the incident time before acting."
+}
+#endregion
+
+#region Known Issues Tracker
+function Get-KnownIssueCatalog {
+    <#
+    .SYNOPSIS
+        Returns the extensible catalog of documented Windows Server known issues that WSTT can detect.
+    .DESCRIPTION
+        Each entry maps a well-known issue to a lightweight, on-box detection scriptblock plus the
+        WSTT menu option that performs the deep-dive, a reference, and concrete remediation. The
+        catalog is intentionally data-only so operators can extend it: copy an existing block, change
+        the fields, and add it to the returned array.
+
+        Detection scriptblocks receive the lookback window (in days) as their single argument and
+        MUST return a hashtable:
+            @{ Status = 'Hit' | 'Clear' | 'Manual'; Detail = '<one-line evidence>' }
+        An optional 'Applies' scriptblock gates host-specific issues (e.g. cluster-only); returning
+        $false marks the entry 'Skipped'. Errors thrown inside Detect are caught by the runner and
+        reported as 'Error', so a single failing probe never aborts the sweep.
+    .OUTPUTS
+        PSCustomObject[] - one per known issue.
+    #>
+    [CmdletBinding()]
+    param()
+
+    @(
+        # ---- ADD NEW KNOWN ISSUES BELOW (copy a block, change the fields) --------------------
+        [pscustomobject]@{
+            Id          = 'KI-0001'
+            Title       = 'Paged-pool exhaustion / registry hive-flush failure (Event 333)'
+            Category    = 'Memory'
+            Severity    = 'High'
+            WSTTOption  = '2 (Memory)'
+            Reference   = 'Bugchecks 0x2E/0x3F/0x77; poolmon pool-tag analysis'
+            Remediation = "Run 'poolmon.exe -p -P -b' (sort Paged), map the top tag to a driver via pooltag.txt, update/disable the leaking filter driver, then reboot."
+            Applies     = { $true }
+            Detect      = {
+                param($Days)
+                $e = Get-RecentEvents -LogName 'System' -EventIds @(333) -DaysBack $Days -MaxEvents 5
+                if (@($e).Count -gt 0) { @{ Status = 'Hit'; Detail = "$(@($e).Count) Event 333 (registry I/O / hive-flush failure) in last $Days d" } }
+                else { @{ Status = 'Clear'; Detail = 'No Event 333 in window' } }
+            }
+        }
+        [pscustomobject]@{
+            Id          = 'KI-0002'
+            Title       = 'Schannel TLS private-key inaccessible (Event 36870/36871)'
+            Category    = 'Security / TLS'
+            Severity    = 'High'
+            WSTTOption  = '8 (Security) / 13 (TLS)'
+            Reference   = 'MachineKeys ACL; cert imported without exportable key'
+            Remediation = "Grant SYSTEM + Administrators on %ProgramData%\Microsoft\Crypto\RSA\MachineKeys; re-import the cert with an accessible private key."
+            Applies     = { $true }
+            Detect      = {
+                param($Days)
+                $e = Get-RecentEvents -LogName 'System' -EventIds @(36870, 36871) -DaysBack $Days -MaxEvents 5
+                if (@($e).Count -gt 0) { @{ Status = 'Hit'; Detail = "$(@($e).Count) Schannel error(s) (36870/36871) - TLS credential/private-key failure" } }
+                else { @{ Status = 'Clear'; Detail = 'No Schannel 36870/36871 in window' } }
+            }
+        }
+        [pscustomobject]@{
+            Id          = 'KI-0003'
+            Title       = 'Cluster instability: heartbeat/quarantine + RHS/resource/quorum'
+            Category    = 'Cluster'
+            Severity    = 'High'
+            WSTTOption  = '22 (WSFC ports) / 10 (Scorecard)'
+            Reference   = 'System 1135/1672; FailoverClustering/Operational 1146/1230/1564/1561'
+            Remediation = "Correlate with NIC error events + storage path events at the same timestamps; run 'Get-ClusterLog -TimeSpan 60'; verify cluster network priority/metric."
+            Applies     = { $script:ClusterEnv -and $script:ClusterEnv.IsClusterNode }
+            Detect      = {
+                param($Days)
+                $sys = Get-RecentEvents -LogName 'System' -EventIds @(1135, 1672) -DaysBack $Days -MaxEvents 10
+                $op = Get-RecentEvents -LogName 'Microsoft-Windows-FailoverClustering/Operational' -EventIds @(1146, 1230, 1564, 1561) -DaysBack $Days -MaxEvents 10
+                $n = (@($sys).Count + @($op).Count)
+                if ($n -gt 0) { @{ Status = 'Hit'; Detail = "$n cluster event(s): heartbeat/quarantine (1135/1672) or RHS/resource/FSW/quorum (1146/1230/1564/1561)" } }
+                else { @{ Status = 'Clear'; Detail = 'No cluster instability events in window' } }
+            }
+        }
+        [pscustomobject]@{
+            Id          = 'KI-0004'
+            Title       = 'Storage transport errors: bus reset / I/O retry (Event 129/153)'
+            Category    = 'Disk / Storage'
+            Severity    = 'High'
+            WSTTOption  = '4 (Disk)'
+            Reference   = 'storahci/iaStorA 129 (RaidPort reset); disk 153 (I/O retried)'
+            Remediation = "Update HBA/RAID firmware + storport driver; verify MPIO path health; check SAN fabric/array logs at the same timestamps."
+            Applies     = { $true }
+            Detect      = {
+                param($Days)
+                $e = Get-RecentEvents -LogName 'System' -EventIds @(129, 153) -DaysBack $Days -MaxEvents 10
+                if (@($e).Count -gt 0) { @{ Status = 'Hit'; Detail = "$(@($e).Count) storage event(s) (129 bus reset / 153 I/O retry) in last $Days d" } }
+                else { @{ Status = 'Clear'; Detail = 'No storage 129/153 in window' } }
+            }
+        }
+        [pscustomobject]@{
+            Id          = 'KI-0005'
+            Title       = 'Restrictive NTLM policy may break legacy auth (LmCompatibilityLevel)'
+            Category    = 'Security'
+            Severity    = 'Medium'
+            WSTTOption  = '8 (Security)'
+            Reference   = 'LmCompatibilityLevel >= 5 = send NTLMv2 only / refuse LM & NTLM'
+            Remediation = "Confirm legacy apps/appliances support NTLMv2; enable 'Restrict NTLM: Audit Incoming NTLM Traffic' before enforcing."
+            Applies     = { $true }
+            Detect      = {
+                param($Days)
+                $lm = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'LmCompatibilityLevel' -ErrorAction SilentlyContinue).LmCompatibilityLevel
+                if ($null -eq $lm) { @{ Status = 'Clear'; Detail = 'LmCompatibilityLevel not set (OS default)' } }
+                elseif ($lm -ge 5) { @{ Status = 'Manual'; Detail = "LmCompatibilityLevel=$lm (NTLMv2 only / refuse LM+NTLM) - verify legacy dependencies" } }
+                else { @{ Status = 'Clear'; Detail = "LmCompatibilityLevel=$lm" } }
+            }
+        }
+        [pscustomobject]@{
+            Id          = 'KI-0006'
+            Title       = 'DCOM hardening authentication mismatch (KB5004442, Event 10036/10037/10038)'
+            Category    = 'Security / App'
+            Severity    = 'Medium'
+            WSTTOption  = '6 (Event Log)'
+            Reference   = 'DistributedCOM 10036 (server refused), 10037/10038 (client)'
+            Remediation = "Update the client/server app to use packet-integrity authentication; do not disable the hardening (enforced since 2022)."
+            Applies     = { $true }
+            Detect      = {
+                param($Days)
+                $e = Get-RecentEvents -LogName 'System' -EventIds @(10036, 10037, 10038) -DaysBack $Days -MaxEvents 10
+                if (@($e).Count -gt 0) { @{ Status = 'Hit'; Detail = "$(@($e).Count) DCOM hardening event(s) (10036/10037/10038) - authentication-level mismatch" } }
+                else { @{ Status = 'Clear'; Detail = 'No DCOM 10036/10037/10038 in window' } }
+            }
+        }
+        [pscustomobject]@{
+            Id          = 'KI-0007'
+            Title       = 'Scheduled task logon failure (stored credentials, 0x8007052E)'
+            Category    = 'Task Scheduler'
+            Severity    = 'Medium'
+            WSTTOption  = '19 (Task Scheduler)'
+            Reference   = 'LastTaskResult 0x8007052E = bad username/password'
+            Remediation = "Update the stored password in Task Scheduler for the affected principal; confirm the account is not locked/expired."
+            Applies     = { $true }
+            Detect      = {
+                param($Days)
+                $bad = @()
+                try {
+                    $bad = @(Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {
+                            $info = $_ | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
+                            if ($info -and $info.LastTaskResult -eq 0x8007052E) { "$($_.TaskPath)$($_.TaskName)" }
+                        })
+                }
+                catch { }
+                if ($bad.Count -gt 0) { @{ Status = 'Hit'; Detail = "$($bad.Count) task(s) failing with 0x8007052E: $([string]::Join(', ', ($bad | Select-Object -First 5)))" } }
+                else { @{ Status = 'Clear'; Detail = 'No tasks failing with a credential error' } }
+            }
+        }
+        [pscustomobject]@{
+            Id          = 'KI-0008'
+            Title       = 'Patch staleness (no KB installed recently)'
+            Category    = 'Windows Update'
+            Severity    = 'Medium'
+            WSTTOption  = '9 (Windows Update)'
+            Reference   = 'Get-HotFix InstalledOn; one missed Patch Tuesday cycle'
+            Remediation = "Run Windows Update / WSUS scan; if WSUS-managed verify the WUServer target is reachable and approvals exist."
+            Applies     = { $true }
+            Detect      = {
+                param($Days)
+                $last = Get-HotFix -ErrorAction SilentlyContinue | Where-Object { $_.InstalledOn } | Sort-Object InstalledOn -Descending | Select-Object -First 1
+                if ($last -and $last.InstalledOn) {
+                    $age = [int]((Get-Date) - $last.InstalledOn).TotalDays
+                    if ($age -gt 35) { @{ Status = 'Hit'; Detail = "Last KB ($($last.HotFixID)) installed $age days ago (>35d)" } }
+                    else { @{ Status = 'Clear'; Detail = "Last KB $($last.HotFixID) installed $age days ago" } }
+                }
+                else { @{ Status = 'Manual'; Detail = 'No hotfix with a parseable InstalledOn date (Get-HotFix limitation) - verify patch level manually' } }
+            }
+        }
+        [pscustomobject]@{
+            Id          = 'KI-0009'
+            Title       = 'Time service not synchronizing (W32Time NoSync / stopped)'
+            Category    = 'Time / Auth'
+            Severity    = 'High'
+            WSTTOption  = '5 (Services) / 8 (Security)'
+            Reference   = '>5 min skew breaks Kerberos => mass auth failures'
+            Remediation = "Domain member: 'w32tm /config /syncfromflags:domhier /update'; PDC: point at a reliable external NTP; then 'Restart-Service W32Time'."
+            Applies     = { $true }
+            Detect      = {
+                param($Days)
+                $type = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' -Name 'Type' -ErrorAction SilentlyContinue).Type
+                if ($type -eq 'NoSync') { @{ Status = 'Hit'; Detail = 'W32Time Type=NoSync - clock will not be corrected from any source' } }
+                else {
+                    $svc = Get-Service -Name 'W32Time' -ErrorAction SilentlyContinue
+                    if ($svc -and $svc.Status -ne 'Running') { @{ Status = 'Manual'; Detail = "W32Time service is $($svc.Status) (Type=$type) - time may drift" } }
+                    else { @{ Status = 'Clear'; Detail = "W32Time Type=$type, service running" } }
+                }
+            }
+        }
+        [pscustomobject]@{
+            Id          = 'KI-0010'
+            Title       = 'Pending reboot blocking patch / role installs'
+            Category    = 'Servicing'
+            Severity    = 'Medium'
+            WSTTOption  = '9 (Windows Update)'
+            Reference   = 'CBS RebootPending / WU RebootRequired / PendingFileRenameOperations'
+            Remediation = "Schedule a reboot. If it persists, run 'DISM /online /cleanup-image /restorehealth' then 'sfc /scannow'."
+            Applies     = { $true }
+            Detect      = {
+                param($Days)
+                $r = @()
+                if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $r += 'CBS' }
+                if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $r += 'WindowsUpdate' }
+                $sm = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction SilentlyContinue
+                if ($sm -and ($sm.PSObject.Properties.Name -contains 'PendingFileRenameOperations') -and $sm.PendingFileRenameOperations) { $r += 'PendingFileRename' }
+                if ($r.Count -gt 0) { @{ Status = 'Hit'; Detail = "Pending reboot: $([string]::Join(', ', $r)) - blocks new patch/role installs" } }
+                else { @{ Status = 'Clear'; Detail = 'No pending-reboot indicators' } }
+            }
+        }
+        [pscustomobject]@{
+            Id          = 'KI-0011'
+            Title       = 'System volume critically low on free space'
+            Category    = 'Disk / Storage'
+            Severity    = 'High'
+            WSTTOption  = '4 (Disk)'
+            Reference   = 'VSS auto-delete, patch-install failure, VM pause-critical at 100%'
+            Remediation = "Free space (cleanmgr / old logs / move data), expand the volume, or relocate page/log/temp files."
+            Applies     = { $true }
+            Detect      = {
+                param($Days)
+                $sysDl = ($env:SystemDrive -replace ':', '')
+                $v = Get-Volume -DriveLetter $sysDl -ErrorAction SilentlyContinue
+                if ($v -and $v.Size -gt 0) {
+                    $used = [math]::Round((($v.Size - $v.SizeRemaining) / $v.Size) * 100, 1)
+                    if ($used -gt 90) { @{ Status = 'Hit'; Detail = "System drive ${sysDl}: $used% used (>90%)" } }
+                    elseif ($used -gt 85) { @{ Status = 'Manual'; Detail = "System drive ${sysDl}: $used% used (>85%, SCOM alert)" } }
+                    else { @{ Status = 'Clear'; Detail = "System drive ${sysDl}: $used% used" } }
+                }
+                else { @{ Status = 'Manual'; Detail = 'Could not read system volume' } }
+            }
+        }
+        [pscustomobject]@{
+            Id          = 'KI-0012'
+            Title       = 'WHEA hardware errors (CPU/memory/PCIe silicon degrading)'
+            Category    = 'Hardware / CPU'
+            Severity    = 'High'
+            WSTTOption  = '3 (CPU)'
+            Reference   = 'WHEA-Logger 19 (corrected), 47/17 (uncorrected/fatal)'
+            Remediation = "Open a hardware vendor case (Dell SupportAssist / HPE ActiveHealth); run BIOS-level CPU/memory diagnostics; plan component replacement."
+            Applies     = { $true }
+            Detect      = {
+                param($Days)
+                $e = Get-RecentEvents -LogName 'System' -EventIds @(17, 19, 47) -DaysBack $Days -MaxEvents 10
+                if (@($e).Count -gt 0) { @{ Status = 'Hit'; Detail = "$(@($e).Count) WHEA hardware error event(s) (17/19/47) in last $Days d" } }
+                else { @{ Status = 'Clear'; Detail = 'No WHEA hardware errors in window' } }
+            }
+        }
+        # ---- ADD NEW KNOWN ISSUES ABOVE ------------------------------------------------------
+    )
+}
+
+function Test-KnownIssue {
+    <#
+    .SYNOPSIS
+        Runs the Known Issues catalog against the local server and reports which signatures are present.
+    .DESCRIPTION
+        Iterates Get-KnownIssueCatalog, evaluates each entry's optional 'Applies' gate, runs its
+        'Detect' scriptblock over the lookback window, and prints a colour-coded verdict per issue
+        (HIT / MANUAL / CLEAR / SKIP / ERR) plus the WSTT deep-dive option and remediation. Ends with
+        a summary scorecard. Console-only output so the HTML report and save-to-file flows can
+        capture it via *>&1.
+    .PARAMETER DaysBack
+        Lookback window in days for event-based detections (1-365). Default 7.
+    .EXAMPLE
+        Test-KnownIssue
+    .EXAMPLE
+        Test-KnownIssue -DaysBack 30
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateRange(1, 365)]
+        [int]$DaysBack = 7
+    )
+
+    Write-Header "Known Issues Tracker (last $DaysBack d)"
+    Write-Info "Maps documented Windows Server issues to live on-box detection."
+    Write-Info "  HIT    = signature found in window      MANUAL = needs human judgement"
+    Write-Info "  CLEAR  = not detected in window         SKIP   = not applicable to this host"
+    Write-Info "Catalog is extensible - add rows in Get-KnownIssueCatalog. Use the cited WSTT option for the deep-dive."
+    Write-Host ""
+
+    $catalog = @(Get-KnownIssueCatalog)
+    $counts = @{ Hit = 0; Clear = 0; Manual = 0; Skipped = 0; Error = 0 }
+    $hits = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($ki in $catalog) {
+        # Applicability gate (default: applies)
+        $applies = $true
+        try { if ($ki.Applies) { $applies = [bool](& $ki.Applies) } } catch { $applies = $true }
+        if (-not $applies) {
+            $counts.Skipped++
+            Write-Info ("  [SKIP]  {0}  {1} (not applicable to this host)" -f $ki.Id, $ki.Title)
+            continue
+        }
+
+        $result = $null
+        try { $result = & $ki.Detect $DaysBack } catch { $result = @{ Status = 'Error'; Detail = $_.Exception.Message } }
+        if (-not $result -or -not $result.Status) { $result = @{ Status = 'Error'; Detail = 'Detection returned no result' } }
+
+        switch ($result.Status) {
+            'Hit' {
+                $counts.Hit++
+                $hits.Add($ki)
+                Write-DiagError   ("  [HIT]   {0} [{1}] {2}" -f $ki.Id, $ki.Severity, $ki.Title)
+                Write-DiagWarning ("          Evidence:    {0}" -f $result.Detail)
+                Write-Info        ("          Deep-dive:   WSTT option {0}" -f $ki.WSTTOption)
+                Write-Info        ("          Reference:   {0}" -f $ki.Reference)
+                Write-Info        ("          Remediation: {0}" -f $ki.Remediation)
+            }
+            'Manual' {
+                $counts.Manual++
+                Write-DiagWarning ("  [MANUAL] {0} {1}" -f $ki.Id, $ki.Title)
+                Write-Info        ("          {0}" -f $result.Detail)
+                Write-Info        ("          Deep-dive: WSTT option {0}" -f $ki.WSTTOption)
+            }
+            'Clear' {
+                $counts.Clear++
+                Write-Success ("  [CLEAR] {0} {1}" -f $ki.Id, $ki.Title)
+            }
+            default {
+                $counts.Error++
+                Write-DiagWarning ("  [ERR]   {0} {1} - {2}" -f $ki.Id, $ki.Title, $result.Detail)
+            }
+        }
+    }
+
+    Write-Host ""
+    Write-Section "Known Issues Summary"
+    Write-Info ("  Catalog entries: {0}" -f $catalog.Count)
+    Write-Info ("  HIT: {0}   MANUAL: {1}   CLEAR: {2}   SKIP: {3}   ERR: {4}" -f $counts.Hit, $counts.Manual, $counts.Clear, $counts.Skipped, $counts.Error)
+    if ($counts.Hit -gt 0) {
+        Write-DiagWarning ("  {0} known-issue signature(s) detected - investigate via the cited WSTT options:" -f $counts.Hit)
+        foreach ($h in $hits) {
+            Write-DiagWarning ("    {0} [{1}] {2}  -> option {3}" -f $h.Id, $h.Severity, $h.Title, $h.WSTTOption)
+        }
+    }
+    else {
+        Write-Success "  No known-issue signatures detected in the lookback window."
+    }
+    Write-Info "Note: CLEAR means no signature in the window, not a guarantee of absence. Extend the catalog in Get-KnownIssueCatalog with your own issues."
+}
+#endregion
+
+#region Proactive / Incident-Derived Checks
+# ----------------------------------------------------------------------------
+# Drop-in detection functions derived from real production incidents (RCA).
+# Each targets a signal that the core v3.0 diagnostics did NOT yet catch,
+# closing the gaps the RCAs themselves flagged. They are invoked from the end
+# of their category's primary Test-* function (so they appear in the right
+# menu option and flow into the HTML report automatically).
+#   1 Get-ServiceControlHang       -> Services        (SCM 7011/7009/7000/7022)
+#   2 Get-ApplicationHang          -> Event Log       (App Hang 1002)
+#   3 Get-DirtyShutdownHistory     -> Event Log       (Kernel-Power 41 / 6008)
+#   4 Test-CrashDumpReadiness      -> Baseline        (volmgr 46/49 + sizing)
+#   5 Get-HungProcessAndService    -> Services        (not-responding / *_PENDING)
+#   6 Get-StorageResetStorm        -> Disk            (clustered 129/153 bursts)
+#   7 Get-ScheduledTaskMissedRun   -> Task Scheduler  (overdue recurring runs)
+#   8 Get-AccountLockoutSource     -> Security        (4740 source attribution)
+# ----------------------------------------------------------------------------
+
+function Get-ServiceControlHang {
+    <#
+    .SYNOPSIS
+        Detects Service Control Manager stop/start hangs and start failures.
+    .DESCRIPTION
+        The core Services check tracks 7034 (terminated) but NOT the timeout /
+        start-failure family (7011/7009/7000/7022) that is frequently the
+        ORIGINATING trigger of a service-host hang. SCM 7011 = a 30s timeout
+        with the service stuck in STOP_PENDING/START_PENDING.
+    .PARAMETER LookbackHours
+        How far back to scan the System log (default 72).
+    #>
+    [CmdletBinding()]
+    param([int]$LookbackHours = 72)
+
+    Write-Section "Service Control Manager - Stop/Start Hangs (7011/7009/7000/7022)"
+    Write-Info "  Description: Detects services that hung while stopping or failed to"
+    Write-Info "               start. SCM 7011 = 30s timeout (service stuck in transition)."
+
+    $scmIds = 7011, 7009, 7000, 7022, 7031, 7043
+    try {
+        $events = Get-WinEvent -FilterHashtable @{
+            LogName      = 'System'
+            ProviderName = 'Service Control Manager'
+            Id           = $scmIds
+            StartTime    = (Get-Date).AddHours(-$LookbackHours)
+        } -ErrorAction SilentlyContinue
+
+        if ($events) {
+            Write-DiagError "  $($events.Count) SCM hang/timeout/start-failure event(s) in last ${LookbackHours}h:"
+            $events | Group-Object Id | Sort-Object Name | ForEach-Object {
+                $label = switch ($_.Name) {
+                    '7011' { "Timeout (30000ms) - service stuck STOPPING/STARTING" }
+                    '7009' { "Timeout connecting to service at start" }
+                    '7000' { "Service failed to start" }
+                    '7022' { "Service hung on starting" }
+                    '7031' { "Service terminated unexpectedly (auto-restart)" }
+                    '7043' { "Service did not shut down cleanly" }
+                    default { "SCM event $($_.Name)" }
+                }
+                Write-DiagWarning "    Event $($_.Name) x$($_.Count) - $label"
+                $_.Group | Select-Object -First 3 | ForEach-Object {
+                    $svc = ($_.Message -split "`n")[0]
+                    Write-Info "      $($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) : $svc"
+                }
+            }
+            Write-Info "    Impact: A service stuck in STOP_PENDING/START_PENDING can wedge the"
+            Write-Info "            service host and, if it holds I/O handles, stall the OS."
+            Write-Info "    Action: Identify the service; check for an orphaned/non-terminable"
+            Write-Info "            worker process (see 'Hung / Orphaned Processes' check)."
+        }
+        else {
+            Write-Success "  No SCM stop/start hang events in last ${LookbackHours}h"
+        }
+    }
+    catch {
+        Write-Info "  Could not query SCM events: $($_.Exception.Message)"
+    }
+}
+
+function Get-ApplicationHang {
+    <#
+    .SYNOPSIS
+        Detects GUI application hangs (Event 1002, provider 'Application Hang').
+    .DESCRIPTION
+        The core Event Log check tracks 1000 (crash) and 1026 (.NET) only.
+        Repeated hangs of taskmgr.exe / mmc.exe are a hallmark of an OS-level
+        I/O or resource stall (operators cannot read PIDs or kill processes).
+    .PARAMETER LookbackHours
+        How far back to scan the Application log (default 72).
+    #>
+    [CmdletBinding()]
+    param([int]$LookbackHours = 72)
+
+    Write-Section "Application Hangs (Event 1002 - 'Application Hang')"
+    Write-Info "  Description: Event 1002 = a GUI app stopped responding. Repeated hangs"
+    Write-Info "               of taskmgr.exe / mmc.exe often indicate an OS-level stall."
+
+    try {
+        $hangs = Get-WinEvent -FilterHashtable @{
+            LogName      = 'Application'
+            ProviderName = 'Application Hang'
+            Id           = 1002
+            StartTime    = (Get-Date).AddHours(-$LookbackHours)
+        } -ErrorAction SilentlyContinue
+
+        if ($hangs) {
+            Write-DiagError "  $($hangs.Count) application-hang event(s) in last ${LookbackHours}h:"
+            # EventData[0] is the faulting executable name for Application Hang 1002;
+            # fall back to a message regex if structured data is unavailable.
+            $hangs | ForEach-Object {
+                $exe = $null
+                try { $exe = ([xml]$_.ToXml()).Event.EventData.Data[0] } catch { }
+                if (-not $exe) {
+                    if ($_.Message -match '(\S+\.exe)') { $exe = $Matches[1] } else { $exe = 'unknown' }
+                }
+                $exe
+            } | Group-Object | Sort-Object Count -Descending | ForEach-Object {
+                Write-DiagWarning "    $($_.Name) - $($_.Count) hang(s)"
+            }
+            $mgmt = $hangs | Where-Object { $_.Message -match 'taskmgr|mmc|services|compmgmt' }
+            if ($mgmt) {
+                Write-Info "    NOTE: Management tools (Task Manager / MMC) hung - operators"
+                Write-Info "          likely could not read PIDs or kill processes during the event."
+            }
+        }
+        else {
+            Write-Success "  No application-hang (1002) events in last ${LookbackHours}h"
+        }
+    }
+    catch {
+        Write-Info "  Could not query Application Hang events: $($_.Exception.Message)"
+    }
+}
+
+function Get-DirtyShutdownHistory {
+    <#
+    .SYNOPSIS
+        Detects dirty / unclean restarts (Kernel-Power 41 + 6008) and counts recurrence.
+    .DESCRIPTION
+        The core checks track 6008 alone; they do not pair clean (6006) vs dirty
+        (41/6008) or treat repeated dirty restarts as a recurring-instability
+        signal. A hung graceful shutdown (no 6006) followed by 6008/41 typically
+        follows an I/O stall.
+    .PARAMETER LookbackDays
+        How far back to scan the System log (default 14).
+    #>
+    [CmdletBinding()]
+    param([int]$LookbackDays = 14)
+
+    Write-Section "Shutdown Integrity - Dirty / Unclean Restarts (Kernel-Power 41, 6008)"
+    Write-Info "  Description: Kernel-Power 41 = box restarted without a clean shutdown."
+    Write-Info "               Pairs with absence of 6006 (clean Event Log stop) and 6008."
+
+    try {
+        $start = (Get-Date).AddDays(-$LookbackDays)
+        $k41 = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41; StartTime = $start } -ErrorAction SilentlyContinue
+        $e6008 = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 6008; StartTime = $start } -ErrorAction SilentlyContinue
+        $e6006 = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 6006; StartTime = $start } -ErrorAction SilentlyContinue
+
+        $dirty = @($k41).Count + @($e6008).Count
+        if ($dirty -gt 0) {
+            Write-DiagError "  Unclean shutdowns in last ${LookbackDays}d: Kernel-Power 41 x$(@($k41).Count), Event 6008 x$(@($e6008).Count)"
+            @($k41) | Select-Object -First 5 | ForEach-Object {
+                Write-DiagWarning "    $($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) - Kernel-Power 41 (dirty restart)"
+            }
+            Write-Info "    Clean shutdowns (6006) in window: $(@($e6006).Count)"
+            if (@($k41).Count -ge 2) {
+                Write-DiagError "    >=2 dirty restarts - treat as RECURRING instability, not a one-off."
+            }
+            Write-Info "    Action: Correlate timestamps with storage resets (129/153) and SCM"
+            Write-Info "            hangs; a hung graceful shutdown often follows an I/O stall."
+        }
+        else {
+            Write-Success "  No dirty/unclean shutdowns in last ${LookbackDays}d"
+        }
+    }
+    catch {
+        Write-Info "  Could not query shutdown events: $($_.Exception.Message)"
+    }
+}
+
+function Test-CrashDumpReadiness {
+    <#
+    .SYNOPSIS
+        Validates that the NEXT hang/BSOD will actually produce a capturable dump.
+    .DESCRIPTION
+        Scans for volmgr 46/49 (dump init / pagefile-too-small failures) AND
+        validates that the pagefile / dedicated dump file is large enough for
+        the CONFIGURED dump type. The core Baseline check reports the dump type
+        but does not detect capture failures or validate sizing.
+    .PARAMETER LookbackDays
+        How far back to scan for volmgr failures (default 30).
+    #>
+    [CmdletBinding()]
+    param([int]$LookbackDays = 30)
+
+    Write-Section "Crash Dump Readiness (so the NEXT hang is actually capturable)"
+    Write-Info "  Description: Validates dump config + pagefile sizing AND scans for"
+    Write-Info "               volmgr 46/49 (dump init / pagefile-too-small failures)."
+
+    try {
+        $volmgr = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'volmgr'; Id = 46, 49; StartTime = (Get-Date).AddDays(-$LookbackDays) } -ErrorAction SilentlyContinue
+        if ($volmgr) {
+            Write-DiagError "  volmgr dump-failure events found ($($volmgr.Count)) - a crash dump could NOT be written:"
+            $volmgr | Group-Object Id | ForEach-Object {
+                $d = if ($_.Name -eq '49') { "Pagefile too small / missing on boot volume for dump" } else { "Crash dump initialization failed" }
+                Write-DiagWarning "    Event $($_.Name) x$($_.Count) - $d"
+            }
+        }
+        else {
+            Write-Success "  No volmgr dump-failure events (46/49) in last ${LookbackDays}d"
+        }
+    }
+    catch { Write-Info "  Could not query volmgr events: $($_.Exception.Message)" }
+
+    try {
+        $cc = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' -ErrorAction Stop
+        $dumpType = switch ($cc.CrashDumpEnabled) {
+            0 { "None (DISABLED)" } 1 { "Complete" } 2 { "Kernel" } 3 { "Small (256KB)" } 7 { "Automatic" } default { "Unknown($($cc.CrashDumpEnabled))" }
+        }
+        Write-Info "    Configured dump type : $dumpType"
+        if ($cc.CrashDumpEnabled -eq 0) {
+            Write-DiagError "    Crash dumps are DISABLED - a future hang/BSOD will leave no evidence."
+        }
+
+        $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory / 1GB, 0)
+        $dedicated = $cc.DedicatedDumpFile
+        if ($dedicated) {
+            Write-Info "    DedicatedDumpFile set: $dedicated (preferred on large-RAM servers)"
+        }
+        else {
+            $bootDrive = $env:SystemDrive
+            $pf = Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "$bootDrive*" }
+            $pfMB = if ($pf) { [int]$pf.AllocatedBaseSize } else { 0 }
+            # Pagefile-on-boot-volume requirement depends on the CONFIGURED dump type:
+            #   1 Complete : RAM + 257 MB    3 Small(256KB) : ~a few MB (use 64 MB floor)
+            #   2 Kernel / 7 Automatic : heuristic min(RAM, 32 GB)
+            $needMB = switch ($cc.CrashDumpEnabled) {
+                1 { ($ramGB * 1024) + 257 }
+                3 { 64 }
+                default { [math]::Min(($ramGB * 1024), 32 * 1024) }
+            }
+            Write-Info "    Boot-volume pagefile : ${pfMB}MB (RAM=${ramGB}GB, dump needs ~${needMB}MB)"
+            if ($pfMB -lt $needMB) {
+                Write-DiagError "    Pagefile on $bootDrive too small for a $dumpType dump - capture WILL fail."
+                Write-Info "      Fix: set a system-managed or fixed pagefile >= required size on $bootDrive, OR configure DedicatedDumpFile."
+            }
+            else {
+                Write-Success "    Pagefile sized adequately for configured dump type."
+            }
+        }
+        if ($cc.AutoReboot -eq 0) { Write-DiagWarning "    AutoReboot disabled - server will sit at a stop screen after BSOD." }
+    }
+    catch { Write-Info "  Could not read CrashControl config: $($_.Exception.Message)" }
+}
+
+function Get-HungProcessAndService {
+    <#
+    .SYNOPSIS
+        Live snapshot of not-responding GUI processes and services stuck in transition.
+    .DESCRIPTION
+        Surfaces (a) GUI processes whose message pump is not responding and
+        (b) services wedged in START_PENDING/STOP_PENDING - the live signature
+        of an orphaned, non-terminable worker holding handles.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Section "Hung Processes & Services Stuck in Transition"
+    Write-Info "  Description: Live snapshot of (a) GUI processes not responding and"
+    Write-Info "               (b) services wedged in START_PENDING/STOP_PENDING."
+
+    try {
+        $hung = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and -not $_.Responding }
+        if ($hung) {
+            Write-DiagError "  $($hung.Count) not-responding process(es):"
+            $hung | ForEach-Object { Write-DiagWarning "    PID $($_.Id) - $($_.ProcessName) (WS=$([math]::Round($_.WorkingSet64/1MB))MB)" }
+        }
+        else {
+            Write-Success "  No not-responding GUI processes"
+        }
+    }
+    catch { Write-Info "  Could not enumerate processes: $($_.Exception.Message)" }
+
+    try {
+        $stuck = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.State -in 'Start Pending', 'Stop Pending' }
+        if ($stuck) {
+            Write-DiagError "  $($stuck.Count) service(s) stuck in transition:"
+            $stuck | ForEach-Object { Write-DiagWarning "    $($_.Name) - $($_.State) (PID $($_.ProcessId), $($_.StartName))" }
+            Write-Info "    Action: A service that cannot leave STOP_PENDING usually has an"
+            Write-Info "            orphaned worker holding a handle - may need a reboot to clear."
+        }
+        else {
+            Write-Success "  No services stuck in Start/Stop-Pending"
+        }
+    }
+    catch { Write-Info "  Could not query service states: $($_.Exception.Message)" }
+}
+
+function Get-StorageResetStorm {
+    <#
+    .SYNOPSIS
+        Detects clustered bursts ('storms') of storage resets/retries (Events 129/153).
+    .DESCRIPTION
+        The core Disk check reports the PRESENCE of 129/153 but not their rate, so
+        a reset storm reads the same as one stray reset. This flags >= BurstThreshold
+        events inside any WindowSeconds window - an acute SAN/HBA path stall.
+    .PARAMETER LookbackDays
+        How far back to scan (default 7).
+    .PARAMETER WindowSeconds
+        Sliding-window width for burst detection (default 60).
+    .PARAMETER BurstThreshold
+        Minimum events within the window to call it a storm (default 4).
+    #>
+    [CmdletBinding()]
+    param([int]$LookbackDays = 7, [int]$WindowSeconds = 60, [int]$BurstThreshold = 4)
+
+    Write-Section "Storage Reset Storm Detection (clustered 129/153 bursts)"
+    Write-Info "  Description: Flags >= $BurstThreshold storage resets/retries within any"
+    Write-Info "               ${WindowSeconds}s window - a 'reset storm' (acute path stall)."
+
+    try {
+        $ev = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 129, 153; StartTime = (Get-Date).AddDays(-$LookbackDays) } -ErrorAction SilentlyContinue |
+        Sort-Object TimeCreated
+        if (-not $ev) { Write-Success "  No 129/153 storage events in last ${LookbackDays}d"; return }
+
+        $times = @($ev.TimeCreated)
+        $maxBurst = 0; $burstStart = $null
+        for ($i = 0; $i -lt $times.Count; $i++) {
+            $windowEnd = $times[$i].AddSeconds($WindowSeconds)
+            $count = @($times | Where-Object { $_ -ge $times[$i] -and $_ -le $windowEnd }).Count
+            if ($count -gt $maxBurst) { $maxBurst = $count; $burstStart = $times[$i] }
+        }
+        Write-Info "  Total 129/153 events: $($ev.Count). Peak burst: $maxBurst within ${WindowSeconds}s."
+        if ($maxBurst -ge $BurstThreshold) {
+            Write-DiagError "  RESET STORM: $maxBurst resets within ${WindowSeconds}s starting $($burstStart.ToString('yyyy-MM-dd HH:mm:ss'))"
+            $ports = $ev | ForEach-Object { if ($_.Message -match '(RaidPort\d+|Disk\d+|\\Device\\\w+)') { $Matches[1] } } | Select-Object -Unique
+            if ($ports) { Write-DiagWarning "    Paths involved: $($ports -join ', ')" }
+            Write-Info "    Action: Engage storage/SAN team; check MPIO path health, HBA firmware"
+            Write-Info "            and storport driver. Simultaneous multi-path resets => fabric-side."
+        }
+        else {
+            Write-DiagWarning "  Scattered resets present but no burst >= $BurstThreshold/${WindowSeconds}s (still investigate trend)."
+        }
+    }
+    catch { Write-Info "  Could not analyse storage events: $($_.Exception.Message)" }
+}
+
+function Get-ScheduledTaskMissedRun {
+    <#
+    .SYNOPSIS
+        Flags enabled recurring tasks that silently stopped firing (overdue / stuck).
+    .DESCRIPTION
+        The core Task Scheduler diag covers failed/stuck/disabled tasks, but not an
+        enabled recurring task whose NextRunTime is overdue (silent stop) or one
+        stuck in the 'currently running' state (0x41301) that blocks re-trigger.
+    .PARAMETER OverdueMinutes
+        Grace period before NextRunTime is considered overdue (default 30).
+    #>
+    [CmdletBinding()]
+    param([int]$OverdueMinutes = 30)
+
+    Write-Section "Scheduled Tasks - Overdue / Missed Recurring Runs"
+    Write-Info "  Description: Flags enabled tasks whose NextRunTime is in the past or that"
+    Write-Info "               are stuck 'running' - i.e. a recurring task that silently stopped."
+
+    try {
+        $flagged = 0
+        Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.State -eq 'Ready' } | ForEach-Object {
+            $info = $_ | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
+            if ($info -and $info.NextRunTime -and $info.NextRunTime -lt (Get-Date).AddMinutes(-$OverdueMinutes)) {
+                Write-DiagWarning "    $($_.TaskPath)$($_.TaskName) - NextRunTime overdue: $($info.NextRunTime), LastResult=0x$('{0:X}' -f $info.LastTaskResult)"
+                $flagged++
+            }
+            if ($info -and $info.LastTaskResult -eq 0x41301 -and $info.LastRunTime -lt (Get-Date).AddHours(-1)) {
+                Write-DiagError "    $($_.TaskPath)$($_.TaskName) - stuck RUNNING since $($info.LastRunTime) (blocks next occurrence)"
+                $flagged++
+            }
+        }
+        if ($flagged -eq 0) {
+            Write-Success "  No overdue or stuck recurring tasks detected"
+        }
+    }
+    catch { Write-Info "  Could not enumerate scheduled tasks: $($_.Exception.Message)" }
+}
+
+function Get-AccountLockoutSource {
+    <#
+    .SYNOPSIS
+        Enriches account-lockout events (4740) with the caller machine and service cross-ref.
+    .DESCRIPTION
+        The core Security check logs 4740 presence; this surfaces the locked account +
+        the CALLER computer per event, and flags any service running as a locked
+        account (stale stored creds are the usual repeat-lockout culprit).
+    .PARAMETER LookbackDays
+        How far back to scan the Security log (default 7).
+    #>
+    [CmdletBinding()]
+    param([int]$LookbackDays = 7)
+
+    Write-Section "Account Lockout Source Attribution (Event 4740)"
+    Write-Info "  Description: For each 4740, extracts the locked account + caller computer,"
+    Write-Info "               and flags services running as that account (stale creds)."
+
+    try {
+        $locks = Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4740; StartTime = (Get-Date).AddDays(-$LookbackDays) } -ErrorAction SilentlyContinue
+        if (-not $locks) { Write-Success "  No account-lockout (4740) events in last ${LookbackDays}d"; return }
+
+        Write-DiagError "  $($locks.Count) lockout event(s) in last ${LookbackDays}d:"
+        $acctList = @()
+        foreach ($l in $locks) {
+            $x = [xml]$l.ToXml()
+            $acct = ($x.Event.EventData.Data | Where-Object { $_.Name -eq 'TargetUserName' }).'#text'
+            $caller = ($x.Event.EventData.Data | Where-Object { $_.Name -eq 'CallerComputerName' }).'#text'
+            $acctList += $acct
+            Write-DiagWarning "    $($l.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) - '$acct' locked, source: $caller"
+        }
+        $lockedAccts = $acctList | Select-Object -Unique
+        Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.StartName } | ForEach-Object {
+            $sn = ($_.StartName -split '\\')[-1]
+            if ($lockedAccts -contains $sn) {
+                Write-DiagError "    Service '$($_.Name)' runs as '$($_.StartName)' - stale stored password will re-lock this account on every start/retry."
+            }
+        }
+    }
+    catch { Write-Info "  Could not analyse lockout events: $($_.Exception.Message)" }
 }
 #endregion
 
@@ -11840,6 +12888,8 @@ UTILITIES:" -ForegroundColor Yellow
     Write-Host " 21. Generate HTML Diagnostic Report" -ForegroundColor Green
     Write-Host " 23. Recent Server Changes (last 24h)" -ForegroundColor Green
     Write-Host "     (Patches, reboots, services, drivers, TLS, NIC, routes, proxy & more)" -ForegroundColor Gray
+    Write-Host " 24. Known Issues Tracker (documented WS issues -> live detection)" -ForegroundColor Green
+    Write-Host "     (Paged-pool, Schannel, cluster, DCOM, NTLM, WHEA, patch/time drift & more)" -ForegroundColor Gray
 
     Write-Host "
 CLUSTER:" -ForegroundColor Yellow
@@ -11921,7 +12971,7 @@ function Start-TroubleshootingTool {
     try {
         do {
             Show-MainMenu
-            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-23)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23")
+            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-24)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24")
             
             switch ($choice) {
                 "1" {
@@ -12103,6 +13153,26 @@ function Start-TroubleshootingTool {
                     $saveChoice = Get-ValidatedChoice -Prompt "Save recent-changes report to file? (Y/N)" -ValidChoices @("Y", "N")
                     if ($saveChoice -eq "Y") {
                         Export-DiagnosticSection -Title "Recent_Server_Changes" -ScriptBlock { Get-RecentServerChange -Hours $lookbackHours }
+                    }
+                }
+                "24" {
+                    Clear-Host
+                    $daysInput = Read-Host "Known-issues lookback window in days (1-365, press Enter for 7)"
+                    $kiDays = 7
+                    if (-not [string]::IsNullOrWhiteSpace($daysInput)) {
+                        $parsedDays = 0
+                        if ([int]::TryParse($daysInput, [ref]$parsedDays) -and $parsedDays -ge 1 -and $parsedDays -le 365) {
+                            $kiDays = $parsedDays
+                        }
+                        else {
+                            Write-DiagWarning "Invalid days value '$daysInput'; using default of 7."
+                        }
+                    }
+                    Test-KnownIssue -DaysBack $kiDays
+                    Write-Host "`n"
+                    $saveChoice = Get-ValidatedChoice -Prompt "Save known-issues report to file? (Y/N)" -ValidChoices @("Y", "N")
+                    if ($saveChoice -eq "Y") {
+                        Export-DiagnosticSection -Title "Known_Issues" -ScriptBlock { Test-KnownIssue -DaysBack $kiDays }
                     }
                 }
                 "0" {
