@@ -91,7 +91,8 @@
                   Application Hang 1002 + dirty/unclean shutdown history (Kernel-Power 41/6008) (Event Log),
                   clustered storage-reset STORM detection (129/153 bursts) (Disk), overdue/missed recurring
                   scheduled-task runs (Task Scheduler), account-lockout source attribution (4740) (Security),
-                  and crash-dump readiness (volmgr 46/49 + pagefile sizing) (Baseline). Watch-list extended
+                  crash-dump readiness (volmgr 46/49 + pagefile sizing) (Baseline), and per-process
+                  CLOSE_WAIT socket-leak detection (Network). Watch-list extended
                   with 7011/7009/7000/7022/7043/41/46/49 (System) and 1002 (Application); Task Scheduler
                   added to the HTML report.
 #>
@@ -212,6 +213,8 @@ Set-Variable -Name THREAD_LEAK_WARNING -Value 500 -Option ReadOnly -Force
 Set-Variable -Name WS_TRIM_WARNING_THRESHOLD -Value 1000 -Option ReadOnly -Force
 Set-Variable -Name PAGEFILE_USAGE_WARNING_PERCENT -Value 70 -Option ReadOnly -Force
 Set-Variable -Name PAGEFILE_USAGE_CRITICAL_PERCENT -Value 90 -Option ReadOnly -Force
+Set-Variable -Name CLOSE_WAIT_WARNING_THRESHOLD -Value 100 -Option ReadOnly -Force
+Set-Variable -Name CLOSE_WAIT_CRITICAL_THRESHOLD -Value 500 -Option ReadOnly -Force
 
 # Path Configuration
 $script:TempBasePath = Join-Path $env:TEMP "ServerDiagnostics"
@@ -2838,6 +2841,9 @@ function Test-NetworkConfiguration {
     catch {
         Write-DiagWarning "  Could not analyze routing table: $($_.Exception.Message)"
     }
+
+    # Proactive (incident-derived): per-process CLOSE_WAIT socket leak detection
+    Get-TcpCloseWaitLeak
 
     #endregion v3.0 Network Checks
 }
@@ -12367,6 +12373,35 @@ function Get-KnownIssueCatalog {
                 else { @{ Status = 'Clear'; Detail = 'No WHEA hardware errors in window' } }
             }
         }
+        [pscustomobject]@{
+            Id          = 'KI-0013'
+            Title       = 'TCP CLOSE_WAIT socket leak (application not closing sockets)'
+            Category    = 'Network / Application'
+            Severity    = 'High'
+            WSTTOption  = '1 (Network)'
+            Reference   = 'CLOSE_WAIT = remote FIN received, local process did not close(); warning >100, critical >500 per process'
+            Remediation = 'Restart the leaking application service to clear sockets; fix connection disposal / pool idle eviction / socket timeouts / TCP keepalive; add monitoring on CLOSE_WAIT counts.'
+            Applies     = { $true }
+            Detect      = {
+                param($Days)
+                $closeWaitConnections = @(Get-NetTCPConnection -State CloseWait -ErrorAction SilentlyContinue)
+                if ($closeWaitConnections.Count -eq 0) { return @{ Status = 'Clear'; Detail = 'No CLOSE_WAIT sockets currently present' } }
+
+                $topGroup = @($closeWaitConnections | Group-Object OwningProcess | Sort-Object Count -Descending | Select-Object -First 1)
+                if (-not $topGroup) { return @{ Status = 'Manual'; Detail = "$($closeWaitConnections.Count) CLOSE_WAIT sockets, but owner process grouping was unavailable" } }
+
+                $processId = 0
+                $null = [int]::TryParse($topGroup.Name, [ref]$processId)
+                $processName = '(exited/unknown)'
+                $processInfo = if ($processId -gt 0) { Get-Process -Id $processId -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
+                if ($processInfo) { $processName = $processInfo.ProcessName }
+
+                if ($topGroup.Count -ge $CLOSE_WAIT_WARNING_THRESHOLD) {
+                    return @{ Status = 'Hit'; Detail = "PID $processId ($processName) owns $($topGroup.Count) CLOSE_WAIT sockets (warning=$CLOSE_WAIT_WARNING_THRESHOLD, critical=$CLOSE_WAIT_CRITICAL_THRESHOLD)" }
+                }
+                return @{ Status = 'Clear'; Detail = "CLOSE_WAIT present but below threshold: top PID $processId ($processName) owns $($topGroup.Count), total=$($closeWaitConnections.Count)" }
+            }
+        }
         # ---- ADD NEW KNOWN ISSUES ABOVE ------------------------------------------------------
     )
 }
@@ -12478,6 +12513,7 @@ function Test-KnownIssue {
 #   6 Get-StorageResetStorm        -> Disk            (clustered 129/153 bursts)
 #   7 Get-ScheduledTaskMissedRun   -> Task Scheduler  (overdue recurring runs)
 #   8 Get-AccountLockoutSource     -> Security        (4740 source attribution)
+#   9 Get-TcpCloseWaitLeak         -> Network         (per-process CLOSE_WAIT socket leaks)
 # ----------------------------------------------------------------------------
 
 function Get-ServiceControlHang {
@@ -12807,6 +12843,110 @@ function Get-StorageResetStorm {
         }
     }
     catch { Write-Info "  Could not analyse storage events: $($_.Exception.Message)" }
+}
+
+function Get-TcpCloseWaitLeak {
+    <#
+    .SYNOPSIS
+        Detects per-process TCP CLOSE_WAIT socket leaks.
+    .DESCRIPTION
+        CLOSE_WAIT means the remote peer has closed its side of the TCP session
+        and the local application has not called close() yet. Large counts owned
+        by one process indicate an application/socket-disposal leak, not packet
+        loss, firewall drops, or a broken OS TCP/IP stack.
+    .PARAMETER WarningThreshold
+        Per-process CLOSE_WAIT count that triggers a warning (default 100).
+    .PARAMETER CriticalThreshold
+        Per-process CLOSE_WAIT count that triggers a critical alert (default 500).
+    .PARAMETER TopProcesses
+        Number of owning processes to display (default 10).
+    #>
+    [CmdletBinding()]
+    param(
+        [int]$WarningThreshold = $CLOSE_WAIT_WARNING_THRESHOLD,
+        [int]$CriticalThreshold = $CLOSE_WAIT_CRITICAL_THRESHOLD,
+        [int]$TopProcesses = 10
+    )
+
+    Write-Section "TCP CLOSE_WAIT Socket Leak Detection"
+    Write-Info "  Description: CLOSE_WAIT means the remote peer sent FIN and this server's"
+    Write-Info "               application has not closed the socket. A high per-process"
+    Write-Info "               count is an application leak, not a network/firewall fault."
+    Write-Info "  Thresholds : Warning >= $WarningThreshold per process | Critical >= $CriticalThreshold per process"
+
+    try {
+        $closeWaitConnections = @(Get-NetTCPConnection -State CloseWait -ErrorAction Stop)
+        $totalCloseWait = $closeWaitConnections.Count
+        Write-Info "  Total CLOSE_WAIT sockets: $totalCloseWait"
+
+        if ($totalCloseWait -eq 0) {
+            Write-Success "  No CLOSE_WAIT sockets detected"
+            return
+        }
+
+        $processGroups = @($closeWaitConnections | Group-Object OwningProcess | Sort-Object Count -Descending)
+        $suspectGroups = @($processGroups | Where-Object { $_.Count -ge $WarningThreshold })
+
+        foreach ($processGroup in ($processGroups | Select-Object -First $TopProcesses)) {
+            $processId = 0
+            $null = [int]::TryParse($processGroup.Name, [ref]$processId)
+            $processInfo = if ($processId -gt 0) { Get-Process -Id $processId -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
+            $processName = if ($processInfo) { $processInfo.ProcessName } else { '(exited/unknown)' }
+            $memoryMB = if ($processInfo) { [math]::Round($processInfo.WorkingSet64 / 1MB, 0) } else { 0 }
+            $cpuSeconds = if ($processInfo -and $null -ne $processInfo.CPU) { [math]::Round($processInfo.CPU, 1) } else { 0 }
+            $executablePath = $null
+
+            try {
+                $cimProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($cimProcess -and $cimProcess.ExecutablePath) { $executablePath = $cimProcess.ExecutablePath }
+            }
+            catch { }
+
+            $summary = "  PID $processId ($processName): CLOSE_WAIT=$($processGroup.Count)  WS=${memoryMB}MB  CPU=${cpuSeconds}s"
+            if ($processGroup.Count -ge $CriticalThreshold) {
+                Write-DiagError "$summary  [CRITICAL socket leak]"
+            }
+            elseif ($processGroup.Count -ge $WarningThreshold) {
+                Write-DiagWarning "$summary  [WARNING socket leak]"
+            }
+            else {
+                Write-Info $summary
+            }
+
+            if ($executablePath) { Write-Info "    Path: $executablePath" }
+
+            if ($processGroup.Count -ge $WarningThreshold) {
+                $localEndpoints = @($processGroup.Group |
+                    Group-Object { "$($_.LocalAddress):$($_.LocalPort)" } |
+                    Sort-Object Count -Descending |
+                    Select-Object -First 5)
+
+                if ($localEndpoints.Count -gt 0) {
+                    Write-Info "    Top local endpoints holding CLOSE_WAIT:"
+                    foreach ($endpointGroup in $localEndpoints) {
+                        Write-Info "      $($endpointGroup.Name) -> $($endpointGroup.Count) socket(s)"
+                    }
+                }
+            }
+        }
+
+        if ($suspectGroups.Count -gt 0) {
+            Write-Info "    Impact: The owning application may stop accepting new connections once"
+            Write-Info "            leaked socket buffers/objects exhaust process or TCP resources."
+            Write-Info "    Immediate action: Restart the owning application service to clear leaked sockets."
+            Write-Info "    Application fix: close sockets/streams in finally or try-with-resources,"
+            Write-Info "                     enable connection-pool idle eviction, set read/connect"
+            Write-Info "                     timeouts, and enable TCP keepalive where appropriate."
+            Write-Info "    Monitoring: Alert when any process exceeds $WarningThreshold CLOSE_WAIT"
+            Write-Info "                sockets; page/escalate at $CriticalThreshold."
+        }
+        else {
+            Write-Success "  No process exceeds the CLOSE_WAIT warning threshold"
+        }
+    }
+    catch {
+        Write-DiagWarning "  Could not inspect CLOSE_WAIT sockets: $($_.Exception.Message)"
+    }
 }
 
 function Get-ScheduledTaskMissedRun {

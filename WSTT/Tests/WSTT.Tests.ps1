@@ -480,6 +480,14 @@ Describe 'Known Issues Tracker feature' {
         $ids = @((Get-KnownIssueCatalog).Id)
         ($ids | Select-Object -Unique).Count | Should -Be ($ids.Count)
     }
+
+    It 'Catalog includes the TCP CLOSE_WAIT socket leak RCA signature' {
+        . ([scriptblock]::Create((Import-WSTTFunction -Name 'Get-KnownIssueCatalog')))
+        $entry = Get-KnownIssueCatalog | Where-Object { $_.Id -eq 'KI-0013' } | Select-Object -First 1
+        $entry | Should -Not -BeNullOrEmpty
+        $entry.Title | Should -Match 'CLOSE_WAIT'
+        $entry.WSTTOption | Should -Match '1'
+    }
 }
 
 Describe 'Proactive / Incident-Derived Checks feature' {
@@ -494,13 +502,18 @@ Describe 'Proactive / Incident-Derived Checks feature' {
             { $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
     }
 
-    It 'Defines all 8 proactive check functions' {
+    It 'Defines all 9 proactive check functions' {
         foreach ($fn in @(
                 'Get-ServiceControlHang', 'Get-ApplicationHang', 'Get-DirtyShutdownHistory',
                 'Test-CrashDumpReadiness', 'Get-HungProcessAndService', 'Get-StorageResetStorm',
-                'Get-ScheduledTaskMissedRun', 'Get-AccountLockoutSource')) {
+                'Get-ScheduledTaskMissedRun', 'Get-AccountLockoutSource', 'Get-TcpCloseWaitLeak')) {
             ($script:PcFunctions.Name) | Should -Contain $fn
         }
+    }
+
+    It 'Wires Get-TcpCloseWaitLeak into Test-NetworkConfiguration' {
+        $f = $script:PcFunctions | Where-Object { $_.Name -eq 'Test-NetworkConfiguration' } | Select-Object -First 1
+        $f.Extent.Text | Should -Match 'Get-TcpCloseWaitLeak'
     }
 
     It 'Extends KnownCriticalEventIDs with the new System IDs' {

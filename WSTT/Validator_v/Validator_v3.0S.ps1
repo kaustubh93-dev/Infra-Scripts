@@ -19,8 +19,7 @@
 # Purpose	  : The script is used to generate a report of specific SOE attributes and validate  #
 #                across a baseline definition.                                                       #
 # Project Name: Server Scaner                                                                        #
-# Create by   : Rana@microsoft.com  
-# Contributed : Sasaleem@microsoft.com                                                               #
+# Maintainer  : WSTT maintainers                                                                     #
 ######################################################################################################
 $scriptversion = "3.0"
 $Computer = $env:COMPUTERNAME
@@ -1636,12 +1635,12 @@ $MyReport += Get-HTMLDetail "DiskMountPoint/BlockSize Details"
 
 $MountDisks = @()
 
-#$MountDisk = gwmi win32_Volume|where-object {$_.filesystem -match “ntfs”} | Select-Object driveletter,@{Name='freespace';Expression={$_.freespace/1GB}},@{Name='capacity';Expression={$_.capacity/1GB}},@{Name='BlockSize';Expression={$_.BlockSize}}, @{Name='Mount_Name';Expression={$_.DeviceID}} 
+#$MountDisk = gwmi win32_Volume|where-object {$_.filesystem -match ï¿½ntfsï¿½} | Select-Object driveletter,@{Name='freespace';Expression={$_.freespace/1GB}},@{Name='capacity';Expression={$_.capacity/1GB}},@{Name='BlockSize';Expression={$_.BlockSize}}, @{Name='Mount_Name';Expression={$_.DeviceID}} 
 
 
 #$MyReport += Get-HTMLDetail "Mount Disk Details:" ($MountDisk)
 
-$MountDisks = gwmi win32_Volume|where-object {$_.filesystem -match “ntfs”} 
+$MountDisks = gwmi win32_Volume|where-object {$_.filesystem -match ï¿½ntfsï¿½} 
 
 Foreach ($mountdisk in $MountDisks)
 

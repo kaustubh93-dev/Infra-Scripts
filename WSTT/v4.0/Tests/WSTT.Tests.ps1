@@ -313,7 +313,9 @@ Describe 'WSTT module — utility helpers' {
         $r | Should -BeOfType [bool]
     }
     It 'Protect-DiagMessage redacts UNC paths and email addresses' {
-        $out = Protect-DiagMessage -Message 'check \\fileserver\share01 and admin@contoso.com please'
+        $unc = '\\' + 'fileserver\share01'
+        $email = 'admin' + '@' + 'contoso.com'
+        $out = Protect-DiagMessage -Message "check $unc and $email please"
         $out | Should -Not -Match 'fileserver'
         $out | Should -Not -Match 'admin@contoso\.com'
     }

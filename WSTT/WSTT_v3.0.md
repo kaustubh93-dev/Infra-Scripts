@@ -4,7 +4,7 @@
 
 A comprehensive PowerShell-based interactive diagnostic tool for **Windows Server 2019, 2022, and 2025**. Diagnoses and collects logs for Network, Memory, CPU, Disk, Services, Event Logs, DNS, Security & Authentication, Windows Update, TLS/SSL, IIS, **WSFC Cluster Port Compliance**, and **Cluster/SQL AG environments** — plus a **Known Issues Tracker** and **incident-derived proactive checks** that map real RCA signatures to live on-box detection.
 
-**Author:** Kaustubh Sharma  
+**Author:** Kaustubh Sharma
 **Version:** 3.0  
 **Requires:** Administrator privileges (auto-prompts for elevation), PowerShell 5.1+  
 **Tested On:** Windows Server 2019 (Build 17763), 2022 (Build 20348), 2025 (Build 26100)
@@ -194,7 +194,7 @@ Maps documented Windows Server issues to **live on-box detection**, so common ro
 - Lookback window: `-DaysBack <1-365>` (default 7); ends with a summary scorecard
 - Console-only output → flows into save-to-file and the HTML Diagnostic Report
 
-**Seeded catalog (12 entries):**
+**Seeded catalog (13 entries):**
 
 | Id | Issue | Category | Deep-dive |
 |----|-------|----------|-----------|
@@ -210,6 +210,7 @@ Maps documented Windows Server issues to **live on-box detection**, so common ro
 | KI-0010 | Pending reboot blocking patch / role installs | Servicing | Option 9 |
 | KI-0011 | System volume critically low on free space | Disk | Option 4 |
 | KI-0012 | WHEA hardware errors (CPU/memory/PCIe silicon degrading) | Hardware / CPU | Option 3 |
+| KI-0013 | TCP CLOSE_WAIT socket leak (application not closing sockets) | Network / Application | Option 1 |
 
 ### 🚨 Proactive / Incident-Derived Checks (NEW)
 
@@ -222,6 +223,7 @@ Detection functions derived from real production RCAs, each targeting a signal t
 | `Get-ApplicationHang` | GUI application hangs (Event 1002 — taskmgr/mmc) | Event Log (6) |
 | `Get-DirtyShutdownHistory` | Dirty/unclean restarts (Kernel-Power 41 / 6008), recurrence count | Event Log (6) |
 | `Get-StorageResetStorm` | Clustered bursts of 129/153 within a sliding window (reset storm) | Disk (4) |
+| `Get-TcpCloseWaitLeak` | Per-process CLOSE_WAIT socket leaks; warning >100 / critical >500 | Network (1) |
 | `Get-AccountLockoutSource` | 4740 enrichment — caller machine + service running as locked acct | Security (8) |
 | `Get-ScheduledTaskMissedRun` | Enabled recurring tasks overdue or stuck 'running' (silent stop) | Task Scheduler (19) |
 | `Test-CrashDumpReadiness` | volmgr 46/49 + pagefile sized for the CONFIGURED dump type | Baseline (20) |
@@ -665,7 +667,7 @@ $script:DefaultLogPath = Join-Path $script:TempBasePath "Logs"
 | Menu options | 25 (0-24) |
 | OS versions supported | 2019, 2022, 2025 |
 | Cluster-safe checks | 13 |
-| New in v3.0 | 27 network, 24 CPU, 24 disk, 19 memory, 8 task scheduler, 9 baseline, HTML report, cluster/AG awareness, 9 WSFC port-compliance checks, 40-category Recent Server Changes, Known Issues Tracker (12 seeded), 8 incident-derived proactive checks |
+| New in v3.0 | 28 network, 24 CPU, 24 disk, 19 memory, 8 task scheduler, 9 baseline, HTML report, cluster/AG awareness, 9 WSFC port-compliance checks, 40-category Recent Server Changes, Known Issues Tracker (13 seeded), 9 incident-derived proactive checks |
 | Pester test coverage | 81 tests — all passing |
 
 ---
@@ -673,7 +675,7 @@ $script:DefaultLogPath = Join-Path $script:TempBasePath "Logs"
 ## License & Support
 
 ### Maintainer
-**Kaustubh Sharma** — author and maintainer of WSTT v3.0.
+WSTT maintainers.
 
 ### Reporting Issues
 When reporting issues, include:
