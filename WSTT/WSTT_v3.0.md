@@ -6,7 +6,7 @@ A comprehensive PowerShell-based interactive diagnostic tool for **Windows Serve
 
 **Author:** Kaustubh Sharma  
 **Version:** 3.0  
-**Requires:** Administrator privileges, PowerShell 5.1+  
+**Requires:** Administrator privileges (auto-prompts for elevation), PowerShell 5.1+  
 **Tested On:** Windows Server 2019 (Build 17763), 2022 (Build 20348), 2025 (Build 26100)
 
 > [!NOTE]
@@ -335,7 +335,7 @@ Detection functions derived from real production RCAs, each targeting a signal t
 ### Required
 - Windows Server 2019, 2022, or 2025
 - PowerShell 5.1 or higher
-- Administrator privileges
+- Administrator privileges (WSTT auto-relaunches with a UAC prompt if started non-elevated)
 - Sufficient disk space for logs (minimum 5GB recommended)
 
 ### Optional
@@ -350,23 +350,60 @@ Detection functions derived from real production RCAs, each targeting a signal t
 
 ## Installation & Usage
 
+### Signed Release Requirement
+
+Official GitHub release artifacts must be Authenticode-signed. Windows can block a downloaded `.ps1` before WSTT starts, especially when the host uses `RemoteSigned` with Mark-of-the-Web or an enterprise `AllSigned` policy.
+
+Verify the downloaded file before running it:
+
+```powershell
+Get-AuthenticodeSignature .\WSTT_v3.0.ps1 | Select-Object Status, SignerCertificate
+```
+
+Expected result for an official release: `Status` is `Valid`. If the status is `NotSigned`, do not treat that file as a release artifact.
+
+Release maintainers should sign the script before publishing, then run the default pre-publish gate:
+
+```powershell
+$cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Select-Object -First 1
+Set-AuthenticodeSignature -FilePath .\WSTT_v3.0.ps1 -Certificate $cert -TimestampServer 'http://timestamp.digicert.com'
+.\Tests\Invoke-PrePublishChecks.ps1
+```
+
+For local development only, unsigned checks can be run with:
+
+```powershell
+.\Tests\Invoke-PrePublishChecks.ps1 -AllowUnsignedDevBuild
+```
+
+If you intentionally use a trusted unsigned development copy on a machine using `RemoteSigned`, remove only the download marker:
+
+```powershell
+Unblock-File .\WSTT_v3.0.ps1
+```
+
+`Unblock-File` does not satisfy `AllSigned`; those systems require a valid signature.
+
 ### Quick Start
 
 ```powershell
-# 1. Open PowerShell as Administrator
-# 2. Set execution policy if needed
+# 1. Open PowerShell. If it is not elevated, WSTT will relaunch with a UAC prompt.
+# 2. Verify the official release signature is Valid
+Get-AuthenticodeSignature .\WSTT_v3.0.ps1 | Select-Object Status, SignerCertificate
+
+# 3. Set execution policy if needed and permitted by your organization
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
-# 3. Run the script
+# 4. Run the script
 .\WSTT_v3.0.ps1
 
-# 4. With session logging
+# 5. With session logging
 .\WSTT_v3.0.ps1 -EnableLogging
 ```
 
 ### What Happens at Startup
 
-1. Verifies Administrator privileges
+1. Verifies Administrator privileges and relaunches with a UAC prompt if needed
 2. Creates diagnostic output directories (`%TEMP%\ServerDiagnostics\`)
 3. **Detects cluster environment** (ClusSvc, cluster name, nodes, CSV paths, heartbeat NICs)
 4. **Detects SQL AG state** (replica role, sync health, listeners)
@@ -594,8 +631,8 @@ $script:DefaultLogPath = Join-Path $script:TempBasePath "Logs"
 
 | Issue | Solution |
 |-------|----------|
-| "Requires Administrator" | Run PowerShell as Administrator |
-| "Execution policy" error | `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser` |
+| "Requires Administrator" | Accept the UAC prompt. If elevation is canceled or blocked by policy, run PowerShell as Administrator and launch WSTT again. |
+| "not digitally signed" / execution policy error | Use the signed release and verify `Get-AuthenticodeSignature` returns `Valid`. For a trusted unsigned development copy on `RemoteSigned` only, run `Unblock-File .\WSTT_v3.0.ps1`. `AllSigned` requires a valid signature. |
 | "TSS not found" | Download TSS, extract to `C:\TSS`, or use Option 15 |
 | Locale parsing failures | English-only tools (w32tm, klist); verify manually via GUI |
 | LBFO cmdlets missing | Server 2025 — script auto-falls back to SET |

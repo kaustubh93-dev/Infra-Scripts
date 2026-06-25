@@ -36,8 +36,11 @@ Describe 'WSTT_v3.0.ps1 — Static / AST checks' {
         $script:ParseErrors | Should -BeNullOrEmpty
     }
 
-    It 'Declares #Requires -RunAsAdministrator' {
-        $script:ScriptContent | Should -Match '#Requires\s+-RunAsAdministrator'
+    It 'Uses runtime self-elevation instead of #Requires -RunAsAdministrator' {
+        $script:ScriptContent | Should -Not -Match '(?m)^\s*#Requires\s+-RunAsAdministrator\b'
+        ($script:Functions.Name) | Should -Contain 'Test-WSTTAdministrator'
+        ($script:Functions.Name) | Should -Contain 'Start-WSTTElevated'
+        $script:ScriptContent | Should -Match '(?s)Start-Process.+-Verb\s+RunAs'
     }
 
     It 'Has a param() block at top level' {

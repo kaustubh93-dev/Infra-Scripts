@@ -1,5 +1,4 @@
-﻿#Requires -RunAsAdministrator
-<#
+﻿<#
 .SYNOPSIS
     Comprehensive Windows Server Troubleshooting and Log Collection Script
 .DESCRIPTION
@@ -100,6 +99,59 @@
 param(
     [switch]$EnableLogging
 )
+
+# Runtime elevation bootstrap. A static admin requirement directive would
+# stop the script before it can relaunch itself from a non-elevated shell.
+$script:WSTTScriptPath = if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+
+function Test-WSTTAdministrator {
+    <#
+    .SYNOPSIS
+        Returns whether the current PowerShell host is running elevated.
+    #>
+    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Start-WSTTElevated {
+    <#
+    .SYNOPSIS
+        Relaunches this script in an elevated Windows PowerShell session.
+    #>
+    [CmdletBinding()]
+    param(
+        [switch]$EnableLogging
+    )
+
+    if ([string]::IsNullOrWhiteSpace($script:WSTTScriptPath) -or -not (Test-Path -LiteralPath $script:WSTTScriptPath -PathType Leaf)) {
+        Write-Host "[ERROR] Cannot determine the WSTT script path for elevation." -ForegroundColor Red
+        return $false
+    }
+
+    try {
+        $powerShellExe = (Get-Command powershell.exe -ErrorAction Stop).Source
+    }
+    catch {
+        $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    }
+
+    $argumentList = @(
+        '-NoProfile',
+        '-File',
+        ('"{0}"' -f $script:WSTTScriptPath)
+    )
+    if ($EnableLogging) { $argumentList += '-EnableLogging' }
+
+    try {
+        Write-Host "WSTT requires administrator privileges. Requesting elevation..." -ForegroundColor Yellow
+        Start-Process -FilePath $powerShellExe -ArgumentList $argumentList -WorkingDirectory (Get-Location).Path -Verb RunAs -ErrorAction Stop
+        return $true
+    }
+    catch {
+        Write-Host "[ERROR] Failed to start elevated PowerShell: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
 
 # Requirements: PowerShell 5.1+ and the NetTCPIP module (Get-Net* cmdlets).
 # Custom display functions use Write-DiagWarning/Write-DiagError to avoid overriding built-in cmdlets.
@@ -12918,13 +12970,10 @@ function Start-TroubleshootingTool {
         [switch]$EnableLogging
     )
     
-    # Check if running as admin
-    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-    $isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    
-    if (-not $isAdmin) {
-        Write-DiagError "This script requires Administrator privileges!"
-        Write-Info "Please run PowerShell as Administrator and try again."
+    # Defensive guard: the bootstrap above should already have elevated the session.
+    if (-not (Test-WSTTAdministrator)) {
+        Write-DiagError "This script requires Administrator privileges, and automatic elevation did not complete."
+        Write-Info "Please accept the UAC prompt or run PowerShell as Administrator and try again."
         Read-Host "Press Enter to exit"
         exit 1
     }
@@ -13212,6 +13261,12 @@ function Start-TroubleshootingTool {
 
 #region Script Entry Point
 # Script execution starts here
+if (-not (Test-WSTTAdministrator)) {
+    if (Start-WSTTElevated -EnableLogging:$EnableLogging) { exit 0 }
+    Write-Host "Please run PowerShell as Administrator and try again." -ForegroundColor Yellow
+    exit 1
+}
+
 if ($EnableLogging) {
     Start-TroubleshootingTool -EnableLogging
 }

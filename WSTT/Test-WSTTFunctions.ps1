@@ -35,9 +35,8 @@ if ($idx -lt 0) {
 }
 $definitions = $raw.Substring(0, $idx)
 
-# The script body has a #Requires -RunAsAdministrator directive at the top.
-# #Requires is a parser directive; it is ignored by Invoke-Expression, so we
-# can load the definitions without elevation for read-only testing.
+# The self-elevation trigger lives in the stripped Script Entry Point block,
+# so definitions can be loaded without a UAC prompt for read-only testing.
 try {
     Invoke-Expression $definitions
     Write-Host "[OK] Definitions loaded ($([math]::Round($definitions.Length/1KB,1)) KB of script body)." -ForegroundColor Green
