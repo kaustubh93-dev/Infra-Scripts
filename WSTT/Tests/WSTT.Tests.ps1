@@ -243,8 +243,31 @@ Describe 'WSFC Cluster Port Compliance — port matrix constant' {
         $script:ScriptContent | Should -Match "Port\s*=\s*3343"
     }
 
-    It 'Includes ICMP entry (Add Node Wizard)' {
-        $script:ScriptContent | Should -Match "Protocol\s*=\s*'ICMP'"
+    It 'Includes ICMPv4 and ICMPv6 entries for Add Node / validation' {
+        $script:ScriptContent | Should -Match "Protocol\s*=\s*'ICMPv4'"
+        $script:ScriptContent | Should -Match "Protocol\s*=\s*'ICMPv6'"
+        $script:ScriptContent | Should -Match "IcmpType -contains '128'"
+    }
+
+    It 'Includes documented static WSFC ports and excludes legacy 138/139 rows' {
+        $coreMatch = [regex]::Match(
+            $script:ScriptContent,
+            '(?s)\$script:WSFC_REQUIRED_PORTS\s*=\s*@\((?<body>.*?)\)\s*\$script:WSFC_DYNAMIC_RPC_PORT_RANGE'
+        )
+        $coreMatch.Success | Should -BeTrue
+        $coreMatrix = $coreMatch.Groups['body'].Value
+        foreach ($port in 445, 135, 137) {
+            $coreMatrix | Should -Match "Port\s*=\s*$port"
+        }
+        $coreMatrix | Should -Not -Match "Port\s*=\s*138"
+        $coreMatrix | Should -Not -Match "Port\s*=\s*139"
+    }
+
+    It 'Includes optional SMB dependency profile for file-share witness/SOFS paths' {
+        $script:ScriptContent | Should -Match '\$script:WSFC_SMB_DEPENDENCY_PORTS\s*='
+        foreach ($port in 135, 137, 138, 139, 445) {
+            $script:ScriptContent | Should -Match "Port\s*=\s*$port"
+        }
     }
 
     It 'Includes WinRM 5985 (cloud witness)' {
@@ -253,6 +276,7 @@ Describe 'WSFC Cluster Port Compliance — port matrix constant' {
 
     It 'Does NOT include dynamic RPC range 49152-65535 (out of scope by design)' {
         $script:ScriptContent | Should -Not -Match 'Port\s*=\s*49152'
+        $script:ScriptContent | Should -Match "WSFC_DYNAMIC_RPC_PORT_RANGE = '49152-65535'"
     }
 }
 
@@ -277,8 +301,36 @@ Describe 'WSFC Cluster Port Compliance — function definitions' {
         ($script:Functions.Name) | Should -Contain 'Get-WSFCFirewallRuleStatus'
     }
 
+    It 'Defines pktmon capture helpers for WSFC probes' {
+        ($script:Functions.Name) | Should -Contain 'Start-WSFCPktmonCapture'
+        ($script:Functions.Name) | Should -Contain 'Stop-WSFCPktmonCapture'
+        ($script:Functions.Name) | Should -Contain 'Show-WSFCPktmonReviewSummary'
+        $script:ScriptContent | Should -Match 'Pktmon Review Summary'
+        $script:ScriptContent | Should -Match 'Pktmon Name Resolution Matrix'
+        $script:ScriptContent | Should -Match 'Pktmon Target / Port Outcome Matrix'
+        $script:ScriptContent | Should -Match 'TargetName, TargetIP, Protocol, Port, Status, Evidence, Count, Action'
+        $script:ScriptContent | Should -Match '\[''Port''\]'
+        $script:ScriptContent | Should -Match 'Show-WSFCPktmonReviewSummary -Path'
+    }
+
+    It 'Keeps pktmon packet evidence deduped and pass-preferred' {
+        $f = $script:Functions | Where-Object { $_.Name -eq 'Show-WSFCPktmonReviewSummary' } | Select-Object -First 1
+        $f.Extent.Text | Should -Match 'PktGroupId'
+        $f.Extent.Text | Should -Match 'PacketIds'
+        $f.Extent.Text | Should -Match 'Pass\s*=\s*4'
+        $f.Extent.Text | Should -Match 'Redact before sharing'
+    }
+
     It 'Defines Test-WSFCClusterPortCompliance (orchestrator)' {
         ($script:Functions.Name) | Should -Contain 'Test-WSFCClusterPortCompliance'
+    }
+
+    It 'Defines Test-WSFCClusterBuildPortReadiness (pre-build/add-node workflow)' {
+        ($script:Functions.Name) | Should -Contain 'Test-WSFCClusterBuildPortReadiness'
+    }
+
+    It 'Defines Test-WSFCFileSharePortReadiness (optional SMB dependency workflow)' {
+        ($script:Functions.Name) | Should -Contain 'Test-WSFCFileSharePortReadiness'
     }
 
     It 'Defines Show-WSFCPortSummaryTable' {
@@ -297,6 +349,11 @@ Describe 'WSFC Cluster Port Compliance — function definitions' {
         $func = $script:Functions | Where-Object { $_.Name -eq 'Test-WSFCClusterPortCompliance' } | Select-Object -First 1
         $func.Body.ParamBlock.Attributes.TypeName.Name | Should -Contain 'CmdletBinding'
     }
+
+    It 'Test-WSFCClusterPortCompliance documents SkipFirewallAudit only once' {
+        $func = $script:Functions | Where-Object { $_.Name -eq 'Test-WSFCClusterPortCompliance' } | Select-Object -First 1
+        ([regex]::Matches($func.Extent.Text, '\.PARAMETER\s+SkipFirewallAudit')).Count | Should -Be 1
+    }
 }
 
 Describe 'WSFC menu wiring' {
@@ -314,8 +371,17 @@ Describe 'WSFC menu wiring' {
         $script:ScriptContent | Should -Match 'Select an option \(0-24\)'
     }
 
-    It 'Dispatcher has a "22" case that calls Test-WSFCClusterPortCompliance' {
+    It 'Dispatcher has a "22" case for existing cluster and build/add-node modes' {
         $script:ScriptContent | Should -Match '"22"\s*\{[^}]*Test-WSFCClusterPortCompliance'
+        $script:ScriptContent | Should -Match 'Test-WSFCClusterBuildPortReadiness'
+        $script:ScriptContent | Should -Match 'Build new cluster readiness'
+        $script:ScriptContent | Should -Match 'Add node readiness'
+        $script:ScriptContent | Should -Match 'Scenario BuildCluster'
+        $script:ScriptContent | Should -Match 'Scenario AddNode'
+        $script:ScriptContent | Should -Match 'Capture pktmon trace during reachability probes'
+        $script:ScriptContent | Should -Match 'CapturePktmon'
+        $script:ScriptContent | Should -Match 'File-Share / SMB dependency readiness'
+        $script:ScriptContent | Should -Match 'Test-WSFCFileSharePortReadiness'
     }
 }
 
@@ -581,6 +647,12 @@ Describe 'WSFC Get-WSFCFirewallRuleStatus — module-missing fallback' {
         $r.OutboundAllow | Should -Be 'Unknown'
         $r.ErrorMessage  | Should -Match 'NetSecurity'
     }
+
+    It 'Tracks broad Any firewall matches with an audit note' {
+        $functionText = Import-WSTTFunction -Name 'Get-WSFCFirewallRuleStatus'
+        $functionText | Should -Match 'AuditNote'
+        $functionText | Should -Match 'LocalPort/IcmpType Any'
+    }
 }
 
 Describe 'WSFC Test-WSFCPortReachability — protocol dispatch' {
@@ -615,6 +687,13 @@ Describe 'WSFC Test-WSFCPortReachability — protocol dispatch' {
             -PortDefinition @{ Service='Test'; Protocol='XYZ'; Port=1 } -TimeoutMs 250
         $r.Status       | Should -Be 'Fail'
         $r.ErrorMessage | Should -Match 'Unknown protocol'
+    }
+
+    It 'Distinguishes TCP refused/reset from silent timeout in messages' {
+        $functionText = Import-WSTTFunction -Name 'Test-WSFCPortReachability'
+        $functionText | Should -Match 'ConnectionRefused'
+        $functionText | Should -Match 'TCP connection refused/reset by target'
+        $functionText | Should -Match 'possible drop'
     }
 }
 

@@ -6,6 +6,20 @@
     Diagnoses and collects logs for Network, Memory, CPU, Disk, Services, DNS,
     Security, Windows Update, TLS/SSL, IIS, and Cluster/SQL AG environments.
 
+    v3.1 Highlights:
+      - Per-run session folder (Logs\<timestamp>_<computer>\) with an end-of-run manifest
+      - Executive Report: 1-page synthesized verdict (summary, top-3 confidence-rated findings, actions)
+      - Root-Cause Correlator: time-window chain analysis over recent change signals
+      - Collection Gaps Summary: one consolidated checklist for every "could not collect" moment
+      - Guided Scenario Mode: pick a symptom, WSTT runs the right existing checks in order
+      - Server State Snapshot: save a baseline and compare against the previous run
+      - Auto drill-down: Known Issues hits offer to jump straight into the deep-dive diagnostic
+      - Broadened PII redaction (IPv4/IPv6/SID, opt-in) + a final pass before reports hit disk
+      - Known Issues catalog: -Category filtering for scenario-scoped runs
+      - Structured JSON export alongside every saved text report
+      - Existing-crash-dump detection alongside future-dump readiness
+      - Confidence tagging (HIGH/MEDIUM/LOW) on inferred/correlated findings
+
     v3.0 Highlights:
       - 25+ Network checks (gateway, duplex, MTU, offload, routing, proxy, RDMA, NIC drivers)
       - 24 CPU checks (per-core, queue length, interrupts, DPC, power throttling, AV detection, NUMA)
@@ -23,14 +37,53 @@
 .PARAMETER EnableLogging
     Enables transcript logging of the entire session
 .EXAMPLE
-    .\WSTT_v3.0.ps1
+    .\WSTT_v3.1.ps1
 .EXAMPLE
-    .\WSTT_v3.0.ps1 -EnableLogging
+    .\WSTT_v3.1.ps1 -EnableLogging
 .NOTES
     Author:   Kaustubh Sharma
-    Version:  3.0
+    Version:  3.1
     Requires: Administrator privileges, PowerShell 5.1+
     Tested:   Windows Server 2019, 2022, 2025
+
+    v3.1 Changes from v3.0:
+      [Reporting]   NEW Executive Report (menu 27): synthesizes the same data Export-HTMLReport
+                    captures into a 3-5 bullet executive summary, top-3 confidence-rated (HIGH/
+                    MEDIUM/LOW) findings, and an ordered action list - readable in ~30 seconds.
+      [Reporting]   NEW Root-Cause Correlator (menu 29, Find-WSTTCorrelatedEvent): groups
+                    Get-RecentServerChange's change signals into likely causal chains via
+                    sliding time-window clustering (default 10 min); a small known-adjacency
+                    table (e.g. Storage -> Cluster) upgrades matching chains to HIGH confidence.
+      [Reporting]   NEW Collection Gaps Summary (menu 25, Get-WSTTCollectionGap): aggregates every
+                    "could not collect this" moment across all diagnostics into one checklist with
+                    a suggested fix command per gap.
+      [UX]          NEW Guided Scenario Mode (menu 28, Start-GuidedScenario): symptom-driven
+                    orchestration ('slow', 'cluster issue', 'network issue', etc.) that runs the
+                    right ordered subset of EXISTING Test-* diagnostics and prints one verdict.
+      [UX]          NEW auto drill-down: Test-KnownIssue -AutoDrillDown (live menu call only)
+                    offers to jump straight into the deep-dive diagnostic for each HIT via an
+                    inline dispatch scoped to the option numbers the catalog cites.
+      [Sessions]    NEW per-run session folder: $script:DefaultLogPath now points at
+                    Logs\<timestamp>_<computername>\ each run, with an end-of-run
+                    _SessionManifest.txt listing every file produced.
+      [History]     NEW Server State Snapshot (menu 26): Export-WSTTSnapshot/Compare-WSTTSnapshot
+                    serialize services/ports/adapters/IPs/hotfixes/local-admins to a baseline
+                    (Clixml, pruned to last 10) and diff the two most recent snapshots.
+      [Export]      NEW structured JSON sidecar written automatically alongside every existing
+                    "Save to file?" text report (Export-DiagnosticSection -Format, default
+                    Text+Json); -Csv also available.
+      [Safety]      Protect-DiagMessage gained opt-in IPv4/IPv6/SID redaction
+                    (-IncludeNetworkIdentifiers) and now backs Write-Success/Write-Info too; new
+                    Protect-DiagReport runs a final redaction pass on fully-rendered reports
+                    before they hit disk (HTML/System reports can opt into network-ID redaction).
+      [Catalog]     Test-KnownIssue gained a -Category filter (e.g. -Category 'Cluster') so
+                    scenario-scoped callers (Guided Scenario Mode) can run a subset of the catalog.
+      [Dumps]       Test-CrashDumpReadiness now also flags EXISTING dump files (MEMORY.DMP,
+                    Minidump\*.dmp, WER LocalDumps) alongside its future-dump readiness checks.
+      [Confidence]  Add-ChangeEventSignal now tags its summary line [MEDIUM-confidence signal]
+                    (parity with Add-ChangeRegistrySignal's existing [LOW-confidence signal]);
+                    Test-KnownIssue's HIT/MANUAL output is now explicitly labelled high/medium
+                    confidence.
 
     v3.0 Changes from v2.5:
       [Network]   15 new checks: gateway reachability, duplicate IP, link speed/duplex,
@@ -218,7 +271,17 @@ Set-Variable -Name CLOSE_WAIT_CRITICAL_THRESHOLD -Value 500 -Option ReadOnly -Fo
 
 # Path Configuration
 $script:TempBasePath = Join-Path $env:TEMP "ServerDiagnostics"
-$script:DefaultLogPath = Join-Path $script:TempBasePath "Logs"
+# $script:LogsRootPath is the stable flat root ("...\Logs"); $script:DefaultLogPath is
+# repointed to a per-run subfolder ("...\Logs\<timestamp>_<computername>") by
+# Initialize-DiagnosticPaths so every existing 'Join-Path $script:DefaultLogPath' call site
+# automatically gets per-run session isolation (v3.1 "Per-run session folder").
+$script:LogsRootPath = Join-Path $script:TempBasePath "Logs"
+$script:DefaultLogPath = $script:LogsRootPath
+# Snapshot baselines persist ACROSS runs (unlike DefaultLogPath), so they live outside the
+# per-run session folder (v3.1 "Snapshot save + compare").
+$script:SnapshotPath = Join-Path $script:TempBasePath "Snapshots"
+# Files this run has written (v3.1 session manifest); populated by Add-WSTTManifestEntry.
+$script:WSTTSessionManifest = [System.Collections.Generic.List[pscustomobject]]::new()
 
 # TSS Path Configuration - HARDCODED
 # Change this path to match your TSS installation location
@@ -343,7 +406,8 @@ function Write-Success {
         The success message to display
     #>
     param([string]$Text)
-    Write-Host "[SUCCESS] $($Text)" -ForegroundColor Green
+    $safeText = Protect-DiagMessage -Message $Text
+    Write-Host "[SUCCESS] $safeText" -ForegroundColor Green
 }
 
 function Write-DiagWarning {
@@ -370,17 +434,60 @@ function Protect-DiagMessage {
     <#
     .SYNOPSIS
         Redacts potentially sensitive information from diagnostic messages
+    .DESCRIPTION
+        Always redacts UNC paths, email addresses, and domain\user patterns - safe to apply to
+        every live diagnostic message since this is display text, not the underlying data used
+        for troubleshooting. Pass -IncludeNetworkIdentifiers to ALSO redact IPv4/IPv6 addresses
+        and SIDs; this is intentionally opt-in because WSTT is a network/perf troubleshooting
+        tool and most live diagnostic output legitimately needs to show real IP addresses. It is
+        used by Protect-DiagReport for the final on-disk report pass (v3.1), not by the
+        interactive Write-* helpers.
     .PARAMETER Message
         The message to sanitize
+    .PARAMETER IncludeNetworkIdentifiers
+        Also redact IPv4/IPv6 addresses and SIDs (S-1-...). Off by default.
     #>
-    param([string]$Message)
+    param(
+        [string]$Message,
+        [switch]$IncludeNetworkIdentifiers
+    )
     # Redact UNC paths (\\server\share)
     $Message = $Message -replace '\\\\[^\s\\]+\\[^\s\\]+', '\\\\***\***'
     # Redact email addresses
     $Message = $Message -replace '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '***@***'
     # Redact domain\user patterns
     $Message = $Message -replace '(?<=[^\w])([A-Z][A-Z0-9]+)\\([A-Za-z0-9._-]+)(?=[^\w]|$)', '$1\***'
+    if ($IncludeNetworkIdentifiers) {
+        # Redact IPv4 addresses (strict octet-range match so build/version numbers aren't hit)
+        $Message = $Message -replace '\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b', '***.***.***.***'
+        # Redact IPv6 addresses (full and '::'-compressed forms)
+        $Message = $Message -replace '\b(?:[A-Fa-f0-9]{1,4}:){2,7}(?::|[A-Fa-f0-9]{1,4})\b', '****::****'
+        # Redact Windows SIDs (S-1-5-21-...-500, well-known S-1-1-0, etc.)
+        $Message = $Message -replace '\bS-1-\d+(?:-\d+){1,14}\b', 'S-1-***'
+    }
     return $Message
+}
+
+function Protect-DiagReport {
+    <#
+    .SYNOPSIS
+        Runs a final redaction pass over a fully-rendered report right before it is written to disk.
+    .DESCRIPTION
+        Coverage of Protect-DiagMessage should not depend on which Write-* helper produced a
+        given line (raw exception text, here-string content, etc. may never have passed through
+        Write-DiagWarning/Write-DiagError). This applies the same redaction rules once over the
+        ENTIRE rendered report text as a safety net (v3.1).
+    .PARAMETER ReportText
+        The fully-rendered report content (plain text or HTML).
+    .PARAMETER RedactNetworkIdentifiers
+        Also redact IPv4/IPv6 addresses and SIDs. Off by default so reports remain fully useful
+        for network/perf troubleshooting; opt in when a report will be shared externally.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ReportText,
+        [switch]$RedactNetworkIdentifiers
+    )
+    return (Protect-DiagMessage -Message $ReportText -IncludeNetworkIdentifiers:$RedactNetworkIdentifiers)
 }
 
 function Write-DiagError {
@@ -404,7 +511,8 @@ function Write-Info {
         The informational message to display
     #>
     param([string]$Text)
-    Write-Host "[INFO] $($Text)" -ForegroundColor White
+    $safeText = Protect-DiagMessage -Message $Text
+    Write-Host "[INFO] $safeText" -ForegroundColor White
 }
 #endregion
 
@@ -518,24 +626,64 @@ function Initialize-DiagnosticPaths {
     .SYNOPSIS
         Initializes diagnostic paths and ensures they exist
     .DESCRIPTION
-        Creates necessary directories for logs and reports
+        Creates necessary directories for logs and reports, then repoints
+        $script:DefaultLogPath at a new per-run session subfolder
+        ("<LogsRootPath>\<timestamp>_<computername>") so every diagnostic, report, and log this
+        run produces lands in one clean, easy-to-zip bundle instead of an ever-growing flat
+        folder (v3.1).
     #>
     try {
         if (-not (Test-Path $script:TempBasePath)) {
             New-Item -Path $script:TempBasePath -ItemType Directory -Force -ErrorAction Stop | Out-Null
             Write-Info "Created diagnostic base path: $($script:TempBasePath)"
         }
-        
+
+        if (-not (Test-Path $script:LogsRootPath)) {
+            New-Item -Path $script:LogsRootPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+
+        # Per-run session folder (v3.1): isolates this run's output from every other run.
+        $sessionFolderName = "{0}_{1}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'), $env:COMPUTERNAME
+        $script:DefaultLogPath = Join-Path $script:LogsRootPath $sessionFolderName
         if (-not (Test-Path $script:DefaultLogPath)) {
             New-Item -Path $script:DefaultLogPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
         }
-        
+
+        if (-not (Test-Path $script:SnapshotPath)) {
+            New-Item -Path $script:SnapshotPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+
         return $true
     }
     catch {
         Write-DiagError "Failed to initialize diagnostic paths: $($_.Exception.Message)"
         return $false
     }
+}
+
+function Add-WSTTManifestEntry {
+    <#
+    .SYNOPSIS
+        Records a file this run produced so it can be listed in the end-of-run session manifest.
+    .PARAMETER Path
+        Full path to the file that was written.
+    .PARAMETER Description
+        Short human-readable label for the manifest listing.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+    if (-not $script:WSTTSessionManifest) {
+        $script:WSTTSessionManifest = [System.Collections.Generic.List[pscustomobject]]::new()
+    }
+    $sizeKb = try { [math]::Round((Get-Item -LiteralPath $Path -ErrorAction Stop).Length / 1KB, 1) } catch { $null }
+    $script:WSTTSessionManifest.Add([pscustomobject]@{
+            Time        = Get-Date
+            Path        = $Path
+            Description = $Description
+            SizeKB      = $sizeKb
+        })
 }
 
 function Test-PathValid {
@@ -680,6 +828,45 @@ function Get-ProcessAnalysis {
         Write-DiagError "Failed to retrieve process information: $($_.Exception.Message)"
         return $null
     }
+}
+
+function Get-WSTTLocalAdminMember {
+    <#
+    .SYNOPSIS
+        Returns the current members of the local Administrators group.
+    .DESCRIPTION
+        Three-tier fallback: Get-LocalGroupMember by well-known SID, then a CIM group-name
+        lookup + 'net localgroup' parse for hosts where the LocalAccounts module or SID lookup
+        is unavailable. Shared by Get-RecentServerChange (Local Administrators snapshot) and
+        Get-WSTTSnapshotData (Server State Snapshot) so both features enumerate members the
+        same way instead of each maintaining its own copy of the same fallback chain.
+    .OUTPUTS
+        String[] - Administrators group member names, or an empty array if enumeration failed.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $members = @()
+    try {
+        if (Get-Command Get-LocalGroup -ErrorAction SilentlyContinue) {
+            $adminGrp = Get-LocalGroup -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue
+            if ($adminGrp) {
+                $members = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+            }
+        }
+        if ($members.Count -eq 0) {
+            $adminGroupName = (Get-CimInstance Win32_Group -Filter "SID='S-1-5-32-544' AND LocalAccount=True" -ErrorAction SilentlyContinue).Name
+            if (-not $adminGroupName) { $adminGroupName = 'administrators' }
+            $netOut = @(& net localgroup $adminGroupName 2>$null)
+            $members = @($netOut | Where-Object {
+                    $_ -and $_.Trim() -ne '' -and
+                    $_ -notmatch '^(Alias name|Comment|Members|-{3,}|The command completed)'
+                } | ForEach-Object { $_.Trim() })
+        }
+    }
+    catch { }
+
+    return $members
 }
 #endregion
 
@@ -1878,10 +2065,12 @@ function Export-WSFCPortReportToCsv {
         if ($ReachabilityResults.Count -gt 0) {
             $ReachabilityResults | Export-Csv -Path $reachPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
             Write-Success "  Reachability CSV: $reachPath"
+            Add-WSTTManifestEntry -Path $reachPath -Description "WSFC Port Reachability (CSV)"
         }
         if ($FirewallResults.Count -gt 0) {
             $FirewallResults | Export-Csv -Path $fwPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
             Write-Success "  Firewall audit CSV: $fwPath"
+            Add-WSTTManifestEntry -Path $fwPath -Description "WSFC Firewall Audit (CSV)"
         }
     }
     catch {
@@ -1968,7 +2157,7 @@ function Export-WSFCPortReportToHtml {
  $fwRowsHtml
  </table>
  <div class='footer'>
-  Generated by WSTT v3.0 - Test-WSFCClusterPortCompliance.<br>
+  Generated by WSTT v3.1 - Test-WSFCClusterPortCompliance.<br>
   Trojan-port overlap analysis and dynamic RPC range (49152-65535) are intentionally excluded from this report.
  </div>
 </body></html>
@@ -1978,6 +2167,7 @@ function Export-WSFCPortReportToHtml {
         $html | Out-File -FilePath $reportPath -Encoding UTF8 -ErrorAction Stop
         Write-Success "  HTML report: $reportPath"
         Write-Info "  File size: $([math]::Round((Get-Item $reportPath).Length / 1KB, 1)) KB"
+        Add-WSTTManifestEntry -Path $reportPath -Description "WSFC Port Compliance Report (HTML)"
         $open = Get-ValidatedChoice -Prompt "  Open report in browser? (Y/N, Enter=N)" -ValidChoices @("Y", "N") -AllowEmpty
         if ($open -eq "Y") { Start-Process $reportPath }
     }
@@ -9733,6 +9923,9 @@ function Show-AdditionalScenarios {
                     wevtutil epl Security $secEvtx
                     
                     Write-Success "Event logs exported to: $($exportPath)"
+                    Add-WSTTManifestEntry -Path $systemEvtx -Description "System Event Log (evtx)"
+                    Add-WSTTManifestEntry -Path $appEvtx -Description "Application Event Log (evtx)"
+                    Add-WSTTManifestEntry -Path $secEvtx -Description "Security Event Log (evtx)"
                 }
                 catch {
                     Write-DiagError "Failed to export event logs: $($_.Exception.Message)"
@@ -9748,6 +9941,810 @@ function Show-AdditionalScenarios {
         Write-Host "`nPress any key to continue..."
         $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     }
+}
+#endregion
+
+#region Shared Diagnostic Capture (v3.1)
+function Get-WSTTDiagnosticSections {
+    <#
+    .SYNOPSIS
+        Canonical list of primary diagnostic sections (Title + ScriptBlock).
+    .DESCRIPTION
+        Single source of truth reused by full HTML report generation, Collection Gaps
+        analysis, and Executive Report synthesis, so every feature that runs "all the checks"
+        runs an IDENTICAL set. Extracted from Export-HTMLReport, which used to define this
+        list inline.
+    #>
+    [CmdletBinding()]
+    param()
+    @(
+        @{ Title = "Server Baseline Validation"; Cmd = { Test-ServerBaseline } },
+        @{ Title = "Network Configuration"; Cmd = { Test-NetworkConfiguration } },
+        @{ Title = "Memory Usage Analysis"; Cmd = { Test-MemoryUsage } },
+        @{ Title = "CPU Usage Analysis"; Cmd = { Test-CPUUsage } },
+        @{ Title = "Disk Performance Analysis"; Cmd = { Test-DiskPerformance } },
+        @{ Title = "Windows Services Health"; Cmd = { Test-ServicesHealth } },
+        @{ Title = "Event Log Analysis"; Cmd = { Test-EventLogHealth } },
+        @{ Title = "DNS Health"; Cmd = { Test-DNSHealth } },
+        @{ Title = "Security & Authentication"; Cmd = { Test-SecurityAuthentication } },
+        @{ Title = "Windows Update Status"; Cmd = { Test-WindowsUpdateStatus } },
+        @{ Title = "TLS Configuration"; Cmd = { Test-TLSConfiguration } },
+        @{ Title = "Task Scheduler Diagnostics"; Cmd = { Test-TaskSchedulerHealth } },
+        @{ Title = "Recent Server Changes (24h)"; Cmd = { Get-RecentServerChange -Hours 24 } },
+        @{ Title = "Cross-Category Scorecard"; Cmd = { Test-CrossCategoryHealth } },
+        @{ Title = "Known Issues Tracker"; Cmd = { Test-KnownIssue -DaysBack 7 } }
+    )
+}
+
+function Invoke-WSTTDiagnosticCapture {
+    <#
+    .SYNOPSIS
+        Runs a set of diagnostic sections, capturing all output streams as text (v3.1).
+    .DESCRIPTION
+        Shared capture layer reused by Export-HTMLReport, Get-WSTTCollectionGap,
+        Export-ExecutiveReport, and Guided Scenario mode - runs each section's ScriptBlock
+        exactly once via '*>&1 | Out-String' (console-only functions elsewhere in this file are
+        captured this way by design) and returns a plain object per section so callers can
+        post-process without re-running potentially-slow diagnostics a second time.
+    .PARAMETER Sections
+        Array of @{ Title; Cmd } hashtables. Defaults to Get-WSTTDiagnosticSections.
+    .PARAMETER Quiet
+        Suppress the "[n/N] Running..." progress line.
+    #>
+    [CmdletBinding()]
+    param(
+        [array]$Sections = (Get-WSTTDiagnosticSections),
+        [switch]$Quiet
+    )
+    $index = 0
+    foreach ($section in $Sections) {
+        $index++
+        if (-not $Quiet) { Write-Info "  [$index/$($Sections.Count)] $($section.Title)..." }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $sectionOutput = & $section.Cmd *>&1 | Out-String
+        $sw.Stop()
+        [pscustomobject]@{
+            Title      = $section.Title
+            Output     = $sectionOutput
+            DurationMs = $sw.ElapsedMilliseconds
+        }
+    }
+}
+
+function Write-WSTTCapturedOutput {
+    <#
+    .SYNOPSIS
+        Replays previously-captured diagnostic output to the console with equivalent coloring.
+    .DESCRIPTION
+        Write-Host color is a terminal-rendering property, not part of the text captured by
+        '*>&1 | Out-String' - so simply Write-Host'ing captured text back would lose it. This
+        re-dispatches each line based on the same [SUCCESS]/[ERROR]/WARNING:/[INFO] tag
+        convention used throughout WSTT, restoring near-identical colors WITHOUT re-running the
+        (potentially slow) diagnostic a second time. Used by Guided Scenario mode (v3.1).
+    .PARAMETER Text
+        Captured output (e.g. Invoke-WSTTDiagnosticCapture's .Output property).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+    )
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($line -match '^\[SUCCESS\]\s*(.*)') { Write-Host "[SUCCESS] $($Matches[1])" -ForegroundColor Green }
+        elseif ($line -match '^\[ERROR\]\s*(.*)') { Write-Host "[ERROR] $($Matches[1])" -ForegroundColor Red }
+        elseif ($line -match '^(\s*)WARNING:\s*(.*)') { Write-Host "$($Matches[1])WARNING: $($Matches[2])" -ForegroundColor Yellow }
+        elseif ($line -match '^\[INFO\]\s*(.*)') { Write-Host "[INFO] $($Matches[1])" -ForegroundColor White }
+        else { Write-Host $line }
+    }
+}
+#endregion
+
+#region Collection Gaps Summary (v3.1)
+function Get-WSTTCollectionGap {
+    <#
+    .SYNOPSIS
+        Aggregates every "could not collect this" moment across all diagnostics into one
+        end-of-run checklist with a suggested fix command next to each.
+    .DESCRIPTION
+        Every failed check today prints its own "Could not query X" inline and gets lost in
+        scroll. This runs the same section set as the HTML report (Get-WSTTDiagnosticSections),
+        scans each section's captured output for known gap phrases (module missing, access
+        denied, feature not installed, command not recognized, etc.), and prints ONE
+        consolidated, numbered checklist instead.
+    .PARAMETER Sections
+        Optional subset of sections to scan. Defaults to the full Get-WSTTDiagnosticSections
+        set (can take a few minutes since it runs every primary diagnostic).
+    .EXAMPLE
+        Get-WSTTCollectionGap
+    #>
+    [CmdletBinding()]
+    param(
+        [array]$Sections = (Get-WSTTDiagnosticSections)
+    )
+
+    Write-Header "Collection Gaps Summary"
+    Write-Info "Running diagnostics and scanning for collection gaps (missing modules, access denied, features not installed)..."
+    Write-Info "This may take 2-5 minutes..."
+
+    # Ordered so the first matching pattern wins (most specific first).
+    $gapPatterns = [ordered]@{
+        'module .*not (?:found|installed|available)'    = 'Install the missing module, e.g. Install-Module <name> -Scope CurrentUser, or Install-WindowsFeature RSAT-<area>.'
+        'is not recognized as the name of a cmdlet'      = 'The referenced cmdlet/tool is not available on this host - install the module or feature that provides it.'
+        'access(?:ed)? denied|unauthorized'              = 'Re-run WSTT as Administrator, or grant the running account read access to the target resource.'
+        'skipped \(.*not installed\)'                    = 'Install the referenced Windows role/feature if this check applies to this server.'
+        'not installed'                                  = 'Install the referenced Windows feature/role or optional component.'
+        'not available'                                  = 'Confirm the referenced feature/service/module is installed and running on this host.'
+        'could not|couldn''t|cannot query|failed to query' = 'Check the error text on this line for the specific missing dependency or permission, then re-run elevated.'
+    }
+
+    $gapEntries = [System.Collections.Generic.List[pscustomobject]]::new()
+    $captured = Invoke-WSTTDiagnosticCapture -Sections $Sections
+    foreach ($result in $captured) {
+        $lines = $result.Output -split "`r?`n"
+        foreach ($line in $lines) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            foreach ($patternKey in $gapPatterns.Keys) {
+                if ($line -match "(?i)$patternKey") {
+                    $gapEntries.Add([pscustomobject]@{
+                            Section = $result.Title
+                            Message = $line.Trim()
+                            Fix     = $gapPatterns[$patternKey]
+                        })
+                    break
+                }
+            }
+        }
+    }
+
+    Write-Host ""
+    if ($gapEntries.Count -eq 0) {
+        Write-Success "No collection gaps detected - every check across $($captured.Count) section(s) ran cleanly."
+        return
+    }
+
+    Write-DiagWarning "$($gapEntries.Count) collection gap(s) found across $($captured.Count) section(s):"
+    Write-Host ""
+    $num = 0
+    foreach ($gap in ($gapEntries | Sort-Object Section)) {
+        $num++
+        Write-Host "  $num. [$($gap.Section)]" -ForegroundColor Yellow
+        Write-Info "     $($gap.Message)"
+        Write-Info "     Fix: $($gap.Fix)"
+    }
+    Write-Host ""
+    Write-Info "Tip: re-run the specific menu option after applying a fix to confirm the gap is closed."
+}
+#endregion
+
+#region Snapshot Save & Compare (v3.1)
+function Get-WSTTSnapshotData {
+    <#
+    .SYNOPSIS
+        Collects a lightweight point-in-time baseline of key server state for later comparison.
+    .DESCRIPTION
+        Captures service states, listening TCP ports, NIC/IP configuration, installed hotfixes,
+        and local Administrators membership - a direct before/after diff that complements the
+        heuristic, event-log-based change detection in Get-RecentServerChange.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $services = @(Get-Service -ErrorAction SilentlyContinue | Select-Object Name, Status, StartType)
+
+    $listeningPorts = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+            Select-Object LocalAddress, LocalPort, OwningProcess |
+            Sort-Object LocalPort -Unique)
+
+    $adapters = @(Get-NetAdapter -ErrorAction SilentlyContinue |
+            Select-Object Name, Status, LinkSpeed, MacAddress)
+
+    $ipConfig = @(Get-NetIPAddress -ErrorAction SilentlyContinue |
+            Where-Object { $_.AddressFamily -eq 'IPv4' } |
+            Select-Object InterfaceAlias, IPAddress, PrefixLength)
+
+    $hotfixes = @(Get-HotFix -ErrorAction SilentlyContinue | Select-Object HotFixID, InstalledOn)
+
+    $localAdmins = @(Get-WSTTLocalAdminMember)
+
+    [pscustomobject]@{
+        Timestamp      = Get-Date
+        ComputerName   = $env:COMPUTERNAME
+        Services       = $services
+        ListeningPorts = $listeningPorts
+        Adapters       = $adapters
+        IPConfig       = $ipConfig
+        Hotfixes       = $hotfixes
+        LocalAdmins    = $localAdmins
+    }
+}
+
+function Export-WSTTSnapshot {
+    <#
+    .SYNOPSIS
+        Serializes the current server state to a baseline snapshot file for future comparison.
+    .DESCRIPTION
+        Saves under $script:SnapshotPath, which is stable ACROSS runs (unlike the per-run
+        $script:DefaultLogPath), and prunes to the most recent 10 snapshots so disk usage stays
+        bounded.
+    .OUTPUTS
+        The path to the saved snapshot file, or $null on failure.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if (-not (Test-PathValid -Path $script:SnapshotPath -CreateIfNotExist)) {
+        Write-DiagError "Cannot create snapshot directory"
+        return $null
+    }
+
+    try {
+        $data = Get-WSTTSnapshotData
+        $fileName = "Snapshot_$(Get-Date -Format 'yyyyMMdd_HHmmss').xml"
+        $filePath = Join-Path $script:SnapshotPath $fileName
+        $data | Export-Clixml -Path $filePath -ErrorAction Stop
+        Write-Success "Snapshot saved: $filePath"
+        Add-WSTTManifestEntry -Path $filePath -Description "Server State Snapshot (baseline)"
+
+        # Prune to the most recent 10 snapshots so this doesn't grow unbounded.
+        $allSnapshots = @(Get-ChildItem -Path $script:SnapshotPath -Filter 'Snapshot_*.xml' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+        if ($allSnapshots.Count -gt 10) {
+            $allSnapshots | Select-Object -Skip 10 | ForEach-Object {
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+        return $filePath
+    }
+    catch {
+        Write-DiagError "Failed to save snapshot: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Compare-WSTTSnapshot {
+    <#
+    .SYNOPSIS
+        Compares the two most recent saved snapshots and reports what changed.
+    .DESCRIPTION
+        A true before/after diff (services, listening ports, adapters, IPs, hotfixes, local
+        Administrators) - more precise than the event-log/registry-LastWriteTime heuristics in
+        Get-RecentServerChange, and complements them well.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Header "Snapshot Comparison"
+
+    if (-not (Test-Path $script:SnapshotPath)) {
+        Write-Info "No snapshot folder yet - nothing to compare. Save a snapshot first."
+        return
+    }
+
+    $snapshots = @(Get-ChildItem -Path $script:SnapshotPath -Filter 'Snapshot_*.xml' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    if ($snapshots.Count -lt 2) {
+        Write-Info "Need at least 2 saved snapshots to compare (found $($snapshots.Count)). Save one now and again on your next run."
+        return
+    }
+
+    try {
+        $current = Import-Clixml -Path $snapshots[0].FullName -ErrorAction Stop
+        $previous = Import-Clixml -Path $snapshots[1].FullName -ErrorAction Stop
+    }
+    catch {
+        Write-DiagError "Failed to load snapshots for comparison: $($_.Exception.Message)"
+        return
+    }
+
+    Write-Info "Comparing $($snapshots[1].Name) ($($previous.Timestamp)) -> $($snapshots[0].Name) ($($current.Timestamp))"
+
+    Write-Section "Service Changes"
+    $prevSvc = @{}; foreach ($s in $previous.Services) { $prevSvc[$s.Name] = $s }
+    $curSvc = @{}; foreach ($s in $current.Services) { $curSvc[$s.Name] = $s }
+    $svcChanges = 0
+    foreach ($name in $curSvc.Keys) {
+        if (-not $prevSvc.ContainsKey($name)) {
+            Write-DiagWarning "  NEW service: $name ($($curSvc[$name].Status)/$($curSvc[$name].StartType))"
+            $svcChanges++
+        }
+        elseif ($prevSvc[$name].Status -ne $curSvc[$name].Status -or $prevSvc[$name].StartType -ne $curSvc[$name].StartType) {
+            Write-DiagWarning "  CHANGED: $name  $($prevSvc[$name].Status)/$($prevSvc[$name].StartType) -> $($curSvc[$name].Status)/$($curSvc[$name].StartType)"
+            $svcChanges++
+        }
+    }
+    foreach ($name in $prevSvc.Keys) {
+        if (-not $curSvc.ContainsKey($name)) {
+            Write-DiagWarning "  REMOVED service: $name"
+            $svcChanges++
+        }
+    }
+    if ($svcChanges -eq 0) { Write-Success "  No service changes" }
+
+    Write-Section "Listening Port Changes"
+    $prevPorts = @($previous.ListeningPorts | ForEach-Object { $_.LocalPort }) | Select-Object -Unique
+    $curPorts = @($current.ListeningPorts | ForEach-Object { $_.LocalPort }) | Select-Object -Unique
+    $newPorts = @($curPorts | Where-Object { $_ -notin $prevPorts })
+    $closedPorts = @($prevPorts | Where-Object { $_ -notin $curPorts })
+    if ($newPorts.Count -gt 0) { Write-DiagWarning "  NEW listening port(s): $($newPorts -join ', ')" }
+    if ($closedPorts.Count -gt 0) { Write-DiagWarning "  No longer listening: $($closedPorts -join ', ')" }
+    if ($newPorts.Count -eq 0 -and $closedPorts.Count -eq 0) { Write-Success "  No listening-port changes" }
+
+    Write-Section "Network Adapter Changes"
+    $prevAd = @{}; foreach ($a in $previous.Adapters) { $prevAd[$a.Name] = $a }
+    $adChanges = 0
+    foreach ($a in $current.Adapters) {
+        if ($prevAd.ContainsKey($a.Name)) {
+            if ($prevAd[$a.Name].Status -ne $a.Status -or $prevAd[$a.Name].LinkSpeed -ne $a.LinkSpeed) {
+                Write-DiagWarning "  CHANGED: $($a.Name)  $($prevAd[$a.Name].Status)/$($prevAd[$a.Name].LinkSpeed) -> $($a.Status)/$($a.LinkSpeed)"
+                $adChanges++
+            }
+        }
+        else {
+            Write-DiagWarning "  NEW adapter: $($a.Name)"
+            $adChanges++
+        }
+    }
+    if ($adChanges -eq 0) { Write-Success "  No adapter changes" }
+
+    Write-Section "IP Address Changes"
+    $prevIps = @($previous.IPConfig | ForEach-Object { "$($_.InterfaceAlias)|$($_.IPAddress)" })
+    $curIps = @($current.IPConfig | ForEach-Object { "$($_.InterfaceAlias)|$($_.IPAddress)" })
+    $newIps = @($curIps | Where-Object { $_ -notin $prevIps })
+    $removedIps = @($prevIps | Where-Object { $_ -notin $curIps })
+    if ($newIps.Count -gt 0) { Write-DiagWarning "  NEW IP(s): $($newIps -join ', ')" }
+    if ($removedIps.Count -gt 0) { Write-DiagWarning "  REMOVED IP(s): $($removedIps -join ', ')" }
+    if ($newIps.Count -eq 0 -and $removedIps.Count -eq 0) { Write-Success "  No IP address changes" }
+
+    Write-Section "Newly Installed Hotfixes"
+    $prevKb = @($previous.Hotfixes | ForEach-Object { $_.HotFixID })
+    $newKb = @($current.Hotfixes | Where-Object { $_.HotFixID -notin $prevKb })
+    if ($newKb.Count -gt 0) {
+        Write-DiagWarning "  $($newKb.Count) new hotfix(es):"
+        foreach ($kb in $newKb) { Write-Info "    $($kb.HotFixID)  $($kb.InstalledOn)" }
+    }
+    else { Write-Success "  No new hotfixes since previous snapshot" }
+
+    Write-Section "Local Administrators Group Changes"
+    $addedAdmins = @($current.LocalAdmins | Where-Object { $_ -notin @($previous.LocalAdmins) })
+    $removedAdmins = @(@($previous.LocalAdmins) | Where-Object { $_ -notin @($current.LocalAdmins) })
+    if ($addedAdmins.Count -gt 0) { Write-DiagWarning "  ADDED to Administrators: $($addedAdmins -join ', ')" }
+    if ($removedAdmins.Count -gt 0) { Write-DiagWarning "  REMOVED from Administrators: $($removedAdmins -join ', ')" }
+    if ($addedAdmins.Count -eq 0 -and $removedAdmins.Count -eq 0) { Write-Success "  No local Administrators membership changes" }
+
+    Write-Host ""
+    Write-Info "This is a direct before/after diff of the two most recent snapshots (not event-log based)."
+}
+
+function Invoke-WSTTSnapshotWorkflow {
+    <#
+    .SYNOPSIS
+        Interactive entry point: offers to compare against the previous snapshot, then saves a
+        new one for next time.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Header "Server State Snapshot"
+    $existing = @(Get-ChildItem -Path $script:SnapshotPath -Filter 'Snapshot_*.xml' -ErrorAction SilentlyContinue)
+    if ($existing.Count -gt 0) {
+        $latest = $existing | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        $compareChoice = Get-ValidatedChoice -Prompt "Compare to previous snapshot from $($latest.LastWriteTime)? (Y/N)" -ValidChoices @("Y", "N")
+        if ($compareChoice -eq "Y") {
+            Compare-WSTTSnapshot
+            Write-Host ""
+        }
+    }
+    else {
+        Write-Info "No previous snapshot found - this will be your first baseline."
+    }
+
+    $saveChoice = Get-ValidatedChoice -Prompt "Save current server state as a new snapshot? (Y/N, Enter=Y)" -ValidChoices @("Y", "N") -AllowEmpty
+    if ($saveChoice -ne "N") {
+        Export-WSTTSnapshot | Out-Null
+    }
+}
+#endregion
+
+#region Executive Report Synthesis (v3.1)
+function Export-ExecutiveReport {
+    <#
+    .SYNOPSIS
+        Synthesizes a one-page executive verdict from the same diagnostics the HTML report runs.
+    .DESCRIPTION
+        Export-HTMLReport concatenates all sections' raw text. This produces a SYNTHESIZED
+        verdict on top of the exact same data: a 3-5 bullet executive summary, the top 3
+        findings with a confidence rating (HIGH/MEDIUM/LOW), and an ordered action list -
+        readable in about 30 seconds instead of scrolling 15 collapsible sections.
+    .PARAMETER Sections
+        Optional subset of sections. Defaults to the full Get-WSTTDiagnosticSections set (can
+        take a few minutes since it runs every primary diagnostic).
+    .EXAMPLE
+        Export-ExecutiveReport
+    #>
+    [CmdletBinding()]
+    param(
+        [array]$Sections = (Get-WSTTDiagnosticSections)
+    )
+
+    Write-Header "Executive Report"
+    Write-Info "Running diagnostics and synthesizing a one-page verdict..."
+    Write-Info "This may take 2-5 minutes..."
+
+    $captured = Invoke-WSTTDiagnosticCapture -Sections $Sections
+    $reportLines = [System.Collections.Generic.List[string]]::new()
+    $reportLines.Add("=" * 65)
+    $reportLines.Add("WSTT Executive Report - $env:COMPUTERNAME")
+    $reportLines.Add("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    $reportLines.Add("=" * 65)
+
+    # Text-mine the captured output using the same [SUCCESS]/[ERROR]/WARNING:/[INFO] tag
+    # convention used throughout WSTT (reuses ConvertTo-WSTTStructuredFinding, the same parser
+    # Export-DiagnosticSection's JSON sidecar relies on, instead of a third hand-rolled regex pass).
+    $findings = [System.Collections.Generic.List[pscustomobject]]::new()
+    $sectionCounts = [System.Collections.Generic.List[pscustomobject]]::new()
+    foreach ($result in $captured) {
+        $parsed = @(ConvertTo-WSTTStructuredFinding -Text $result.Output | Where-Object { $_.Severity -in @('Error', 'Warning') })
+        foreach ($p in $parsed) {
+            # Reuse the existing [LOW-confidence signal] marker (Add-ChangeRegistrySignal) when
+            # present; otherwise a warning is treated as MEDIUM confidence (v3.1 confidence tagging).
+            $confidence = if ($p.Severity -eq 'Error') { 'HIGH' } elseif ($p.Message -match '\[LOW-confidence signal\]') { 'LOW' } else { 'MEDIUM' }
+            $findings.Add([pscustomobject]@{ Section = $result.Title; Severity = $p.Severity.ToUpper(); Confidence = $confidence; Text = $p.Message })
+        }
+        $sectionCounts.Add([pscustomobject]@{
+                Section  = $result.Title
+                Errors   = @($parsed | Where-Object { $_.Severity -eq 'Error' }).Count
+                Warnings = @($parsed | Where-Object { $_.Severity -eq 'Warning' }).Count
+            })
+    }
+
+    # A. Executive Summary (3-5 bullets)
+    Write-Section "Executive Summary"
+    $reportLines.Add(""); $reportLines.Add("--- Executive Summary ---")
+    $topSections = @($sectionCounts | Where-Object { $_.Errors -gt 0 -or $_.Warnings -gt 0 } |
+            Sort-Object -Property @{Expression = 'Errors'; Descending = $true }, @{Expression = 'Warnings'; Descending = $true } |
+            Select-Object -First 5)
+    if ($topSections.Count -eq 0) {
+        Write-Success "  All $($captured.Count) section(s) came back clean - no errors or warnings detected."
+        $reportLines.Add("All $($captured.Count) section(s) came back clean - no errors or warnings detected.")
+    }
+    else {
+        foreach ($ts in $topSections) {
+            $line = "{0}: {1} error(s), {2} warning(s)" -f $ts.Section, $ts.Errors, $ts.Warnings
+            if ($ts.Errors -gt 0) { Write-DiagError "  $line" } else { Write-DiagWarning "  $line" }
+            $reportLines.Add("- $line")
+        }
+    }
+
+    # B. Top 3 findings with confidence (deduped, HIGH first)
+    Write-Section "Top Findings (confidence-rated)"
+    $reportLines.Add(""); $reportLines.Add("--- Top Findings (confidence-rated) ---")
+    $rankOrder = @{ 'HIGH' = 0; 'MEDIUM' = 1; 'LOW' = 2 }
+    $seenText = [System.Collections.Generic.HashSet[string]]::new()
+    $topFindings = [System.Collections.Generic.List[pscustomobject]]::new()
+    foreach ($f in ($findings | Sort-Object -Property @{ Expression = { $rankOrder[$_.Confidence] } })) {
+        $key = $f.Text.Trim()
+        if ($seenText.Contains($key)) { continue }
+        [void]$seenText.Add($key)
+        $topFindings.Add($f)
+        if ($topFindings.Count -ge 3) { break }
+    }
+    if ($topFindings.Count -eq 0) {
+        Write-Success "  No warning/error findings to rank."
+        $reportLines.Add("No warning/error findings to rank.")
+    }
+    else {
+        $rank = 0
+        foreach ($tf in $topFindings) {
+            $rank++
+            Write-Host ("  {0}. [{1} confidence] ({2})" -f $rank, $tf.Confidence, $tf.Section) -ForegroundColor Cyan
+            Write-Info "     $($tf.Text)"
+            $reportLines.Add("$rank. [$($tf.Confidence) confidence] ($($tf.Section)) $($tf.Text)")
+        }
+    }
+
+    # C. Ordered action list
+    Write-Section "Recommended Actions (in order)"
+    $reportLines.Add(""); $reportLines.Add("--- Recommended Actions (in order) ---")
+    if ($topFindings.Count -eq 0) {
+        Write-Success "  No immediate action required based on this pass."
+        $reportLines.Add("No immediate action required based on this pass.")
+    }
+    else {
+        $sectionOptionMap = @{
+            'Server Baseline Validation'   = '20'; 'Network Configuration' = '1'; 'Memory Usage Analysis' = '2'
+            'CPU Usage Analysis'           = '3'; 'Disk Performance Analysis' = '4'; 'Windows Services Health' = '5'
+            'Event Log Analysis'           = '6'; 'DNS Health' = '7'; 'Security & Authentication' = '8'
+            'Windows Update Status'        = '9'; 'TLS Configuration' = '13'; 'Task Scheduler Diagnostics' = '19'
+            'Recent Server Changes (24h)'  = '23'; 'Cross-Category Scorecard' = '10'; 'Known Issues Tracker' = '24'
+        }
+        $actionNum = 0
+        foreach ($tf in $topFindings) {
+            $actionNum++
+            $optNum = $sectionOptionMap[$tf.Section]
+            $pointer = if ($optNum) { "Run main-menu option $optNum ($($tf.Section)) for the deep-dive." } else { "Review the $($tf.Section) section for detail." }
+            Write-Host ("  {0}. {1}" -f $actionNum, $pointer) -ForegroundColor White
+            $reportLines.Add("$actionNum. $pointer")
+        }
+    }
+
+    Write-Host ""
+    Write-Info "Full detail for every section is available via the HTML Diagnostic Report (menu option 21)."
+
+    $saveChoice = Get-ValidatedChoice -Prompt "Save this Executive Report to file? (Y/N)" -ValidChoices @("Y", "N")
+    if ($saveChoice -eq "Y") {
+        if (Test-PathValid -Path $script:DefaultLogPath -CreateIfNotExist) {
+            try {
+                $reportPath = Join-Path $script:DefaultLogPath "ExecutiveReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+                $reportText = Protect-DiagReport -ReportText ($reportLines -join "`n")
+                $reportText | Out-File -FilePath $reportPath -Encoding UTF8 -ErrorAction Stop
+                Write-Success "Executive Report saved to: $reportPath"
+                Add-WSTTManifestEntry -Path $reportPath -Description "Executive Report (text)"
+            }
+            catch {
+                Write-DiagError "Failed to save Executive Report: $($_.Exception.Message)"
+            }
+        }
+    }
+}
+#endregion
+
+#region Guided Scenario Mode (v3.1)
+function Get-WSTTGuidedScenarioCatalog {
+    <#
+    .SYNOPSIS
+        Maps a symptom description to an ordered set of EXISTING diagnostics to run.
+    .DESCRIPTION
+        Pure orchestration over Test-*/Get-* functions that already exist elsewhere in this
+        file - no new checks. Mirrors Doctors-CLI's Playbooks/*.md symptom-to-specialty
+        dispatch sequence, built entirely over WSTT's own checks.
+    #>
+    [CmdletBinding()]
+    param()
+    @(
+        [pscustomobject]@{
+            Id    = 1
+            Name  = "Server feels slow / high resource usage"
+            Steps = @(
+                @{ Title = "CPU"; Cmd = { Test-CPUUsage } },
+                @{ Title = "Memory"; Cmd = { Test-MemoryUsage } },
+                @{ Title = "Disk"; Cmd = { Test-DiskPerformance } },
+                @{ Title = "Cross-Category Scorecard"; Cmd = { Test-CrossCategoryHealth } }
+            )
+        }
+        [pscustomobject]@{
+            Id    = 2
+            Name  = "Cluster / failover issue"
+            Steps = @(
+                @{ Title = "Cluster / SQL AG Environment"; Cmd = { Get-ClusterEnvironmentInfo | Format-List | Out-String } },
+                @{ Title = "WSFC Cluster Port Compliance"; Cmd = { Test-WSFCClusterPortCompliance } },
+                @{ Title = "Disk"; Cmd = { Test-DiskPerformance } },
+                @{ Title = "Event Log"; Cmd = { Test-EventLogHealth } },
+                @{ Title = "Known Cluster Issues"; Cmd = { Test-KnownIssue -Category 'Cluster' } }
+            )
+        }
+        [pscustomobject]@{
+            Id    = 3
+            Name  = "Can't connect / network issue"
+            Steps = @(
+                @{ Title = "Network Configuration"; Cmd = { Test-NetworkConfiguration } },
+                @{ Title = "DNS Health"; Cmd = { Test-DNSHealth } },
+                @{ Title = "Security & Authentication (RDP/ports)"; Cmd = { Test-SecurityAuthentication } },
+                @{ Title = "Cross-Category Scorecard"; Cmd = { Test-CrossCategoryHealth } }
+            )
+        }
+        [pscustomobject]@{
+            Id    = 4
+            Name  = "Disk or storage errors"
+            Steps = @(
+                @{ Title = "Disk Performance"; Cmd = { Test-DiskPerformance } },
+                @{ Title = "Event Log"; Cmd = { Test-EventLogHealth } },
+                @{ Title = "Crash Dump Readiness"; Cmd = { Test-CrashDumpReadiness } },
+                @{ Title = "Cross-Category Scorecard"; Cmd = { Test-CrossCategoryHealth } }
+            )
+        }
+        [pscustomobject]@{
+            Id    = 5
+            Name  = "Authentication / logon failures"
+            Steps = @(
+                @{ Title = "Security & Authentication"; Cmd = { Test-SecurityAuthentication } },
+                @{ Title = "DNS Health"; Cmd = { Test-DNSHealth } },
+                @{ Title = "Event Log"; Cmd = { Test-EventLogHealth } }
+            )
+        }
+        [pscustomobject]@{
+            Id    = 6
+            Name  = "Windows Update / patching stuck"
+            Steps = @(
+                @{ Title = "Windows Update Status"; Cmd = { Test-WindowsUpdateStatus } },
+                @{ Title = "Task Scheduler"; Cmd = { Test-TaskSchedulerHealth } },
+                @{ Title = "Event Log"; Cmd = { Test-EventLogHealth } }
+            )
+        }
+        [pscustomobject]@{
+            Id    = 7
+            Name  = "Not sure - run full triage"
+            Steps = @(
+                @{ Title = "Cross-Category Scorecard"; Cmd = { Test-CrossCategoryHealth } },
+                @{ Title = "Known Issues Tracker"; Cmd = { Test-KnownIssue -DaysBack 7 } },
+                @{ Title = "Recent Server Changes (24h)"; Cmd = { Get-RecentServerChange -Hours 24 } }
+            )
+        }
+    )
+}
+
+function Start-GuidedScenario {
+    <#
+    .SYNOPSIS
+        Symptom-driven orchestration: pick "what's wrong" instead of a diagnostic number.
+    .DESCRIPTION
+        Maps a symptom to a fixed, ordered subset of EXISTING Test-*/Get-* diagnostics (no new
+        checks), runs them, and prints one combined verdict. Captures each step's output once
+        (Write-WSTTCapturedOutput replays it live with equivalent coloring) so the same pass
+        both displays results AND feeds the end-of-scenario error/warning tally.
+    .EXAMPLE
+        Start-GuidedScenario
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Header "Guided Scenario Mode - What's Wrong?"
+    $catalog = Get-WSTTGuidedScenarioCatalog
+    Write-Host ""
+    foreach ($scenario in $catalog) {
+        Write-Host "  $($scenario.Id). $($scenario.Name)" -ForegroundColor Yellow
+    }
+    Write-Host "  0. Return to Main Menu" -ForegroundColor Yellow
+
+    $validIds = @('0') + @($catalog | ForEach-Object { "$($_.Id)" })
+    $choice = Get-ValidatedChoice -Prompt "`nWhat's wrong? (0-$($catalog.Count))" -ValidChoices $validIds
+    if ($choice -eq '0') { return }
+
+    $scenario = $catalog | Where-Object { "$($_.Id)" -eq $choice } | Select-Object -First 1
+    Write-Host ""
+    Write-Info "Running: $($scenario.Name) ($($scenario.Steps.Count) step(s))..."
+
+    $totalErrors = 0
+    $totalWarnings = 0
+    foreach ($step in $scenario.Steps) {
+        Write-Section $step.Title
+        $output = & $step.Cmd *>&1 | Out-String
+        Write-WSTTCapturedOutput -Text $output
+        $totalErrors += @([regex]::Matches($output, '(?m)^\[ERROR\]')).Count
+        $totalWarnings += @([regex]::Matches($output, '(?m)^\s*WARNING:')).Count
+    }
+
+    Write-Host ""
+    Write-Section "Guided Scenario Verdict"
+    if ($totalErrors -eq 0 -and $totalWarnings -eq 0) {
+        Write-Success "No errors or warnings found across $($scenario.Steps.Count) check(s) for '$($scenario.Name)'."
+        Write-Info "This scenario is likely NOT the cause - consider a different symptom, or run the Executive Report for a broader pass."
+    }
+    else {
+        Write-DiagWarning "$totalErrors error(s), $totalWarnings warning(s) found across $($scenario.Steps.Count) check(s) for '$($scenario.Name)'."
+        Write-Info "Review the flagged section(s) above, or re-run the individual main-menu diagnostic for full detail."
+    }
+}
+#endregion
+
+#region Root-Cause Correlator (v3.1)
+function Find-WSTTCorrelatedEvent {
+    <#
+    .SYNOPSIS
+        Groups recent change signals into likely causal chains by time-window proximity.
+    .DESCRIPTION
+        Test-CrossCategoryHealth flags issue AREAS independently and never correlates them. This
+        reuses the SAME evidence Get-RecentServerChange already collects (category/time/detail
+        change signals) and groups anything landing within a rolling time window across 2+
+        DISTINCT categories into one "likely chain" instead of N unrelated issues, printing
+        FOR/AGAINST evidence and a confidence rating. A small table of known causal adjacencies
+        (e.g. Storage -> Cluster, the classic "storage reset -> CSV pause -> heartbeat loss"
+        chain) upgrades a cluster's confidence to HIGH when it matches a documented pattern;
+        otherwise clusters are reported at MEDIUM confidence ("correlated, not necessarily
+        causal"). Does not require snapshot history - works on a single pass.
+    .PARAMETER Hours
+        Lookback window in hours passed to Get-RecentServerChange. Default 24.
+    .PARAMETER WindowMinutes
+        Maximum gap between consecutive events for them to be considered part of the same
+        chain. Default 10.
+    .EXAMPLE
+        Find-WSTTCorrelatedEvent
+    .EXAMPLE
+        Find-WSTTCorrelatedEvent -Hours 72 -WindowMinutes 15
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateRange(1, 720)]
+        [int]$Hours = 24,
+        [ValidateRange(1, 1440)]
+        [int]$WindowMinutes = 10
+    )
+
+    # Known causal adjacencies observed in real incidents. Category strings must match what
+    # Get-RecentServerChange/Add-ChangeEventSignal/Add-ChangeRegistrySignal actually record.
+    # Order-independent (matches either direction in a cluster); only used to upgrade
+    # confidence to HIGH - never to invent a chain that time-window grouping didn't already find.
+    $knownChains = @(
+        @{ From = 'Disk/Storage'; To = 'Cluster Config'; Label = 'Storage reset -> possible CSV pause -> cluster impact' }
+        @{ From = 'Reboot/Shutdown'; To = 'Service Change'; Label = 'Reboot/shutdown -> services renegotiating start order' }
+        @{ From = 'Windows Update'; To = 'Reboot/Shutdown'; Label = 'Patch install -> reboot' }
+        @{ From = 'Driver/PnP'; To = 'Disk/Storage'; Label = 'Driver change -> storage path instability' }
+        @{ From = 'TLS Certificate'; To = 'Terminal Server / RDP'; Label = 'Certificate change -> RDP/TLS handshake impact' }
+        @{ From = 'Cluster Config'; To = 'Disk/Storage'; Label = 'Cluster reconfiguration -> storage path impact' }
+    )
+
+    Write-Header "Root-Cause Correlator (time-window analysis, last $Hours h)"
+    Write-Info "Groups change signals from Get-RecentServerChange into likely causal chains when 2+"
+    Write-Info "different categories occur within a $WindowMinutes-minute window. Correlation is NOT"
+    Write-Info "proof of causation - use this to prioritize which deep-dive to run first."
+    Write-Host ""
+
+    $timeline = Get-RecentServerChange -Hours $Hours -PassThru
+    $events = @($timeline | Where-Object { $_.Time } | Sort-Object Time)
+
+    if ($events.Count -eq 0) {
+        Write-Success "No change signals in the last $Hours h - nothing to correlate."
+        return
+    }
+
+    # Sliding-window clustering: walk the sorted timeline, start a new cluster whenever the gap
+    # to the previous event exceeds WindowMinutes.
+    $clusters = [System.Collections.Generic.List[object]]::new()
+    $current = [System.Collections.Generic.List[object]]::new()
+    $current.Add($events[0])
+    for ($i = 1; $i -lt $events.Count; $i++) {
+        $gap = ($events[$i].Time - $current[$current.Count - 1].Time).TotalMinutes
+        if ($gap -le $WindowMinutes) {
+            $current.Add($events[$i])
+        }
+        else {
+            $clusters.Add(@($current))
+            $current = [System.Collections.Generic.List[object]]::new()
+            $current.Add($events[$i])
+        }
+    }
+    $clusters.Add(@($current))
+
+    # Only clusters spanning 2+ DISTINCT categories are a "chain" worth reporting.
+    $chains = @($clusters | Where-Object { @(($_ | Select-Object -ExpandProperty Category -Unique)).Count -ge 2 })
+
+    if ($chains.Count -eq 0) {
+        Write-Success "No multi-category correlated event clusters found within $WindowMinutes-minute windows."
+        Write-Info "Every change signal in the window appears to be an isolated, single-category event."
+        return
+    }
+
+    Write-DiagWarning "$($chains.Count) likely correlated chain(s) found:"
+    $chainNum = 0
+    foreach ($chain in $chains) {
+        $chainNum++
+        $sorted = @($chain | Sort-Object Time)
+        $categories = @($sorted | Select-Object -ExpandProperty Category -Unique)
+        $startTime = $sorted[0].Time
+        $endTime = $sorted[$sorted.Count - 1].Time
+        $spanMinutes = [math]::Round(($endTime - $startTime).TotalMinutes, 1)
+
+        # Check against known causal adjacencies (either direction) to upgrade confidence.
+        $matchedKnown = $null
+        foreach ($kc in $knownChains) {
+            if ($categories -contains $kc.From -and $categories -contains $kc.To) {
+                $matchedKnown = $kc
+                break
+            }
+        }
+        $confidence = if ($matchedKnown) { 'HIGH' } else { 'MEDIUM' }
+        $chainLabel = if ($matchedKnown) { $matchedKnown.Label } else { ($categories -join ' <-> ') }
+
+        Write-Host ""
+        Write-DiagWarning "  Chain $chainNum [$confidence confidence]: $chainLabel"
+        Write-Info "    FOR:     $($sorted.Count) events across $($categories.Count) categories within $spanMinutes min ($($startTime.ToString('yyyy-MM-dd HH:mm:ss')) -> $($endTime.ToString('yyyy-MM-dd HH:mm:ss')))"
+        if ($matchedKnown) {
+            Write-Info "             Matches a documented causal pattern: $($matchedKnown.From) -> $($matchedKnown.To)"
+        }
+        Write-Info "    AGAINST: Time proximity does not prove causation - categories may be coincidental. Confirm with the relevant deep-dive diagnostic before acting."
+        foreach ($e in $sorted) {
+            Write-Info ("      {0:yyyy-MM-dd HH:mm:ss}  [{1}]  {2} - {3}" -f $e.Time, $e.Category, $e.Source, $e.Detail)
+        }
+    }
+
+    Write-Host ""
+    Write-Info "Tip: increase -WindowMinutes to catch slower-unfolding chains, or decrease it to reduce coincidental grouping."
 }
 #endregion
 
@@ -10140,8 +11137,10 @@ Computer: $($env:COMPUTERNAME)
             $report += "Could not retrieve cipher suites`n"
         }
         
+        $report = Protect-DiagReport -ReportText $report
         $report | Out-File -FilePath $reportPath -Encoding UTF8 -ErrorAction Stop
         Write-Success "TLS Report generated: $($reportPath)"
+        Add-WSTTManifestEntry -Path $reportPath -Description "TLS Configuration Report"
         
         $open = Get-ValidatedChoice -Prompt "Open report? (Y/N)" -ValidChoices @("Y", "N")
         if ($open -eq "Y") {
@@ -10158,6 +11157,42 @@ Computer: $($env:COMPUTERNAME)
     }
 }
 
+function ConvertTo-WSTTStructuredFinding {
+    <#
+    .SYNOPSIS
+        Parses tag-prefixed diagnostic text into structured Severity/Message records (v3.1).
+    .DESCRIPTION
+        WSTT's console-only Test-* functions use a consistent [SUCCESS]/[ERROR]/WARNING:/[INFO]
+        text-tag convention (the same one Export-HTMLReport already relies on for colorizing).
+        This turns that tagged text into flat records so results can be piped into Excel/Power
+        BI or your own trend charts, without scraping colored console text. Untagged lines
+        (section dividers, banners) are skipped - only actual findings are returned.
+    .PARAMETER Text
+        Captured diagnostic output (e.g. from Export-DiagnosticSection's ScriptBlock capture).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+    )
+    $lineNumber = 0
+    foreach ($line in ($Text -split "`r?`n")) {
+        $lineNumber++
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line -match '^\[SUCCESS\]\s*(.*)') {
+            [pscustomobject]@{ LineNumber = $lineNumber; Severity = 'Success'; Message = $Matches[1] }
+        }
+        elseif ($line -match '^\[ERROR\]\s*(.*)') {
+            [pscustomobject]@{ LineNumber = $lineNumber; Severity = 'Error'; Message = $Matches[1] }
+        }
+        elseif ($line -match '^\s*WARNING:\s*(.*)') {
+            [pscustomobject]@{ LineNumber = $lineNumber; Severity = 'Warning'; Message = $Matches[1] }
+        }
+        elseif ($line -match '^\[INFO\]\s*(.*)') {
+            [pscustomobject]@{ LineNumber = $lineNumber; Severity = 'Info'; Message = $Matches[1] }
+        }
+    }
+}
+
 function Export-DiagnosticSection {
     <#
     .SYNOPSIS
@@ -10166,10 +11201,16 @@ function Export-DiagnosticSection {
         Report title
     .PARAMETER ScriptBlock
         The diagnostic function to capture output from
+    .PARAMETER Format
+        Output format(s) to write: 'Text', 'Json'. Default 'Text','Json' (v3.1) - the JSON
+        sidecar is a flat array of Severity/Message records (ConvertTo-WSTTStructuredFinding)
+        so results can be piped into Excel/Power BI without scraping colored console text.
     #>
     param(
         [string]$Title,
-        [scriptblock]$ScriptBlock
+        [scriptblock]$ScriptBlock,
+        [ValidateSet('Text', 'Json')]
+        [string[]]$Format = @('Text', 'Json')
     )
     
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -10198,16 +11239,31 @@ function Export-DiagnosticSection {
             $report += $text
         }
         
-        $report | Out-File -FilePath $reportPath -Encoding UTF8 -ErrorAction Stop
-        Write-Success "Report saved to: $reportPath"
+        $reportText = Protect-DiagReport -ReportText ($report -join "`n")
+
+        if ($Format -contains 'Text') {
+            $reportText | Out-File -FilePath $reportPath -Encoding UTF8 -ErrorAction Stop
+            Write-Success "Report saved to: $reportPath"
+            Add-WSTTManifestEntry -Path $reportPath -Description "$Title (text)"
+        }
+
+        if ($Format -contains 'Json') {
+            $structured = @(ConvertTo-WSTTStructuredFinding -Text $reportText)
+            $jsonPath = Join-Path $script:DefaultLogPath "${safeTitle}_${timestamp}.json"
+            $structured | ConvertTo-Json -Depth 4 | Out-File -FilePath $jsonPath -Encoding UTF8 -ErrorAction Stop
+            Write-Success "Structured JSON saved to: $jsonPath"
+            Add-WSTTManifestEntry -Path $jsonPath -Description "$Title (JSON)"
+        }
         
-        $open = Get-ValidatedChoice -Prompt "Open report in Notepad? (Y/N)" -ValidChoices @("Y", "N")
-        if ($open -eq "Y") {
-            try {
-                notepad $reportPath
-            }
-            catch {
-                Write-DiagWarning "Could not open report. Navigate to: $reportPath"
+        if ($Format -contains 'Text') {
+            $open = Get-ValidatedChoice -Prompt "Open report in Notepad? (Y/N)" -ValidChoices @("Y", "N")
+            if ($open -eq "Y") {
+                try {
+                    notepad $reportPath
+                }
+                catch {
+                    Write-DiagWarning "Could not open report. Navigate to: $reportPath"
+                }
             }
         }
     }
@@ -10223,9 +11279,14 @@ function Export-SystemReport {
     .DESCRIPTION
         Creates a detailed text report with system information, resource usage,
         and configuration details
+    .PARAMETER RedactNetworkIdentifiers
+        Also redact IPv4/IPv6 addresses and SIDs from the saved report (v3.1). Off by default.
     .EXAMPLE
         Export-SystemReport
     #>
+    param(
+        [switch]$RedactNetworkIdentifiers
+    )
     Write-Header "Generating System Report"
     
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -10361,8 +11422,10 @@ Computer: $($env:COMPUTERNAME)
         }
         
         # Save report
+        $report = Protect-DiagReport -ReportText $report -RedactNetworkIdentifiers:$RedactNetworkIdentifiers
         $report | Out-File -FilePath $reportPath -Encoding UTF8 -ErrorAction Stop
         Write-Success "Report generated: $($reportPath)"
+        Add-WSTTManifestEntry -Path $reportPath -Description "System Report (text)"
         
         # Open report
         $open = Get-ValidatedChoice -Prompt "Open report? (Y/N)" -ValidChoices @("Y", "N")
@@ -11768,7 +12831,12 @@ function Export-HTMLReport {
         Generates a comprehensive HTML diagnostic report
     .DESCRIPTION
         Runs all diagnostic checks and produces a styled, collapsible HTML report
+    .PARAMETER RedactNetworkIdentifiers
+        Also redact IPv4/IPv6 addresses and SIDs from the saved report (v3.1). Off by default.
     #>
+    param(
+        [switch]$RedactNetworkIdentifiers
+    )
     Write-Header "Generating HTML Diagnostic Report"
 
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -11782,24 +12850,8 @@ function Export-HTMLReport {
     Write-Info "Running all diagnostics and capturing output..."
     Write-Info "This may take 2-5 minutes..."
 
-    # Capture output from all major diagnostic functions
-    $sections = @(
-        @{ Title = "Server Baseline Validation"; Cmd = { Test-ServerBaseline } },
-        @{ Title = "Network Configuration"; Cmd = { Test-NetworkConfiguration } },
-        @{ Title = "Memory Usage Analysis"; Cmd = { Test-MemoryUsage } },
-        @{ Title = "CPU Usage Analysis"; Cmd = { Test-CPUUsage } },
-        @{ Title = "Disk Performance Analysis"; Cmd = { Test-DiskPerformance } },
-        @{ Title = "Windows Services Health"; Cmd = { Test-ServicesHealth } },
-        @{ Title = "Event Log Analysis"; Cmd = { Test-EventLogHealth } },
-        @{ Title = "DNS Health"; Cmd = { Test-DNSHealth } },
-        @{ Title = "Security & Authentication"; Cmd = { Test-SecurityAuthentication } },
-        @{ Title = "Windows Update Status"; Cmd = { Test-WindowsUpdateStatus } },
-        @{ Title = "TLS Configuration"; Cmd = { Test-TLSConfiguration } },
-        @{ Title = "Task Scheduler Diagnostics"; Cmd = { Test-TaskSchedulerHealth } },
-        @{ Title = "Recent Server Changes (24h)"; Cmd = { Get-RecentServerChange -Hours 24 } },
-        @{ Title = "Cross-Category Scorecard"; Cmd = { Test-CrossCategoryHealth } },
-        @{ Title = "Known Issues Tracker"; Cmd = { Test-KnownIssue -DaysBack 7 } }
-    )
+    # Capture output from all major diagnostic functions (shared list, v3.1)
+    $sections = Get-WSTTDiagnosticSections
 
     # Build HTML
     $css = @"
@@ -11847,7 +12899,7 @@ $css
 <body>
 <h1>Server Diagnostic Report — $env:COMPUTERNAME</h1>
 <div class="meta">
-Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Tool: WSTT v3.0 | OS: $((Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption)
+Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Tool: WSTT v3.1 | OS: $((Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption)
 <span class="expand-all" onclick="toggleAll()">[Expand/Collapse All]</span>
 </div>
 <div class="meta" style="color:#9cdcfe;">
@@ -11856,16 +12908,13 @@ SCOM-aligned thresholds in effect: CPU $($CPU_WARNING_THRESHOLD)%, Memory $($MEM
 $js
 "@
 
+    $captured = Invoke-WSTTDiagnosticCapture -Sections $sections
     $sectionIndex = 0
-    foreach ($section in $sections) {
+    foreach ($result in $captured) {
         $sectionIndex++
-        Write-Info "  [$sectionIndex/$($sections.Count)] $($section.Title)..."
-
-        # Capture all output streams
-        $output = & $section.Cmd *>&1 | Out-String
 
         # Colorize the output for HTML
-        $htmlOutput = [System.Net.WebUtility]::HtmlEncode($output)
+        $htmlOutput = [System.Net.WebUtility]::HtmlEncode($result.Output)
         $htmlOutput = $htmlOutput -replace '\[SUCCESS\]', '<span class="success">[SUCCESS]</span>'
         $htmlOutput = $htmlOutput -replace '\[ERROR\]', '<span class="error">[ERROR]</span>'
         # Match WARNING: only at start of a line (after optional whitespace) so
@@ -11877,7 +12926,7 @@ $js
 
         $htmlBody += @"
 
-<h2 onclick="toggleSection('section$sectionIndex')">▸ $($section.Title)</h2>
+<h2 onclick="toggleSection('section$sectionIndex')">▸ $($result.Title)</h2>
 <div class="section" id="section$sectionIndex">
 <pre>$htmlOutput</pre>
 </div>
@@ -11891,9 +12940,11 @@ $js
 "@
 
     try {
+        $htmlBody = Protect-DiagReport -ReportText $htmlBody -RedactNetworkIdentifiers:$RedactNetworkIdentifiers
         $htmlBody | Out-File -FilePath $reportPath -Encoding UTF8 -ErrorAction Stop
         Write-Success "HTML Report generated: $reportPath"
         Write-Info "  File size: $([math]::Round((Get-Item $reportPath).Length / 1KB, 1)) KB"
+        Add-WSTTManifestEntry -Path $reportPath -Description "HTML Diagnostic Report"
 
         $open = Get-ValidatedChoice -Prompt "Open report in browser? (Y/N)" -ValidChoices @("Y", "N")
         if ($open -eq "Y") {
@@ -11998,7 +13049,7 @@ function Add-ChangeEventSignal {
         return
     }
 
-    Write-Success "  $($list.Count) '$Category' event(s) found"
+    Write-Success "  $($list.Count) '$Category' event(s) found [MEDIUM-confidence signal]"
     $shown = @($list | Sort-Object TimeCreated -Descending | Select-Object -First $ShowMax)
     foreach ($e in $shown) {
         $snippet = Get-EventSnippet -Event $e -MaxLength 120
@@ -12081,6 +13132,10 @@ function Get-RecentServerChange {
         the HTML report and the save-to-file flow.
     .PARAMETER Hours
         Lookback window in hours (1-720). Default 24.
+    .PARAMETER PassThru
+        Also return the internal timeline (List[pscustomobject] with Time/Category/Source/Detail)
+        so callers such as Find-WSTTCorrelatedEvent can do time-window correlation (v3.1).
+        Console output is unchanged either way.
     .EXAMPLE
         Get-RecentServerChange
     .EXAMPLE
@@ -12089,7 +13144,8 @@ function Get-RecentServerChange {
     [CmdletBinding()]
     param(
         [ValidateRange(1, 720)]
-        [int]$Hours = 24
+        [int]$Hours = 24,
+        [switch]$PassThru
     )
 
     Write-Header "Recent Server Changes (last $Hours h)"
@@ -12335,22 +13391,7 @@ function Get-RecentServerChange {
     # 20. Local Administrators group membership (snapshot + 4732/4733 correlation in Security section)
     Write-Section "Local Administrators (snapshot)"
     try {
-        $adminMembers = @()
-        if (Get-Command Get-LocalGroup -ErrorAction SilentlyContinue) {
-            $adminGrp = Get-LocalGroup -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue
-            if ($adminGrp) {
-                $adminMembers = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
-            }
-        }
-        if ($adminMembers.Count -eq 0) {
-            $adminGroupName = (Get-CimInstance Win32_Group -Filter "SID='S-1-5-32-544' AND LocalAccount=True" -ErrorAction SilentlyContinue).Name
-            if (-not $adminGroupName) { $adminGroupName = 'administrators' }
-            $netOut = @(& net localgroup $adminGroupName 2>$null)
-            $adminMembers = @($netOut | Where-Object {
-                    $_ -and $_.Trim() -ne '' -and
-                    $_ -notmatch '^(Alias name|Comment|Members|-{3,}|The command completed)'
-                } | ForEach-Object { $_.Trim() })
-        }
+        $adminMembers = @(Get-WSTTLocalAdminMember)
         if ($adminMembers.Count -gt 0) {
             Write-Info "  Administrators members (snapshot): $([string]::Join(', ', $adminMembers))"
             Write-Info "    Correlate add/remove with Security events 4732/4733 (see Security section)."
@@ -12724,6 +13765,8 @@ function Get-RecentServerChange {
 
     Write-Host ""
     Write-Info "Reminder: low-confidence registry signals indicate a key was modified, not which value changed. Correlate findings with the incident time before acting."
+
+    if ($PassThru) { return $timeline }
 }
 #endregion
 
@@ -13017,25 +14060,43 @@ function Test-KnownIssue {
         capture it via *>&1.
     .PARAMETER DaysBack
         Lookback window in days for event-based detections (1-365). Default 7.
+    .PARAMETER Category
+        Only run catalog entries whose Category matches one of these values (v3.1), e.g.
+        -Category 'Cluster'. Case-insensitive. Omit to run the whole catalog.
+    .PARAMETER AutoDrillDown
+        After the summary, prompt Y/N per HIT to immediately run its deep-dive diagnostic
+        (v3.1). Off by default - only pass this from a live interactive call; never pass it
+        from a captured/save-to-file re-invocation (Read-Host would block report generation).
     .EXAMPLE
         Test-KnownIssue
     .EXAMPLE
         Test-KnownIssue -DaysBack 30
+    .EXAMPLE
+        Test-KnownIssue -Category 'Cluster'
     #>
     [CmdletBinding()]
     param(
         [ValidateRange(1, 365)]
-        [int]$DaysBack = 7
+        [int]$DaysBack = 7,
+        [string[]]$Category,
+        [switch]$AutoDrillDown
     )
 
     Write-Header "Known Issues Tracker (last $DaysBack d)"
     Write-Info "Maps documented Windows Server issues to live on-box detection."
-    Write-Info "  HIT    = signature found in window      MANUAL = needs human judgement"
+    Write-Info "  HIT    = signature found in window (high-confidence match)     MANUAL = needs human judgement (medium-confidence)"
     Write-Info "  CLEAR  = not detected in window         SKIP   = not applicable to this host"
     Write-Info "Catalog is extensible - add rows in Get-KnownIssueCatalog. Use the cited WSTT option for the deep-dive."
     Write-Host ""
 
     $catalog = @(Get-KnownIssueCatalog)
+    if ($Category) {
+        $catalog = @($catalog | Where-Object { $_.Category -in $Category })
+    }
+    if ($Category -and $catalog.Count -eq 0) {
+        Write-DiagWarning "No catalog entries matched the requested Category filter."
+        return
+    }
     $counts = @{ Hit = 0; Clear = 0; Manual = 0; Skipped = 0; Error = 0 }
     $hits = [System.Collections.Generic.List[object]]::new()
 
@@ -13094,6 +14155,38 @@ function Test-KnownIssue {
         Write-Success "  No known-issue signatures detected in the lookback window."
     }
     Write-Info "Note: CLEAR means no signature in the window, not a guarantee of absence. Extend the catalog in Get-KnownIssueCatalog with your own issues."
+
+    if ($AutoDrillDown -and $counts.Hit -gt 0) {
+        Write-Host ""
+        Write-Section "Auto Drill-Down"
+        foreach ($h in $hits) {
+            $optNum = [regex]::Match("$($h.WSTTOption)", '\d+').Value
+            if (-not $optNum) { continue }
+            $run = Get-ValidatedChoice -Prompt "Run deep-dive diagnostic for '$($h.Title)' now? (WSTT option $optNum) (Y/N)" -ValidChoices @("Y", "N")
+            if ($run -eq "Y") {
+                Write-Host ""
+                # Inline dispatch scoped to the option numbers Get-KnownIssueCatalog actually cites
+                # in WSTTOption (replaces the old general-purpose Invoke-WSTTMenuOption, which had
+                # no other caller).
+                switch ($optNum) {
+                    "1" { Test-NetworkConfiguration }
+                    "2" { Test-MemoryUsage }
+                    "3" { Test-CPUUsage }
+                    "4" { Test-DiskPerformance }
+                    "5" { Test-ServicesHealth }
+                    "6" { Test-EventLogHealth }
+                    "8" { Test-SecurityAuthentication }
+                    "9" { Test-WindowsUpdateStatus }
+                    "19" { Test-TaskSchedulerHealth }
+                    "22" { Test-WSFCClusterPortCompliance }
+                    default {
+                        Write-DiagWarning "  No direct diagnostic mapping for menu option $optNum - open the main menu and select it manually."
+                    }
+                }
+                Write-Host ""
+            }
+        }
+    }
 }
 #endregion
 
@@ -13350,6 +14443,40 @@ function Test-CrashDumpReadiness {
         if ($cc.AutoReboot -eq 0) { Write-DiagWarning "    AutoReboot disabled - server will sit at a stop screen after BSOD." }
     }
     catch { Write-Info "  Could not read CrashControl config: $($_.Exception.Message)" }
+
+    # Existing dump files (v3.1): detection-only, no other tool required - flags anything
+    # already on disk so it isn't missed, separate from readiness for a FUTURE dump (above).
+    Write-Info "  Scanning for EXISTING dump files (separate from future-dump readiness above)..."
+    try {
+        $foundDumps = @()
+
+        $memoryDmp = Join-Path $env:SystemRoot 'MEMORY.DMP'
+        if (Test-Path -LiteralPath $memoryDmp) { $foundDumps += Get-Item -LiteralPath $memoryDmp }
+
+        $minidumpDir = Join-Path $env:SystemRoot 'Minidump'
+        if (Test-Path -LiteralPath $minidumpDir) {
+            $foundDumps += @(Get-ChildItem -LiteralPath $minidumpDir -Filter '*.dmp' -File -ErrorAction SilentlyContinue)
+        }
+
+        $werLocalDumps = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps' -Name 'DumpFolder' -ErrorAction SilentlyContinue).DumpFolder
+        if ($werLocalDumps -and (Test-Path -LiteralPath $werLocalDumps)) {
+            $foundDumps += @(Get-ChildItem -LiteralPath $werLocalDumps -Filter '*.dmp' -File -ErrorAction SilentlyContinue)
+        }
+
+        $foundDumps = @($foundDumps | Where-Object { $_ })
+        if ($foundDumps.Count -gt 0) {
+            Write-DiagWarning "  $($foundDumps.Count) existing crash dump file(s) found - each needs separate debugger (WinDbg/CDB) analysis:"
+            foreach ($d in ($foundDumps | Sort-Object LastWriteTime -Descending | Select-Object -First 10)) {
+                $sizeMb = [math]::Round($d.Length / 1MB, 1)
+                Write-Info "    $($d.FullName)  ($sizeMb MB, modified $($d.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')))"
+            }
+            if ($foundDumps.Count -gt 10) { Write-Info "    ... and $($foundDumps.Count - 10) more" }
+        }
+        else {
+            Write-Success "  No existing crash dump files found in standard locations (MEMORY.DMP, Minidump, WER LocalDumps)."
+        }
+    }
+    catch { Write-Info "  Could not scan for existing dump files: $($_.Exception.Message)" }
 }
 
 function Get-HungProcessAndService {
@@ -13642,7 +14769,7 @@ function Show-MainMenu {
 
                                                                 
      WINDOWS SERVER TROUBLESHOOTING & LOG COLLECTION TOOL       
-                         Version 3.0
+                         Version 3.1
                                                                 
 
 "@ -ForegroundColor Cyan
@@ -13683,6 +14810,14 @@ UTILITIES:" -ForegroundColor Yellow
     Write-Host "     (Paged-pool, Schannel, cluster, DCOM, NTLM, WHEA, patch/time drift & more)" -ForegroundColor Gray
 
     Write-Host "
+v3.1 NEW FEATURES:" -ForegroundColor Yellow
+    Write-Host " 25. Collection Gaps Summary (missing modules / access-denied checklist)" -ForegroundColor Green
+    Write-Host " 26. Server State Snapshot (save baseline / compare to previous run)" -ForegroundColor Green
+    Write-Host " 27. Executive Report (1-page synthesized verdict)" -ForegroundColor Green
+    Write-Host " 28. Guided Scenario Mode (`"what's wrong?`" symptom picker)" -ForegroundColor Green
+    Write-Host " 29. Root-Cause Correlator (time-window chain analysis)" -ForegroundColor Green
+
+    Write-Host "
 CLUSTER:" -ForegroundColor Yellow
     Write-Host " 22. WSFC Cluster Port Compliance Check" -ForegroundColor White
     Write-Host "     (Live reachability + local firewall-rule audit for cluster ports)" -ForegroundColor Gray
@@ -13720,6 +14855,9 @@ function Start-TroubleshootingTool {
     # Initialize diagnostic paths
     if (-not (Initialize-DiagnosticPaths)) {
         Write-DiagError "Failed to initialize diagnostic paths. Some features may not work correctly."
+    }
+    else {
+        Write-Info "Session output folder: $script:DefaultLogPath"
     }
     
     # Detect cluster and SQL AG environment once at startup
@@ -13759,7 +14897,7 @@ function Start-TroubleshootingTool {
     try {
         do {
             Show-MainMenu
-            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-24)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24")
+            $choice = Get-ValidatedChoice -Prompt "`nSelect an option (0-29)" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29")
             
             switch ($choice) {
                 "1" {
@@ -13871,7 +15009,8 @@ function Start-TroubleshootingTool {
                 }
                 "12" {
                     Clear-Host
-                    Export-SystemReport
+                    $redactChoice = Get-ValidatedChoice -Prompt "Redact IP addresses & SIDs in this report? (Y/N, Enter=N)" -ValidChoices @("Y", "N") -AllowEmpty
+                    Export-SystemReport -RedactNetworkIdentifiers:($redactChoice -eq "Y")
                 }
                 "13" {
                     Clear-Host
@@ -13912,7 +15051,8 @@ function Start-TroubleshootingTool {
                 }
                 "21" {
                     Clear-Host
-                    Export-HTMLReport
+                    $redactChoice = Get-ValidatedChoice -Prompt "Redact IP addresses & SIDs in this report? (Y/N, Enter=N)" -ValidChoices @("Y", "N") -AllowEmpty
+                    Export-HTMLReport -RedactNetworkIdentifiers:($redactChoice -eq "Y")
                 }
                 "22" {
                     Clear-Host
@@ -14000,12 +15140,44 @@ function Start-TroubleshootingTool {
                             Write-DiagWarning "Invalid days value '$daysInput'; using default of 7."
                         }
                     }
-                    Test-KnownIssue -DaysBack $kiDays
+                    Test-KnownIssue -DaysBack $kiDays -AutoDrillDown
                     Write-Host "`n"
                     $saveChoice = Get-ValidatedChoice -Prompt "Save known-issues report to file? (Y/N)" -ValidChoices @("Y", "N")
                     if ($saveChoice -eq "Y") {
                         Export-DiagnosticSection -Title "Known_Issues" -ScriptBlock { Test-KnownIssue -DaysBack $kiDays }
                     }
+                }
+                "25" {
+                    Clear-Host
+                    Get-WSTTCollectionGap
+                    Write-Host "`n"
+                }
+                "26" {
+                    Clear-Host
+                    Invoke-WSTTSnapshotWorkflow
+                }
+                "27" {
+                    Clear-Host
+                    Export-ExecutiveReport
+                }
+                "28" {
+                    Clear-Host
+                    Start-GuidedScenario
+                }
+                "29" {
+                    Clear-Host
+                    $corrHoursInput = Read-Host "Lookback window in hours (1-720, press Enter for 24)"
+                    $corrHours = 24
+                    if (-not [string]::IsNullOrWhiteSpace($corrHoursInput)) {
+                        $parsedCorrHours = 0
+                        if ([int]::TryParse($corrHoursInput, [ref]$parsedCorrHours) -and $parsedCorrHours -ge 1 -and $parsedCorrHours -le 720) {
+                            $corrHours = $parsedCorrHours
+                        }
+                        else {
+                            Write-DiagWarning "Invalid hours value '$corrHoursInput'; using default of 24."
+                        }
+                    }
+                    Find-WSTTCorrelatedEvent -Hours $corrHours
                 }
                 "0" {
                     Write-Host "`nExiting... Thank you for using the troubleshooting tool!" -ForegroundColor Cyan
@@ -14033,9 +15205,34 @@ function Start-TroubleshootingTool {
                 Write-Info "  Review and redact before sharing: $transcriptPath"
                 Stop-Transcript
                 Write-Success "Transcript saved to: $($transcriptPath)"
+                Add-WSTTManifestEntry -Path $transcriptPath -Description "Session Transcript (log)"
             }
             catch {
                 Write-DiagWarning "Could not stop transcript: $($_.Exception.Message)"
+            }
+        }
+
+        # Write a per-run manifest listing every file this session produced (v3.1).
+        if ($script:WSTTSessionManifest -and $script:WSTTSessionManifest.Count -gt 0) {
+            try {
+                $manifestPath = Join-Path $script:DefaultLogPath "_SessionManifest.txt"
+                $manifestLines = [System.Collections.Generic.List[string]]::new()
+                $manifestLines.Add("WSTT Session Manifest")
+                $manifestLines.Add("Computer:  $env:COMPUTERNAME")
+                $manifestLines.Add("Folder:    $script:DefaultLogPath")
+                $manifestLines.Add("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+                $manifestLines.Add("=" * 65)
+                foreach ($entry in ($script:WSTTSessionManifest | Sort-Object Time)) {
+                    $sizeText = if ($null -ne $entry.SizeKB) { "$($entry.SizeKB) KB" } else { "unknown size" }
+                    $manifestLines.Add(("{0:HH:mm:ss}  {1,-40}  {2}  ({3})" -f $entry.Time, $entry.Description, (Split-Path -Leaf $entry.Path), $sizeText))
+                }
+                $manifestLines | Out-File -FilePath $manifestPath -Encoding UTF8 -ErrorAction Stop
+                Write-Host ""
+                Write-Success "Session complete. $($script:WSTTSessionManifest.Count) file(s) saved to: $script:DefaultLogPath"
+                Write-Info "  Manifest: $manifestPath"
+            }
+            catch {
+                Write-DiagWarning "Could not write session manifest: $($_.Exception.Message)"
             }
         }
     }

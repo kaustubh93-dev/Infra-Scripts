@@ -25,7 +25,7 @@ Local-only validator for the network ports required by Windows Server Failover C
 | Stream | Mechanism | Purpose |
 |--------|-----------|---------|
 | **Live reachability** | TCP via `TcpClient.ConnectAsync` (2s timeout), ICMP via `Test-Connection`, UDP best-effort via `UdpClient` | Proves traffic actually flows from this node to each peer right now |
-| **Local firewall audit** | `Get-NetFirewallRule` + `Get-NetFirewallPortFilter` for inbound + outbound | Proves Allow rules exist and surfaces any enabled Block rules |
+| **Local firewall audit** | `Get-NetFirewallRule` + `Get-NetFirewallPortFilter` for inbound + outbound | Proves Allow rules exist, surfaces enabled Block rules, and notes broad `Any` rule matches |
 
 **Required port matrix (validated):**
 
@@ -33,29 +33,76 @@ Local-only validator for the network ports required by Windows Server Failover C
 |---------|----------|------|-----------|---------|
 | Cluster Service | UDP | 3343 | Bidirectional | Cluster heartbeat / intra-cluster comms (DTLS-encrypted) |
 | Cluster Service | TCP | 3343 | Bidirectional | Required during node-join operations |
-| Cluster Service | ICMP | Echo | Bidirectional | Add Node Wizard connectivity test |
+| Cluster Service | ICMPv4 | Echo | Bidirectional | Add Node Wizard / validation ICMPv4 Echo |
+| Cluster Service | ICMPv6 | Echo | Bidirectional | Cluster validation ICMPv6 Echo |
 | Cluster Service | TCP | 445 | Bidirectional | SMB during cluster join, file-share witness, validation |
 | RPC Endpoint Mapper | TCP | 135 | Bidirectional | RPC endpoint mapper for cluster management |
 | Cluster Admin (NetBIOS) | UDP | 137 | Bidirectional | NetBIOS name service (legacy admin discovery) |
-| SMB / NetBIOS Datagram | UDP | 138 | Bidirectional | NetBIOS datagram service (legacy SMB over NetBIOS) |
-| SMB / NetBIOS Session | TCP | 139 | Bidirectional | NetBIOS session service (legacy SMB over NetBIOS) |
 | WinRM (Cloud Witness) | TCP | 5985 | Bidirectional | WinRM HTTP — required for Azure cloud witness |
+
+**Documented but not live-scanned:**
+
+| Service | Protocol | Port | Reason |
+|---------|----------|------|--------|
+| Randomly allocated high RPC ports | TCP | 49152-65535 | Cluster/RPC picks dynamic ports at runtime; scanning 16K ports is impractical and noisy. |
+
+**Optional file-share / SMB dependency profile:**
+
+Use Option 22 mode 4 when validating file-share witness, SOFS, general SMB access, or legacy SMB over NetBIOS dependencies. These are dependency ports, not all core Cluster Service ports.
+
+| Feature | Protocol | Port | When to test |
+|---------|----------|------|--------------|
+| Microsoft file sharing RPC endpoint mapper | TCP | 135 | Legacy/admin SMB dependency paths |
+| NetBIOS Name Resolution | UDP | 137 | Legacy NetBIOS or application dependency |
+| NetBIOS Datagram Service | UDP | 138 | Legacy SMB over NetBIOS |
+| NetBIOS Session Service | TCP | 139 | Legacy SMB over NetBIOS |
+| Direct-hosted SMB | TCP | 445 | File-share witness, SOFS, and modern SMB access |
 
 **Out of scope by design:**
 - Trojan-port overlap analysis (e.g. environment-specific Trojan list comparison) — not in this tool.
-- Dynamic RPC range 49152–65535 live testing — testing 16K ports is impractical; cluster picks random ports at runtime.
+- Dynamic RPC range 49152-65535 live testing — testing 16K ports is impractical; cluster picks random ports at runtime.
 
 **How it works:**
 - Auto-discovers peer nodes from `$script:ClusterEnv.ClusterNodes` when run on a cluster member.
+- Option 22 has three modes: existing-cluster compliance, new-cluster build readiness, and Add-Node readiness with manual target nodes.
+- Option 22 mode 4 checks optional file-share / SMB dependency ports for witness, SOFS, and legacy SMB paths.
+- New-cluster mode uses `Test-WSFCClusterBuildPortReadiness -Scenario BuildCluster -TargetNode <hostname[],ip[]>` before `New-Cluster`.
+- Add-Node mode uses `Test-WSFCClusterBuildPortReadiness -Scenario AddNode -TargetNode <hostname[],ip[]>` before `Add-ClusterNode`.
+- For bidirectional evidence, run new-cluster mode from every planned node; for Add-Node, run from an existing node to the new node and from the new node back to existing nodes.
 - Falls back to interactive prompt or `-TargetNode <hostname[],ip[]>` parameter on standalone hosts.
 - All hostnames/IPs validated against an RFC 1123 + IPv4 regex before any network I/O.
 - UDP results are explicitly reported as `Inconclusive` (UDP is connectionless — silent ports are indistinguishable from open).
+- TCP failures distinguish active refusal/reset from silent timeout/drop where Windows exposes that socket detail.
+- Optional built-in `pktmon.exe` capture can be enabled during reachability probes for packet-level evidence. It requires elevated pktmon driver access; if pktmon cannot start, WSTT reports the reason and continues the port checks.
+- When pktmon text output is available, WSTT prints a `Pktmon Review Summary` with a `Pktmon Name Resolution Matrix` and `Pktmon Target / Port Outcome Matrix` showing target node name, target IP, protocol, port, status, evidence, count, and recommended action. It highlights DNS answers, ICMP port-unreachable responses, TCP resets, SYN-only evidence, and SYN/SYN-ACK evidence. Packet counts are deduplicated with `PktGroupId` when present, and a successful SYN/SYN-ACK handshake is not downgraded by later teardown/reset evidence for the same target and port.
+- Pktmon text can include hostnames, IP addresses, and MAC addresses; redact before sharing outside the approved support boundary.
+- Dynamic RPC range 49152-65535 is not live-scanned; after static ports pass for a new cluster build, run Microsoft `Test-Cluster` validation before `New-Cluster`.
 - Console summary table + per-port CSV exports + dark-themed HTML report.
+
+**Examples:**
+```powershell
+# New 2-node cluster: run from each node against the other planned node
+Test-WSFCClusterBuildPortReadiness -Scenario BuildCluster -TargetNode 'node02'
+
+# New 3-node cluster: run from node01 against node02 and node03, then repeat from each peer
+Test-WSFCClusterBuildPortReadiness -Scenario BuildCluster -TargetNode 'node02','node03'
+
+# Add node: run from an existing node to the new node, then from the new node back to existing nodes
+Test-WSFCClusterBuildPortReadiness -Scenario AddNode -TargetNode 'newnode03' -ExportCsv -ExportHtml
+
+# Add packet evidence during probes when needed
+Test-WSFCClusterBuildPortReadiness -Scenario AddNode -TargetNode 'newnode03' -CapturePktmon
+
+# Optional SMB dependency profile for file-share witness / SOFS / legacy SMB paths
+Test-WSFCFileSharePortReadiness -TargetNode 'fileshare-or-sofs-target' -ExportCsv -ExportHtml
+```
 
 **Outputs (under `%TEMP%\ServerDiagnostics\Logs\`):**
 - `WSFC_PortReachability_yyyyMMdd_HHmmss.csv`
 - `WSFC_FirewallAudit_yyyyMMdd_HHmmss.csv`
 - `WSFC_PortCompliance_yyyyMMdd_HHmmss.html`
+- `WSFC_Pktmon_yyyyMMdd_HHmmss.etl` when pktmon capture is enabled
+- `WSFC_Pktmon_yyyyMMdd_HHmmss.txt` when pktmon formatting is supported on the host
 
 ### 🌐 Network Diagnostics — 15 New Checks
 | # | Check | What It Detects |
