@@ -705,8 +705,8 @@ function Test-PathValid {
     }
     
     # Security: Reject path traversal, injection, and non-rooted paths
-    if ($Path -match '\.\.' -or $Path -match '[\$\(\)&\|;`]' -or $Path -match '^\s*\\\\[^\\]+\\[^\\]+') {
-        Write-DiagError "Path rejected for security: contains traversal, special characters, or UNC path"
+    if ($Path -match '\.\.' -or $Path -match "[\`$\(\)&\|;``']" -or $Path -match '^\s*\\\\[^\\]+\\[^\\]+') {
+        Write-DiagError "Path rejected for security: contains traversal, quote, special characters, or UNC path"
         return $false
     }
     
@@ -864,7 +864,7 @@ function Get-WSTTLocalAdminMember {
                 } | ForEach-Object { $_.Trim() })
         }
     }
-    catch { }
+    catch { Write-Verbose "Local Administrators enumeration skipped: $($_.Exception.Message)" }
 
     return $members
 }
@@ -914,7 +914,7 @@ function Get-ClusterEnvironmentInfo {
         $info.ClusterName = $cluster.Name
         $info.ClusterNodes = @(Get-ClusterNode -ErrorAction SilentlyContinue | Select-Object Name, State, NodeWeight)
     }
-    catch { }
+    catch { Write-Verbose "Cluster basics query skipped: $($_.Exception.Message)" }
 
     # Cluster networks — identify heartbeat-only NICs
     try {
@@ -928,10 +928,10 @@ function Get-ClusterEnvironmentInfo {
                     $adapters = Get-ClusterNetworkInterface -Network $netName -ErrorAction SilentlyContinue
                     $adapters | Where-Object { $_.Node -eq $env:COMPUTERNAME } | ForEach-Object { $_.Adapter }
                 }
-                catch { }
+                catch { Write-Verbose "Cluster network interface query skipped for '$netName': $($_.Exception.Message)" }
             })
     }
-    catch { }
+    catch { Write-Verbose "Cluster network enumeration skipped: $($_.Exception.Message)" }
 
     # Cluster Shared Volumes
     try {
@@ -940,7 +940,7 @@ function Get-ClusterEnvironmentInfo {
                 $_.SharedVolumeInfo.FriendlyVolumeName
             })
     }
-    catch { }
+    catch { Write-Verbose "CSV enumeration skipped: $($_.Exception.Message)" }
 
     # Quorum
     try {
@@ -950,7 +950,7 @@ function Get-ClusterEnvironmentInfo {
             $info.QuorumResource = if ($quorum.QuorumResource) { $quorum.QuorumResource.Name } else { "(none)" }
         }
     }
-    catch { }
+    catch { Write-Verbose "Quorum query skipped: $($_.Exception.Message)" }
 
     # Cluster-Aware Updating
     try {
@@ -959,7 +959,7 @@ function Get-ClusterEnvironmentInfo {
             $info.IsCAUEnabled = $true
         }
     }
-    catch { }
+    catch { Write-Verbose "CAU detection skipped: $($_.Exception.Message)" }
 
     # SQL AG Detection
     try {
@@ -1005,11 +1005,11 @@ WHERE ars.is_local = 1
                     $reader.Close()
                     $conn.Close()
                 }
-                catch { }
+                catch { Write-Verbose "SqlClient AG fallback query skipped: $($_.Exception.Message)" }
             }
         }
     }
-    catch { }
+    catch { Write-Verbose "SQL AG detection skipped: $($_.Exception.Message)" }
 
     return $info
 }
@@ -1159,8 +1159,8 @@ function Test-WSFCPortReachability {
                 }
                 finally {
                     if ($tcpClient) {
-                        try { $tcpClient.Close() } catch {}
-                        try { $tcpClient.Dispose() } catch {}
+                        try { $tcpClient.Close() } catch { Write-Verbose "TcpClient close failed: $($_.Exception.Message)" }
+                        try { $tcpClient.Dispose() } catch { Write-Verbose "TcpClient dispose failed: $($_.Exception.Message)" }
                     }
                 }
             }
@@ -1182,7 +1182,7 @@ function Test-WSFCPortReachability {
                     $result.ErrorMessage = "UDP send failed: $($_.Exception.Message) (DNS/route/local firewall may be blocking outbound)"
                 }
                 finally {
-                    if ($udpClient) { try { $udpClient.Close() } catch {} }
+                    if ($udpClient) { try { $udpClient.Close() } catch { Write-Verbose "UdpClient close failed: $($_.Exception.Message)" } }
                 }
             }
             'ICMP' {
@@ -2213,6 +2213,12 @@ function Set-TSSPath {
         return (Test-TSSAvailable)
     }
     
+    # Security: reject characters that would break the quoted TSS invocation string
+    if ($userPath -match "[\`$\(\)&\|;``']") {
+        Write-DiagError "Path rejected for security: contains quote or special characters"
+        return $false
+    }
+    
     # Validate the path
     if (-not (Test-Path $userPath -PathType Container)) {
         Write-DiagError "Invalid path: Directory does not exist"
@@ -2901,7 +2907,7 @@ function Test-NetworkConfiguration {
                     }
                 }
             }
-            catch { }
+            catch { Write-Verbose "Duplicate IP check skipped: $($_.Exception.Message)" }
         }
         if ($duplicateFound) {
             Write-Info "    Impact: Intermittent connectivity, random RDP/file/AD failures."
@@ -2948,7 +2954,7 @@ function Test-NetworkConfiguration {
                     }
                 }
             }
-            catch { }
+            catch { Write-Verbose "Duplex check skipped: $($_.Exception.Message)" }
             if ($linkSpeed -match '100\s*(Mbps|M)' -and $adpt.DriverDescription -notlike '*Virtual*') {
                 Write-DiagWarning "    100 Mbps link speed on physical adapter - possible autonegotiation failure"
                 Write-Info "      Remediation: Replace cable, check switch port speed config, swap NIC port."
@@ -3014,7 +3020,7 @@ function Test-NetworkConfiguration {
                     }
                 }
             }
-            catch { }
+            catch { Write-Verbose "Checksum offload check skipped: $($_.Exception.Message)" }
         }
     }
 
@@ -3108,7 +3114,7 @@ function Test-NetworkConfiguration {
                     Write-Info "  $($adpt.Name): Suffix='$suffix' RegisterInDNS=$registerInDns"
                 }
             }
-            catch { }
+            catch { Write-Verbose "DNS suffix check skipped: $($_.Exception.Message)" }
         }
     }
 
@@ -3200,7 +3206,7 @@ function Test-NetworkConfiguration {
             }
         }
     }
-    catch { }
+    catch { Write-Verbose "Proxy check skipped: $($_.Exception.Message)" }
 
     # 9. Network Adapter Driver Version & Date
     # ------------------------------------------------------------
@@ -3406,7 +3412,7 @@ function Test-NetworkConfiguration {
             Write-Info "  SMB Direct (Server): $(if ($smbDirect.EnableSMBDirect) { 'Enabled' } else { 'Disabled' })"
         }
     }
-    catch { }
+    catch { Write-Verbose "RDMA/SMB Direct check skipped: $($_.Exception.Message)" }
 
     # 13. TCP/IP Stack Parameters
     # ------------------------------------------------------------
@@ -3458,7 +3464,7 @@ function Test-NetworkConfiguration {
             Write-Info "  TCP KeepAlive: Default (2 hours)"
         }
     }
-    catch { }
+    catch { Write-Verbose "TCP KeepAlive check skipped: $($_.Exception.Message)" }
 
     # Timestamps
     try {
@@ -3477,7 +3483,7 @@ function Test-NetworkConfiguration {
             Write-Info "  TCP 1323 Options: OS Default"
         }
     }
-    catch { }
+    catch { Write-Verbose "TCP 1323 options check skipped: $($_.Exception.Message)" }
 
     # 14. Network Adapter Error Events
     # ------------------------------------------------------------
@@ -5063,7 +5069,7 @@ function Test-CPUUsage {
                 }
             }
         }
-        catch { }
+        catch { Write-Verbose "AG redo check skipped: $($_.Exception.Message)" }
     }
 
     #region v3.0 CPU Checks
@@ -5404,7 +5410,7 @@ function Test-CPUUsage {
                 }
             }
         }
-        catch { }
+        catch { Write-Verbose "AV filter driver check skipped: $($_.Exception.Message)" }
     }
     catch {
         Write-DiagWarning "  Could not check antivirus processes"
@@ -5764,7 +5770,7 @@ function Test-CPUUsage {
                     $affinityIssues += "  $($proc.Name) (PID $($proc.Id)): Affinity=$coreCount of $logicalProcs cores (mask: 0x$($affinity.ToString('X')))"
                 }
             }
-            catch { }
+            catch { Write-Verbose "Process affinity check skipped for a process: $($_.Exception.Message)" }
         }
         if ($affinityIssues.Count -gt 0) {
             Write-DiagWarning "  Processes with restricted CPU affinity:"
@@ -6037,7 +6043,7 @@ function Test-DiskPerformance {
     try {
         $sqlSvc = Get-Service -Name 'MSSQL*', 'SQLAgent*', 'MSSQLSERVER' -ErrorAction SilentlyContinue
         if ($sqlSvc) { $isDbServer = $true }
-    } catch { }
+    } catch { Write-Verbose "SQL service detection skipped: $($_.Exception.Message)" }
 
     if ($cachedVolumes) {
         foreach ($vol in $cachedVolumes) {
@@ -6490,7 +6496,7 @@ function Test-DiskPerformance {
             Write-Success "  All VSS writers are stable"
         }
     }
-    catch { }
+    catch { Write-Verbose "VSS writer check skipped: $($_.Exception.Message)" }
 
     # 6. Storage Spaces / Pool Health
     # ------------------------------------------------------------
@@ -6593,7 +6599,7 @@ function Test-DiskPerformance {
                 Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction Stop |
                     Where-Object { $_.DeviceID -ne $env:SystemDrive -and $_.Size -gt 10GB }
             )
-        } catch { }
+        } catch { Write-Verbose "Logical disk enumeration skipped: $($_.Exception.Message)" }
 
         if ($pageFiles) {
             foreach ($pf in $pageFiles) {
@@ -6730,7 +6736,7 @@ function Test-DiskPerformance {
             Write-Info "  Filter instances attached to volumes: $instanceCount"
         }
     }
-    catch { }
+    catch { Write-Verbose "Filter driver check skipped: $($_.Exception.Message)" }
 
     # 11. Disk Timeout & Retry Settings
     # ------------------------------------------------------------
@@ -6790,7 +6796,7 @@ function Test-DiskPerformance {
                     Write-Info "  Supported MPIO hardware entries: $(@($mpioDevices).Count)"
                 }
             }
-            catch { }
+            catch { Write-Verbose "MPIO check skipped: $($_.Exception.Message)" }
 
             # Check MPIO paths
             try {
@@ -6933,7 +6939,7 @@ function Test-DiskPerformance {
                     }
                 }
             }
-            catch { }
+            catch { Write-Verbose "Storage tiering check skipped: $($_.Exception.Message)" }
         }
         else {
             Write-Info "  No storage tiers configured (standard non-tiered storage)"
@@ -7116,6 +7122,7 @@ function Test-ServicesHealth {
             }
             catch {
                 # Service not installed on this server, skip
+                Write-Verbose "Service check skipped: $($_.Exception.Message)"
             }
         }
     }
@@ -7202,7 +7209,7 @@ function Test-ServicesHealth {
                     }
                 }
             }
-            catch { }
+            catch { Write-Verbose "Service trigger query skipped for '$($svc.Name)': $($_.Exception.Message)" }
 
             $reportable += $svc
         }
@@ -7394,7 +7401,7 @@ function Test-ServicesHealth {
                 $isDomainJoined = $false
                 try {
                     $isDomainJoined = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).PartOfDomain
-                } catch { }
+                } catch { Write-Verbose "Domain-join detection skipped: $($_.Exception.Message)" }
                 if ($isDomainJoined) {
                     Write-DiagWarning "  Time source is the Hyper-V host (VM IC Time Synchronization Provider)."
                     Write-Info "    Domain members should sync from the AD time hierarchy, not the host."
@@ -7592,7 +7599,7 @@ function Test-ServicesHealth {
             Write-Info "                 this host; confirm the licensing mode in 'Set-RDLicenseConfiguration'."
         }
     }
-    catch { }
+    catch { Write-Verbose "RD licensing check skipped: $($_.Exception.Message)" }
 
     # Proactive (incident-derived): SCM stop/start hangs + hung/orphaned processes & stuck services
     Get-ServiceControlHang
@@ -7865,7 +7872,7 @@ function Test-EventLogHealth {
             Write-Success "  No storage adapter errors"
         }
     }
-    catch { }
+    catch { Write-Verbose "Storage adapter error check skipped: $($_.Exception.Message)" }
 
     # DNS Update Failures (1196)
     # ------------------------------------------------------------
@@ -7900,7 +7907,7 @@ function Test-EventLogHealth {
             Write-Success "  No DNS update failures"
         }
     }
-    catch { }
+    catch { Write-Verbose "DNS update failure check skipped: $($_.Exception.Message)" }
 
     # Known Critical Event Summary (from $script:KnownCriticalEventIDs)
     # ------------------------------------------------------------
@@ -7931,7 +7938,7 @@ function Test-EventLogHealth {
                     $foundAny = $true
                 }
             }
-            catch { }
+            catch { Write-Verbose "Event log query skipped: $($_.Exception.Message)" }
         }
     }
     if (-not $foundAny) {
@@ -8313,7 +8320,7 @@ function Test-DNSHealth {
             Write-Success "  No DNS dynamic update failures"
         }
     }
-    catch { }
+    catch { Write-Verbose "DNS dynamic update check skipped: $($_.Exception.Message)" }
 
     # Reverse DNS Check
     # ------------------------------------------------------------
@@ -8758,7 +8765,7 @@ function Test-SecurityAuthentication {
             Write-Success "  No Schannel errors"
         }
     }
-    catch { }
+    catch { Write-Verbose "Schannel error check skipped: $($_.Exception.Message)" }
 
     # NTLM vs Kerberos Detection
     # ------------------------------------------------------------
@@ -8803,7 +8810,7 @@ function Test-SecurityAuthentication {
                             if ($node) { $authPkg = [string]$node.'#text' }
                         }
                     }
-                    catch { }
+                    catch { Write-Verbose "Event XML parse skipped: $($_.Exception.Message)" }
 
                     # Fallback to positional property if XML parse failed
                     if (-not $authPkg -and $evt.Properties.Count -gt 14) {
@@ -9145,7 +9152,7 @@ function Test-WindowsUpdateStatus {
                 $reasons += "Pending File Rename Operations"
             }
         }
-        catch { }
+        catch { Write-Verbose "Pending file rename check skipped: $($_.Exception.Message)" }
         
         if ($pendingReboot) {
             Write-DiagWarning "  REBOOT PENDING!"
@@ -9257,7 +9264,7 @@ function Test-WindowsUpdateStatus {
             Write-Success "  No pending.xml found (good)"
         }
     }
-    catch { }
+    catch { Write-Verbose "pending.xml check skipped: $($_.Exception.Message)" }
 
     # Legacy OS Detection
     # ------------------------------------------------------------
@@ -9298,7 +9305,7 @@ function Test-WindowsUpdateStatus {
             Write-Info "  OS Build $build - version not recognized"
         }
     }
-    catch { }
+    catch { Write-Verbose "OS build check skipped: $($_.Exception.Message)" }
 
     # Failed Update Events
     # ------------------------------------------------------------
@@ -9543,7 +9550,7 @@ function Test-CrossCategoryHealth {
                 $tsKey = Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -ErrorAction Stop
                 if ($tsKey.fDenyTSConnections -eq 1) { $rdpDisabledByPolicy = $true }
             }
-            catch { }
+            catch { Write-Verbose "RDP policy check skipped: $($_.Exception.Message)" }
             $termSvc = Get-Service -Name 'TermService' -ErrorAction SilentlyContinue
             $termSvcDisabled = $termSvc -and ($termSvc.StartType -eq 'Disabled' -or $termSvc.Status -ne 'Running')
             $winRMRunning = (Get-Service -Name 'WinRM' -ErrorAction SilentlyContinue).Status -eq 'Running'
@@ -9577,7 +9584,7 @@ function Test-CrossCategoryHealth {
             }
         }
     }
-    catch { }
+    catch { Write-Verbose "MachineKeys ACL check skipped: $($_.Exception.Message)" }
 
     # 5. Account Lockouts
     # Event 4740 = lockout. Member servers only see local-account lockouts;
@@ -9832,7 +9839,7 @@ function Show-AdditionalScenarios {
                     try {
                         $activeOwners = Get-ClusterGroup -ErrorAction SilentlyContinue | Where-Object { $_.OwnerNode -eq $env:COMPUTERNAME -and $_.State -eq 'Online' }
                     }
-                    catch { }
+                    catch { Write-Verbose "Cluster group ownership check skipped: $($_.Exception.Message)" }
                     if ($activeOwners) {
                         Write-DiagWarning "This node owns $(@($activeOwners).Count) active cluster group(s). Consider running on a passive node first:"
                         $activeOwners | Select-Object -First 5 | ForEach-Object { Write-Info "    $($_.Name): $($_.State)" }
@@ -11610,7 +11617,7 @@ function Test-IISHealth {
             }
         }
     }
-    catch {}
+    catch { Write-Verbose "IIS role detection skipped: $($_.Exception.Message)" }
     
     # Import WebAdministration
     try {
@@ -11771,7 +11778,7 @@ function Test-IISHealth {
                         $appPoolName = $Matches['AppPool']
                     }
                 }
-                catch {}
+                catch { Write-Verbose "App pool parse skipped: $($_.Exception.Message)" }
                 
                 $memMB = [math]::Round($wp.WorkingSet64 / 1MB, 2)
                 $cpuStr = if ($wp.CPU) { [math]::Round($wp.CPU, 2) } else { "N/A" }
@@ -12302,7 +12309,7 @@ function Test-TaskSchedulerHealth {
                     Write-DiagWarning "    $($ct.Name): Overly permissive — Everyone or Authenticated Users have Full Access"
                 }
             }
-            catch { }
+            catch { Write-Verbose "Task SDDL audit skipped: $($_.Exception.Message)" }
         }
         if ($permIssues -eq 0) {
             Write-Success "  No overly permissive task SDDL entries found (root folder)"
@@ -12413,7 +12420,7 @@ function Test-TaskSchedulerHealth {
                             }
                         }
                     }
-                    catch { }
+                    catch { Write-Verbose "Trigger boundary parse skipped: $($_.Exception.Message)" }
                 }
                 # Check for disabled triggers
                 if ($trigger.Enabled -eq $false) {
@@ -12648,7 +12655,7 @@ function Test-ServerBaseline {
                     }
                 }
             }
-            catch { }
+            catch { Write-Verbose "NIC power save check skipped: $($_.Exception.Message)" }
         }
         if ($checked -eq 0) {
             Write-Info "  No power-managed adapters reported MSPower_DeviceEnable data"
@@ -13871,7 +13878,6 @@ function Get-KnownIssueCatalog {
             Remediation = "Confirm legacy apps/appliances support NTLMv2; enable 'Restrict NTLM: Audit Incoming NTLM Traffic' before enforcing."
             Applies     = { $true }
             Detect      = {
-                param($Days)
                 $lm = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'LmCompatibilityLevel' -ErrorAction SilentlyContinue).LmCompatibilityLevel
                 if ($null -eq $lm) { @{ Status = 'Clear'; Detail = 'LmCompatibilityLevel not set (OS default)' } }
                 elseif ($lm -ge 5) { @{ Status = 'Manual'; Detail = "LmCompatibilityLevel=$lm (NTLMv2 only / refuse LM+NTLM) - verify legacy dependencies" } }
@@ -13904,7 +13910,6 @@ function Get-KnownIssueCatalog {
             Remediation = "Update the stored password in Task Scheduler for the affected principal; confirm the account is not locked/expired."
             Applies     = { $true }
             Detect      = {
-                param($Days)
                 $bad = @()
                 try {
                     $bad = @(Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {
@@ -13912,7 +13917,7 @@ function Get-KnownIssueCatalog {
                             if ($info -and $info.LastTaskResult -eq 0x8007052E) { "$($_.TaskPath)$($_.TaskName)" }
                         })
                 }
-                catch { }
+                catch { Write-Verbose "Scheduled task credential scan skipped: $($_.Exception.Message)" }
                 if ($bad.Count -gt 0) { @{ Status = 'Hit'; Detail = "$($bad.Count) task(s) failing with 0x8007052E: $([string]::Join(', ', ($bad | Select-Object -First 5)))" } }
                 else { @{ Status = 'Clear'; Detail = 'No tasks failing with a credential error' } }
             }
@@ -13927,7 +13932,6 @@ function Get-KnownIssueCatalog {
             Remediation = "Run Windows Update / WSUS scan; if WSUS-managed verify the WUServer target is reachable and approvals exist."
             Applies     = { $true }
             Detect      = {
-                param($Days)
                 $last = Get-HotFix -ErrorAction SilentlyContinue | Where-Object { $_.InstalledOn } | Sort-Object InstalledOn -Descending | Select-Object -First 1
                 if ($last -and $last.InstalledOn) {
                     $age = [int]((Get-Date) - $last.InstalledOn).TotalDays
@@ -13947,7 +13951,6 @@ function Get-KnownIssueCatalog {
             Remediation = "Domain member: 'w32tm /config /syncfromflags:domhier /update'; PDC: point at a reliable external NTP; then 'Restart-Service W32Time'."
             Applies     = { $true }
             Detect      = {
-                param($Days)
                 $type = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' -Name 'Type' -ErrorAction SilentlyContinue).Type
                 if ($type -eq 'NoSync') { @{ Status = 'Hit'; Detail = 'W32Time Type=NoSync - clock will not be corrected from any source' } }
                 else {
@@ -13967,7 +13970,6 @@ function Get-KnownIssueCatalog {
             Remediation = "Schedule a reboot. If it persists, run 'DISM /online /cleanup-image /restorehealth' then 'sfc /scannow'."
             Applies     = { $true }
             Detect      = {
-                param($Days)
                 $r = @()
                 if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $r += 'CBS' }
                 if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $r += 'WindowsUpdate' }
@@ -13987,7 +13989,6 @@ function Get-KnownIssueCatalog {
             Remediation = "Free space (cleanmgr / old logs / move data), expand the volume, or relocate page/log/temp files."
             Applies     = { $true }
             Detect      = {
-                param($Days)
                 $sysDl = ($env:SystemDrive -replace ':', '')
                 $v = Get-Volume -DriveLetter $sysDl -ErrorAction SilentlyContinue
                 if ($v -and $v.Size -gt 0) {
@@ -14025,7 +14026,6 @@ function Get-KnownIssueCatalog {
             Remediation = 'Restart the leaking application service to clear sockets; fix connection disposal / pool idle eviction / socket timeouts / TCP keepalive; add monitoring on CLOSE_WAIT counts.'
             Applies     = { $true }
             Detect      = {
-                param($Days)
                 $closeWaitConnections = @(Get-NetTCPConnection -State CloseWait -ErrorAction SilentlyContinue)
                 if ($closeWaitConnections.Count -eq 0) { return @{ Status = 'Clear'; Detail = 'No CLOSE_WAIT sockets currently present' } }
 
@@ -14300,7 +14300,7 @@ function Get-ApplicationHang {
             # fall back to a message regex if structured data is unavailable.
             $hangs | ForEach-Object {
                 $exe = $null
-                try { $exe = ([xml]$_.ToXml()).Event.EventData.Data[0] } catch { }
+                try { $exe = ([xml]$_.ToXml()).Event.EventData.Data[0] } catch { Write-Verbose "Event XML parse skipped: $($_.Exception.Message)" }
                 if (-not $exe) {
                     if ($_.Message -match '(\S+\.exe)') { $exe = $Matches[1] } else { $exe = 'unknown' }
                 }
@@ -14626,7 +14626,7 @@ function Get-TcpCloseWaitLeak {
                 $cimProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($cimProcess -and $cimProcess.ExecutablePath) { $executablePath = $cimProcess.ExecutablePath }
             }
-            catch { }
+            catch { Write-Verbose "Process path lookup skipped: $($_.Exception.Message)" }
 
             $summary = "  PID $processId ($processName): CLOSE_WAIT=$($processGroup.Count)  WS=${memoryMB}MB  CPU=${cpuSeconds}s"
             if ($processGroup.Count -ge $CriticalThreshold) {
